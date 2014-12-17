@@ -1,4 +1,18 @@
 ------------------------------------------------------------------------------
+Version 8.7.0 [v8-stable] 2015-01-13
+- mmnormalize enhancements
+  Thanks to Janmejay Singh for the patch.
+- RainerScript "foreach" iterator and array reading support
+  Thanks to Janmejay Singh for the patch.
+- now requires liblognorm >= 1.0.2
+- add support for systemd >= 209 library names
+- BSD "ntp" facility (value 12) is now also supported in filter
+  Thanks to Douglas K. Rand of Iteris, Inc. for the patch.
+  Note: this patch was released under ASL 2.0 (see email-conversation).
+- bugfix: global(localHostName="xxx") was not respected in all modules
+- bugfix: emit correct error message on config-file-not-found
+  closes https://github.com/rsyslog/rsyslog/issues/173
+------------------------------------------------------------------------------
 Version 8.6.0 [v8-stable] 2014-12-02
 NOTE: This version also incorporates all changes and enhancements made for
 v8.5.0, but in a stable release. For details see immediately below.
@@ -64,6 +78,12 @@ v8.5.0, but in a stable release. For details see immediately below.
   general, it looks more like a cosmetic issue. For example, with
   MySQL it lead to a small memory but also an annoying message about
   a thread not properly torn down.
+- imttcp was removed because it was an incompleted experimental module
+- pmrfc3164sd because it was a custom module nobody used
+  We used to keep this as a sample inside the tree, but whoever wants
+  to look at it can check in older versions inside git.
+- omoracle was removed because it was orphaned and did not build/work
+  for quite some years and nobody was interested in fixing it
 ---------------------------------------------------------------------------
 Version 8.5.0 [v8-stable] 2014-10-24
 - imfile greatly refactored and support for wildcards added

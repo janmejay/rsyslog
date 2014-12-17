@@ -26,7 +26,9 @@
 
 #include <signal.h>
 #include <sys/wait.h>
-#include <liblogging/stdlog.h>
+#ifdef HAVE_LIBLOGGING_STDLOG
+#  include <liblogging/stdlog.h>
+#endif
 #ifdef OS_SOLARIS
 #	include <errno.h>
 #else
@@ -176,7 +178,11 @@ rsRetVal writePidFile(void)
 		fprintf(stderr, "rsyslogd: error writing pid file\n");
 		ABORT_FINALIZE(RS_RET_ERR);
 	}
-	fprintf(fp, "%d", (int) glblGetOurPid());
+	if(fprintf(fp, "%d", (int) glblGetOurPid()) < 0) {
+		char err[1024];
+		rs_strerror_r(errno, err, sizeof(err));
+		errmsg.LogError(0, iRet, "rsyslog: error writing pid file: %s", err);
+	}
 	fclose(fp);
 finalize_it:
 	RETiRet;
@@ -765,9 +771,11 @@ logmsgInternal(int iErr, const syslog_pri_t pri, const uchar *const msg, int fla
 		CHKiRet(logmsgInternalSelf(iErr, pri, lenMsg,
 					   (bufModMsg == NULL) ? (char*)msg : bufModMsg,
 					   flags));
+#ifdef HAVE_LIBLOGGING_STDLOG
 	} else {
 		stdlog_log(stdlog_hdl, pri2sev(pri), "%s",
 			   (bufModMsg == NULL) ? (char*)msg : bufModMsg);
+#endif
 	}
 
 	/* we now check if we should print internal messages out to stderr. This was
@@ -1230,6 +1238,7 @@ initAll(int argc, char **argv)
 	}
 
 	localRet = rsconf.Load(&ourConf, ConfFile);
+	glbl.GenerateLocalHostNameProperty();
 
 	if(localRet == RS_RET_NONFATAL_CONFIG_ERR) {
 		if(loadConf->globals.bAbortOnUncleanConfig) {

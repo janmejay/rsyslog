@@ -1,6 +1,6 @@
 if ENABLE_TESTBENCH
 # TODO: reenable TESTRUNS = rt_init rscript
-check_PROGRAMS = $(TESTRUNS) ourtail nettester tcpflood chkseq msleep randomgen diagtalker uxsockrcvr syslog_caller syslog_inject inputfilegen minitcpsrv
+check_PROGRAMS = $(TESTRUNS) ourtail nettester tcpflood chkseq msleep randomgen diagtalker uxsockrcvr syslog_caller inputfilegen minitcpsrv
 TESTS = $(TESTRUNS) 
 #TESTS = $(TESTRUNS) cfg.sh
 
@@ -12,6 +12,8 @@ TESTS +=  \
 	fac_local7.sh \
 	fac_mail.sh \
 	fac_news.sh \
+	fac_ftp.sh \
+	fac_ntp.sh \
 	fac_uucp.sh \
 	fac_invld1.sh \
 	fac_invld2.sh \
@@ -40,6 +42,7 @@ TESTS +=  \
 	sndrcv_udp.sh \
 	sndrcv_udp_nonstdpt.sh \
 	imudp_thread_hang.sh \
+	sndrcv_udp_nonstdpt_v6.sh \
 	asynwr_simple.sh \
 	asynwr_timeout.sh \
 	asynwr_small.sh \
@@ -66,6 +69,10 @@ TESTS +=  \
 	pipe_noreader.sh \
 	dircreate_dflt.sh \
 	dircreate_off.sh \
+	imuxsock_logger.sh \
+	imuxsock_logger_err.sh \
+	imuxsock_traillf.sh \
+	imuxsock_ccmiddle.sh \
 	imuxsock_logger_root.sh \
 	imuxsock_traillf_root.sh \
 	imuxsock_ccmiddle_root.sh \
@@ -403,6 +410,10 @@ EXTRA_DIST= 1.rstest 2.rstest 3.rstest err1.rstest \
 	   testsuites/fac_mail.conf \
 	   fac_news.sh \
 	   testsuites/fac_news.conf \
+	   fac_ftp.sh \
+	   testsuites/fac_ftp.conf \
+	   fac_ntp.sh \
+	   testsuites/fac_ntp.conf \
 	   fac_uucp.sh \
 	   testsuites/fac_uucp.conf \
 	   fac_invld1.sh \
@@ -553,6 +564,9 @@ EXTRA_DIST= 1.rstest 2.rstest 3.rstest err1.rstest \
 	   sndrcv_udp_nonstdpt.sh \
 	   testsuites/sndrcv_udp_nonstdpt_sender.conf \
 	   testsuites/sndrcv_udp_nonstdpt_rcvr.conf \
+	   sndrcv_udp_nonstdpt_v6.sh \
+	   testsuites/sndrcv_udp_nonstdpt_v6_sender.conf \
+	   testsuites/sndrcv_udp_nonstdpt_v6_rcvr.conf \
 	   sndrcv_omudpspoof.sh \
 	   testsuites/sndrcv_omudpspoof_sender.conf \
 	   testsuites/sndrcv_omudpspoof_rcvr.conf \
@@ -642,15 +656,25 @@ EXTRA_DIST= 1.rstest 2.rstest 3.rstest err1.rstest \
 	   testsuites/dircreate_dflt.conf \
 	   dircreate_off.sh \
 	   testsuites/dircreate_off.conf \
+	   imuxsock_logger.sh \
+	   testsuites/imuxsock_logger.conf \
+	   imuxsock_logger_err.sh \
 	   imuxsock_logger_root.sh \
 	   testsuites/imuxsock_logger_root.conf \
 	   resultdata/imuxsock_logger.log \
+	   imuxsock_traillf.sh \
+	   testsuites/imuxsock_traillf.conf \
 	   imuxsock_traillf_root.sh \
 	   testsuites/imuxsock_traillf_root.conf \
 	   resultdata/imuxsock_traillf.log \
+	   imuxsock_ccmiddle.sh \
+	   testsuites/imuxsock_ccmiddle.conf \
 	   imuxsock_ccmiddle_root.sh \
 	   testsuites/imuxsock_ccmiddle_root.conf \
 	   resultdata/imuxsock_ccmiddle.log \
+	   imuxsock_hostname.sh \
+	   testsuites/imuxsock_hostname.conf \
+	   resultdata/imuxsock_hostname.log \
 	   testsuites/mysql-truncate.sql \
 	   testsuites/mysql-select-msg.sql \
 	   libdbi-basic.sh \
@@ -680,15 +704,17 @@ EXTRA_DIST= 1.rstest 2.rstest 3.rstest err1.rstest \
 	   testsuites/mmnormalize_tokenized.conf \
 	   testsuites/tokenized_input \
 	   rscript_replace.sh \
-	   rscript_replace_complex.sh \
 	   testsuites/rscript_replace.conf \
+	   rscript_replace_complex.sh \
 	   testsuites/rscript_replace_complex.conf \
 	   testsuites/complex_replace_input \
+	   rscript_unaffected_reset.sh \
 	   rscript_wrap2.sh \
 	   testsuites/rscript_wrap2.conf \
 	   rscript_wrap3.sh \
 	   testsuites/rscript_wrap3.conf \
-	   testsuites/wrap3_input \
+	   testsuites/wrap3_input\
+	   testsuites/gethostname.conf \
 	   json_array_subscripting.sh \
 	   testsuites/json_array_subscripting.conf \
 	   testsuites/json_array_input \
@@ -730,10 +756,7 @@ minitcpsrv_SOURCES = minitcpsrvr.c
 minitcpsrv_LDADD = $(SOL_LIBS)
 
 syslog_caller_SOURCES = syslog_caller.c
-syslog_caller_LDADD = $(SOL_LIBS)
-
-syslog_inject_SOURCES = syslog_inject.c
-syslog_inject_LDADD = $(SOL_LIBS)
+syslog_caller_LDADD = $(SOL_LIBS) $(LIBLOGGING_STDLOG_LIBS)
 
 diagtalker_SOURCES = diagtalker.c
 diagtalker_LDADD = $(SOL_LIBS)

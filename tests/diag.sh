@@ -216,6 +216,13 @@ case $1 in
    'content-check') 
 		cat rsyslog.out.log | grep -qF "$2"
 		if [ "$?" -ne "0" ]; then
+		    echo content-check failed
+		    exit 1
+		fi
+		;;
+   'assert-content-missing') 
+		cat rsyslog.out.log | grep -qF "$2"
+		if [ "$?" -eq "0" ]; then
 		    exit 1
 		fi
 		;;

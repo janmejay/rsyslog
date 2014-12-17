@@ -2,7 +2,7 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ(2.61)
-AC_INIT([rsyslog],[8.6.0],[rsyslog@lists.adiscon.com])
+AC_INIT([rsyslog],[8.7.0.master],[rsyslog@lists.adiscon.com])
 AM_INIT_AUTOMAKE([subdir-objects])
 
 m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
@@ -30,7 +30,6 @@ PKG_PROG_PKG_CONFIG
 
 # modules we require
 PKG_CHECK_MODULES(LIBESTR, libestr >= 0.1.9)
-PKG_CHECK_MODULES(LIBLOGGING_STDLOG, liblogging-stdlog >= 1.0.3)
 PKG_CHECK_MODULES([JSON_C], [json],, [
 	PKG_CHECK_MODULES([JSON_C], [json-c],,)
 ])
@@ -359,7 +358,9 @@ AC_ARG_ENABLE(imjournal,
         [enable_imjournal="no"]
 )
 if test "x$enable_imjournal" = "xyes"; then
-	PKG_CHECK_MODULES([LIBSYSTEMD_JOURNAL], [libsystemd-journal >= 197])
+	PKG_CHECK_MODULES([LIBSYSTEMD_JOURNAL], [libsystemd >= 209] ,, [
+	    PKG_CHECK_MODULES([LIBSYSTEMD_JOURNAL], [libsystemd-journal >= 197])
+	])
 fi
 AM_CONDITIONAL(ENABLE_IMJOURNAL, test x$enable_imjournal = xyes)
 
@@ -1061,6 +1062,24 @@ fi
 AM_CONDITIONAL(ENABLE_GUARDTIME, test x$enable_guardtime = xyes)
 
 
+# liblogging-stdlog support
+AC_ARG_ENABLE(liblogging-stdlog,
+        [AS_HELP_STRING([--enable-liblogging-stdlog],[Enable liblogging-stdlog support @<:@default=yes@:>@])],
+        [case "${enableval}" in
+         yes) enable_liblogging_stdlog="yes" ;;
+          no) enable_liblogging_stdlog="no" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-liblogging-stdlog) ;;
+         esac],
+        [enable_liblogging_stdlog=yes]
+)
+if test "x$enable_liblogging_stdlog" = "xyes"; then
+        PKG_CHECK_MODULES(LIBLOGGING_STDLOG, liblogging-stdlog >= 1.0.3,
+		AC_DEFINE(HAVE_LIBLOGGING_STDLOG, 1, [Define to 1 if liblogging-stdlog is available.])
+        )
+fi
+AM_CONDITIONAL(ENABLE_LIBLOGGING_STDLOG, test x$enable_liblogging_stdlog = xyes)
+
+
 # RFC 3195 support
 AC_ARG_ENABLE(rfc3195,
         [AS_HELP_STRING([--enable-rfc3195],[Enable RFC3195 support @<:@default=no@:>@])],
@@ -1213,7 +1232,9 @@ AC_ARG_ENABLE(omjournal,
         [enable_omjournal=no]
 )
 if test "x$enable_omjournal" = "xyes"; then
-	PKG_CHECK_MODULES([LIBSYSTEMD_JOURNAL], [libsystemd-journal >= 197])
+	PKG_CHECK_MODULES([LIBSYSTEMD_JOURNAL], [libsystemd >= 209] ,, [
+	    PKG_CHECK_MODULES([LIBSYSTEMD_JOURNAL], [libsystemd-journal >= 197])
+	])
 fi
 AM_CONDITIONAL(ENABLE_OMJOURNAL, test x$enable_omjournal = xyes)
 
@@ -1587,6 +1608,7 @@ echo "    Log file encryption support:              $enable_libgcrypt"
 echo "    anonymization support enabled:            $enable_mmanon"
 echo "    message counting support enabled:         $enable_mmcount"
 echo "    mmfields enabled:                         $enable_mmfields"
+echo "    liblogging-stdlog support enabled:        $enable_liblogging_stdlog"
 echo
 echo "---{ input plugins }---"
 echo "    Klog functionality enabled:               $enable_klog ($os_type)"
