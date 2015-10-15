@@ -177,6 +177,7 @@ TESTS +=  \
 	imptcp_conndrop.sh \
 	imptcp_no_octet_counted.sh \
 	imptcp_spframingfix.sh \
+	imptcp_nonProcessingPoller.sh \
 	rscript_random.sh \
 	rscript_replace.sh \
 	rscript_replace_complex.sh \
