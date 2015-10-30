@@ -197,6 +197,14 @@ case $1 in
 			echo WaitMainQueueEmpty | ./diagtalker || . ./diag.sh error-exit  $?
 		fi
 		;;
+   'await-lookup-table-reload') # wait for all pending lookup table reloads to complete $2 is the instance.
+		if [ "$2" == "2" ]
+		then
+			echo AwaitLookupTableReload | ./diagtalker -p13501 || . $srcdir/diag.sh error-exit  $?
+		else
+			echo AwaitLookupTableReload | ./diagtalker || . $srcdir/diag.sh error-exit  $?
+		fi
+		;;
    'issue-HUP') # shut rsyslogd down when main queue is empty. $2 is the instance.
 		kill -HUP `cat rsyslog$2.pid`
 		./msleep 1000
@@ -271,6 +279,13 @@ case $1 in
 		    . ./diag.sh error-exit 1
 		fi
 		;;
+   'content-check-with-count') 
+		count=$(cat rsyslog.out.log | grep -qF "$2" | wc -l)
+		if [ "x$count" == "x$3" ]; then
+		    echo content-check failed, expected $2 to occure $3 times, but found it $count times
+		    . $srcdir/diag.sh error-exit 1
+		fi
+		;;
    'custom-content-check') 
 		cat $3 | grep -qF "$2"
 		if [ "$?" -ne "0" ]; then
@@ -288,7 +303,8 @@ case $1 in
    'assert-content-missing') 
 		cat rsyslog.out.log | grep -qF "$2"
 		if [ "$?" -eq "0" ]; then
-		    . ./diag.sh error-exit 1
+		    echo content-missing assertion failed
+		    . $srcdir/diag.sh error-exit 1
 		fi
 		;;
    'gzip-seq-check') # do the usual sequence check, but for gzip files

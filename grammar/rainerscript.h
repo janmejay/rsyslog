@@ -153,6 +153,7 @@ struct nvlst {
 #define S_UNSET 4007
 #define S_CALL 4008
 #define S_FOREACH 4009
+#define S_RELOAD_LOOKUP_TABLE 4010
 
 enum cnfFiltType { CNFFILT_NONE, CNFFILT_PRI, CNFFILT_PROP, CNFFILT_SCRIPT };
 static inline char*
@@ -214,6 +215,11 @@ struct cnfstmt {
 			struct cnfitr *iter;
 			struct cnfstmt *body;
 		} s_foreach;
+        struct {
+			lookup_ref_t *table;
+            uchar *table_name;
+			uchar *stub_value;
+		} s_reload_lookup_table;
 	} d;
 };
 
@@ -281,6 +287,7 @@ struct cnffunc {
 	unsigned short nParams;
 	enum cnffuncid fID; /* function ID for built-ins, 0 means use name */
 	void *funcdata;	/* global data for function-specific use (e.g. compiled regex) */
+	uint8_t destructable_funcdata;
 	struct cnfexpr *expr[];
 };
 
@@ -378,6 +385,7 @@ struct cnfstmt * cnfstmtNewSet(char *var, struct cnfexpr *expr, int force_reset)
 struct cnfstmt * cnfstmtNewUnset(char *var);
 struct cnfstmt * cnfstmtNewCall(es_str_t *name);
 struct cnfstmt * cnfstmtNewContinue(void);
+struct cnfstmt * cnfstmtNewReloadLookupTable(struct cnffparamlst *fparams);
 void cnfstmtDestructLst(struct cnfstmt *root);
 void cnfstmtOptimize(struct cnfstmt *root);
 struct cnfarray* cnfarrayNew(es_str_t *val);

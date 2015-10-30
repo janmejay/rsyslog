@@ -210,6 +210,7 @@ CODESTARTobjDestruct(rsconf)
 	tplDeleteAll(pThis);
 	free(pThis->globals.mainQ.pszMainMsgQFName);
 	free(pThis->globals.pszConfDAGFile);
+	lookupDestroyCnf();
 	llDestroy(&(pThis->rulesets.llRulesets));
 ENDobjDestruct(rsconf)
 
@@ -424,7 +425,7 @@ void cnfDoObj(struct cnfobj *o)
 		inputProcessCnf(o);
 		break;
 	case CNFOBJ_LOOKUP_TABLE:
-		lookupProcessCnf(o);
+		lookupTableDefProcessCnf(o);
 		break;
 	case CNFOBJ_PARSER:
 		parserProcessCnf(o);

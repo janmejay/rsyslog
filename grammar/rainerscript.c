@@ -1195,7 +1195,7 @@ done:
 static long long
 var2Number(struct var *r, int *bSuccess)
 {
-	long long n;
+	long long n = 0;
 	if(r->datatype == 'S') {
 		n = es_str2num(r->d.estr, bSuccess);
 	} else {
@@ -1284,6 +1284,7 @@ static rsRetVal
 doExtractFieldByChar(uchar *str, uchar delim, const int matchnbr, uchar **resstr)
 {
 	int iCurrFld;
+    int allocLen;
 	int iLen;
 	uchar *pBuf;
 	uchar *pFld;
@@ -1314,7 +1315,12 @@ doExtractFieldByChar(uchar *str, uchar delim, const int matchnbr, uchar **resstr
 			    * step back a little not to copy it as part of the field. */
 		/* we got our end pointer, now do the copy */
 		iLen = pFldEnd - pFld + 1; /* the +1 is for an actual char, NOT \0! */
-		CHKmalloc(pBuf = MALLOC((iLen + 1) * sizeof(uchar)));
+        allocLen = iLen + 1;
+#	ifdef VALGRIND
+		allocLen += (3 - (iLen % 4));
+        /*older versions of valgrind have a problem with strlen inspecting 4-bytes at a time*/
+#	endif
+		CHKmalloc(pBuf = MALLOC(allocLen * sizeof(uchar)));
 		/* now copy */
 		memcpy(pBuf, pFld, iLen);
 		pBuf[iLen] = '\0'; /* terminate it */
@@ -1589,7 +1595,7 @@ doRandomGen(struct var *__restrict__ const sourceVal) {
 	}
 	long int x = randomNumber();
 	if (max > MAX_RANDOM_NUMBER) {
-		dbgprintf("rainerscript: desired random-number range [0 - %ld) is wider than supported limit of [0 - %ld)", max, MAX_RANDOM_NUMBER);
+		dbgprintf("rainerscript: desired random-number range [0 - %lld) is wider than supported limit of [0 - %d)", max, MAX_RANDOM_NUMBER);
 	}
 	return x % max;
 }
@@ -1613,6 +1619,9 @@ doFuncCall(struct cnffunc *__restrict__ const func, struct var *__restrict__ con
 	int matchnbr;
 	struct funcData_prifilt *pPrifilt;
 	rsRetVal localRet;
+	lookup_key_t key;
+	uint8_t lookup_key_type;
+	lookup_t *lookup_table;
 
 	dbgprintf("rainerscript: executing function id %d\n", func->fID);
 	switch(func->fID) {
@@ -1774,16 +1783,27 @@ doFuncCall(struct cnffunc *__restrict__ const func, struct var *__restrict__ con
 		ret->datatype = 'N';
 		break;
 	case CNFFUNC_LOOKUP:
-dbgprintf("DDDD: executing lookup\n");
+		dbgprintf("DDDD: executing lookup\n");
 		ret->datatype = 'S';
 		if(func->funcdata == NULL) {
 			ret->d.estr = es_newStrFromCStr("TABLE-NOT-FOUND", sizeof("TABLE-NOT-FOUND")-1);
 			break;
 		}
 		cnfexprEval(func->expr[1], &r[1], usrptr);
-		str = (char*) var2CString(&r[1], &bMustFree);
-		ret->d.estr = lookupKey_estr(func->funcdata, (uchar*)str);
-		if(bMustFree) free(str);
+		lookup_table = ((lookup_ref_t*)func->funcdata)->self;
+		if (lookup_table != NULL) {
+			lookup_key_type = lookup_table->key_type;
+			bMustFree = 0;
+			if (lookup_key_type == LOOKUP_KEY_TYPE_STRING) {
+				key.k_str = (uchar*) var2CString(&r[1], &bMustFree);
+			} else if (lookup_key_type == LOOKUP_KEY_TYPE_UINT) {
+				key.k_uint = var2Number(&r[1], NULL);
+			}
+			ret->d.estr = lookupKey((lookup_ref_t*)func->funcdata, key);
+			if(bMustFree) free(key.k_str);
+		} else {
+			ret->d.estr = es_newStrFromCStr("", 1);
+		}
 		varFreeMembers(&r[1]);
 		break;
 	default:
@@ -2426,8 +2446,9 @@ cnffuncDestruct(struct cnffunc *func)
 			break;
 		default:break;
 	}
-	if(func->fID != CNFFUNC_EXEC_TEMPLATE)
+	if(func->destructable_funcdata) {
 		free(func->funcdata);
+	}
 	free(func->fname);
 }
 
@@ -2741,6 +2762,11 @@ cnfstmtPrintOnly(struct cnfstmt *stmt, int indent, sbool subtree)
 		doIndent(indent); dbgprintf("UNSET %s\n",
 				  stmt->d.s_unset.varname);
 		break;
+    case S_RELOAD_LOOKUP_TABLE:
+		doIndent(indent); dbgprintf("RELOAD_LOOKUP_TABLE table(%s) (stub with '%s' on error)",
+									stmt->d.s_reload_lookup_table.table_name,
+									stmt->d.s_reload_lookup_table.stub_value);
+		break;
 	case S_PRIFILT:
 		doIndent(indent); dbgprintf("PRIFILT '%s'\n", stmt->printable);
 		pmaskPrint(stmt->d.s_prifilt.pmask, indent);
@@ -2935,6 +2961,13 @@ cnfstmtDestruct(struct cnfstmt *stmt)
 			cstrDestruct(&stmt->d.s_propfilt.pCSCompValue);
 		cnfstmtDestructLst(stmt->d.s_propfilt.t_then);
 		break;
+    case S_RELOAD_LOOKUP_TABLE:
+        if (stmt->d.s_reload_lookup_table.table_name != NULL) {
+			free(stmt->d.s_reload_lookup_table.table_name);
+        }
+        if (stmt->d.s_reload_lookup_table.stub_value != NULL) {
+			free(stmt->d.s_reload_lookup_table.stub_value);
+        }
 	default:
 		dbgprintf("error: unknown stmt type during destruct %u\n",
 			(unsigned) stmt->nodetype);
@@ -2994,6 +3027,68 @@ cnfstmtNewCall(es_str_t *name)
 	struct cnfstmt* cnfstmt;
 	if((cnfstmt = cnfstmtNew(S_CALL)) != NULL) {
 		cnfstmt->d.s_call.name = name;
+	}
+	return cnfstmt;
+}
+
+struct cnfstmt *
+cnfstmtNewReloadLookupTable(struct cnffparamlst *fparams)
+{
+	int nParams;
+	struct cnffparamlst *param, *nxt;
+	struct cnfstmt* cnfstmt;
+	uint8_t failed = 0;
+	if((cnfstmt = cnfstmtNew(S_RELOAD_LOOKUP_TABLE)) != NULL) {
+		nParams = 0;
+		for(param = fparams ; param != NULL ; param = param->next) {
+			++nParams;
+		}
+		cnfstmt->d.s_reload_lookup_table.table_name = cnfstmt->d.s_reload_lookup_table.stub_value = NULL;
+		switch(nParams) {
+		case 2:
+			param = fparams->next;
+			if (param->expr->nodetype != 'S') {
+				parser_errmsg("statement ignored: reload_lookup_table(table_name, optional:stub_value_in_case_reload_fails) "
+							  "expects a litteral string for second argument\n");
+				failed = 1;
+			}
+			if ((cnfstmt->d.s_reload_lookup_table.stub_value = (uchar*) es_str2cstr(((struct cnfstringval*)param->expr)->estr, NULL)) == NULL) {
+				parser_errmsg("statement ignored: reload_lookup_table statement failed to allocate memory for lookup-table stub-value\n");
+				failed = 1;
+			}
+		case 1:
+			param = fparams;
+			if (param->expr->nodetype != 'S') {
+				parser_errmsg("statement ignored: reload_lookup_table(table_name, optional:stub_value_in_case_reload_fails) "
+							  "expects a litteral string for first argument\n");
+				failed = 1;
+			}
+			if ((cnfstmt->d.s_reload_lookup_table.table_name = (uchar*) es_str2cstr(((struct cnfstringval*)param->expr)->estr, NULL)) == NULL) {
+				parser_errmsg("statement ignored: reload_lookup_table statement failed to allocate memory for lookup-table name\n");
+				failed = 1;
+			}
+			break;
+		default:
+			parser_errmsg("statement ignored: reload_lookup_table(table_name, optional:stub_value_in_case_reload_fails) "
+						  "expected 1 or 2 arguments, but found '%d'\n", nParams);
+			failed = 1;
+		}
+	}
+	param = fparams;
+	while(param != NULL) {
+		nxt = param->next;
+		if (param->expr != NULL) cnfexprDestruct(param->expr);
+		free(param);
+		param = nxt;
+	}
+	if (failed) {
+		cnfstmt->nodetype = S_NOP;
+		if (cnfstmt->d.s_reload_lookup_table.table_name != NULL) {
+			free(cnfstmt->d.s_reload_lookup_table.table_name);
+		}
+		if (cnfstmt->d.s_reload_lookup_table.stub_value != NULL) {
+			free(cnfstmt->d.s_reload_lookup_table.stub_value);
+		}
 	}
 	return cnfstmt;
 }
@@ -3572,6 +3667,13 @@ cnfstmtOptimizePRIFilt(struct cnfstmt *stmt)
 done:	return;
 }
 
+static void
+cnfstmtOptimizeReloadLookupTable(struct cnfstmt *stmt) {
+	if((stmt->d.s_reload_lookup_table.table = lookupFindTable(stmt->d.s_reload_lookup_table.table_name)) == NULL) {
+		parser_errmsg("lookup table '%s' not found\n", stmt->d.s_reload_lookup_table.table_name);
+	}
+}
+
 /* we abuse "optimize" a bit. Actually, we obtain a ruleset pointer, as
  * all rulesets are only known later in the process (now!).
  */
@@ -3638,6 +3740,9 @@ cnfstmtOptimize(struct cnfstmt *root)
 				parser_errmsg("STOP is followed by unreachable statements!\n");
 			break;
 		case S_UNSET: /* nothing to do */
+			break;
+        case S_RELOAD_LOOKUP_TABLE:
+            cnfstmtOptimizeReloadLookupTable(stmt);
 			break;
 		case S_NOP:
 			DBGPRINTF("optimizer error: we see a NOP, how come?\n");
@@ -3727,7 +3832,7 @@ funcName2ID(es_str_t *fname, unsigned short nParams)
 			"but is %d.");
 	} else if(FUNC_NAME("wrap")) {
 		GENERATE_FUNC_WITH_NARG_RANGE("wrap", 2, 3, CNFFUNC_WRAP,
-									  "number of parameters for wrap() must either be "
+									  "number of parameters for %s() must either be "
 									  "two (operand_string, wrapper) or"
 									  "three (operand_string, wrapper, wrapper_escape_str)"
 									  "but is %d.");
@@ -3786,6 +3891,8 @@ initFunc_exec_template(struct cnffunc *func)
 	char *tplName = NULL;
 	DEFiRet;
 
+	func->destructable_funcdata = 0;
+
 	if(func->nParams != 1) {
 		parser_errmsg("rsyslog logic error in line %d of file %s\n",
 			__LINE__, __FILE__);
@@ -3841,31 +3948,37 @@ finalize_it:
 
 
 static inline rsRetVal
-initFunc_lookup(struct cnffunc *func)
+resolveLookupTable(struct cnffunc *func)
 {
 	uchar *cstr = NULL;
+	char *fn_name = NULL;
 	DEFiRet;
 
-	if(func->nParams != 2) {
+	func->destructable_funcdata = 0;
+
+	if(func->nParams == 0) {/*we assume first arg is lookup-table-name*/
 		parser_errmsg("rsyslog logic error in line %d of file %s\n",
 			__LINE__, __FILE__);
 		FINALIZE;
 	}
 
+	CHKmalloc(fn_name = es_str2cstr(func->fname, NULL));
+
 	func->funcdata = NULL;
 	if(func->expr[0]->nodetype != 'S') {
-		parser_errmsg("table name (param 1) of lookup() must be a constant string");
+		parser_errmsg("table name (param 1) of %s() must be a constant string", fn_name);
 		FINALIZE;
 	}
 
-	cstr = (uchar*)es_str2cstr(((struct cnfstringval*) func->expr[0])->estr, NULL);
+	CHKmalloc(cstr = (uchar*)es_str2cstr(((struct cnfstringval*) func->expr[0])->estr, NULL));
 	if((func->funcdata = lookupFindTable(cstr)) == NULL) {
-		parser_errmsg("lookup table '%s' not found", cstr);
+		parser_errmsg("lookup table '%s' not found (used in function: %s)", cstr, fn_name);
 		FINALIZE;
 	}
 
 finalize_it:
 	free(cstr);
+	free(fn_name);
 	RETiRet;
 }
 
@@ -3888,6 +4001,7 @@ cnffuncNew(es_str_t *fname, struct cnffparamlst* paramlst)
 		func->fname = fname;
 		func->nParams = nParams;
 		func->funcdata = NULL;
+		func->destructable_funcdata = 1;
 		func->fID = funcName2ID(fname, nParams);
 		/* shuffle params over to array (access speed!) */
 		param = paramlst;
@@ -3908,7 +4022,7 @@ cnffuncNew(es_str_t *fname, struct cnffparamlst* paramlst)
 				initFunc_prifilt(func);
 				break;
 			case CNFFUNC_LOOKUP:
-				initFunc_lookup(func);
+				resolveLookupTable(func);
 				break;
 			case CNFFUNC_EXEC_TEMPLATE:
 				initFunc_exec_template(func);
