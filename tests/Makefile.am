@@ -180,6 +180,21 @@ endif
 endif
 endif
 
+if ENABLE_IMPSTATS
+TESTS +=  \
+	dynstats.sh \
+	dynstats_overflow.sh \
+	dynstats_reset.sh \
+	dynstats_ctr_reset.sh \
+	dynstats_nometric.sh
+if HAVE_VALGRIND
+TESTS +=  \
+	dynstats-vg.sh \
+	dynstats_reset-vg.sh \
+	dynstats_overflow-vg.sh
+endif
+endif
+
 if ENABLE_IMPTCP
 # note that some tests simply USE imptcp, but they also
 # need to be disabled if we do not have this module
@@ -821,8 +836,30 @@ EXTRA_DIST= \
 	mysql-actq-mt-withpause-vg.sh \
 	testsuites/mysql-actq-mt.conf \
 	mmpstrucdata.sh \
+	mmpstrucdata-vg.sh \
 	testsuites/mmpstrucdata.conf \
 	libdbi-basic-vg.sh \
+	dynstats_ctr_reset.sh \
+	dynstats_nometric.sh \
+	dynstats_overflow.sh \
+	dynstats_overflow-vg.sh \
+	dynstats_reset.sh \
+	dynstats_reset-vg.sh \
+	dynstats.sh \
+	dynstats-vg.sh \
+	testsuites/dynstats.conf \
+	testsuites/dynstats_ctr_reset.conf \
+	testsuites/dynstats_empty_input \
+	testsuites/dynstats_input \
+	testsuites/dynstats_input_1 \
+	testsuites/dynstats_input_2 \
+	testsuites/dynstats_input_3 \
+	testsuites/dynstats_input_more_0 \
+	testsuites/dynstats_input_more_1 \
+	testsuites/dynstats_input_more_2 \
+	testsuites/dynstats_nometric.conf \
+	testsuites/dynstats_overflow.conf \
+	testsuites/dynstats_reset.conf \
 	mmnormalize_variable.sh \
 	mmnormalize_tokenized.sh \
 	testsuites/mmnormalize_variable.conf \
