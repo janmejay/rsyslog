@@ -34,6 +34,7 @@ DEFobjCurrIf(statsobj)
 #define DYNSTATS_MAX_BUCKET_NS_METRIC_LENGTH 100
 #define DYNSTATS_METRIC_NAME_SEPARATOR ':'
 #define DYNSTATS_HASHTABLE_SIZE_OVERPROVISIONING 1.25
+#define DYNSTATS_METRIC_TRIE_DEFAULT_HASHTABLE_CAPACITY 8
 
 static struct cnfparamdescr modpdescr[] = {
 	{ DYNSTATS_PARAM_NAME, eCmdHdlrString, CNFPARAM_REQUIRED },
@@ -67,21 +68,42 @@ dynstats_destroyCtr(dynstats_bucket_t *b, dynstats_ctr_t *ctr, uint8_t destructS
 	free(ctr);
 }
 
-static inline void /* assumes exclusive access to bucket */
-dynstats_destroyCounters(dynstats_bucket_t *b) {
-	dynstats_ctr_t *ctr;
+static inline void
+dynstats_destroyMetricNode(dynstats_bucket_t *b, dynstats_metric_node_t *n, uint8_t destructStatsCtr);
 
-	hdestroy_r(&b->table);
-	statsobj.DestructAllCounters(b->stats);
-	while(1) {
-		ctr = SLIST_FIRST(&b->ctrs);
-		if (ctr == NULL) {
+static inline void
+dynstats_destroyMetricEntry(dynstats_bucket_t *b, dynstats_metric_entry_t *e,  uint8_t destructStatsCtr) {
+    if (ustrlen(e->k) == 0) {
+        dynstats_destroyCtr(b, e->d.ctr, destructStatsCtr);
+    } else {
+        dynstats_destroyMetricNode(b, e->d.nxt, destructStatsCtr);
+    }
+	free(e->k);
+    free(e);
+}
+
+static inline void
+dynstats_destroyMetricNode(dynstats_bucket_t *b, dynstats_metric_node_t *n, uint8_t destructStatsCtr) {
+    dynstats_metric_entry_t *e;
+
+    hdestroy_r(&n->table);
+    while(1) {
+		e = SLIST_FIRST(&n->entries);
+		if (e == NULL) {
 			break;
 		} else {
-			SLIST_REMOVE_HEAD(&b->ctrs, link);
-			dynstats_destroyCtr(b, ctr, 0);
+			SLIST_REMOVE_HEAD(&n->entries, link);
+			dynstats_destroyMetricEntry(b, e, destructStatsCtr);
 		}
 	}
+    pthread_rwlock_destroy(&n->lock);
+    free(n);
+}
+
+static inline void /* assumes exclusive access to bucket */
+dynstats_destroyMetrics(dynstats_bucket_t *b) {
+	statsobj.DestructAllCounters(b->stats);
+    dynstats_destroyMetricNode(b, b->root, 0);
 	STATSCOUNTER_BUMP(b->ctrMetricsPurged, b->mutCtrMetricsPurged, b->metricCount);
 }
 
@@ -92,7 +114,7 @@ dynstats_destroyBucket(dynstats_bucket_t* b) {
 	bkts = &loadConf->dynstats_buckets;
 
 	pthread_rwlock_wrlock(&b->lock);
-	dynstats_destroyCounters(b);
+	dynstats_destroyMetrics(b);
 	statsobj.Destruct(&b->stats);
 	free(b->name);
 	pthread_rwlock_unlock(&b->lock);
@@ -157,6 +179,45 @@ finalize_it:
 	RETiRet;
 }
 
+static inline rsRetVal
+dynstats_createMetricNode(dynstats_metric_node_t **node) {
+    dynstats_metric_node_t *n;
+    uint8_t lock_initialized;
+    DEFiRet;
+
+    lock_initialized = 0;
+
+    CHKmalloc(n = calloc(1, sizeof(dynstats_metric_node_t)));
+    n->capacity = DYNSTATS_METRIC_TRIE_DEFAULT_HASHTABLE_CAPACITY;
+    pthread_rwlock_init(&n->lock, NULL);
+    lock_initialized = 1;
+    if (! hcreate_r(n->capacity, &n->table)) {
+		ABORT_FINALIZE(RS_RET_INTERNAL_ERROR);
+	}
+    SLIST_INIT(&n->entries);
+
+    *node = n;
+finalize_it:
+    if (iRet != RS_RET_OK) {
+        hdestroy_r(&n->table);
+        if (lock_initialized) {
+            pthread_rwlock_destroy(&n->lock);
+        }
+        free(n);
+    }
+
+    RETiRet;
+}
+
+static inline rsRetVal
+dynstats_createMetrics(dynstats_bucket_t *b) {
+    DEFiRet;
+    b->root = NULL;
+    CHKiRet(dynstats_createMetricNode(&b->root));
+finalize_it:
+    RETiRet;
+}
+
 static rsRetVal
 dynstats_resetBucket(dynstats_bucket_t *b, uint8_t do_purge) {
 	size_t htab_sz;
@@ -164,14 +225,11 @@ dynstats_resetBucket(dynstats_bucket_t *b, uint8_t do_purge) {
 	htab_sz = (size_t) (DYNSTATS_HASHTABLE_SIZE_OVERPROVISIONING * b->maxCardinality + 1);
 	pthread_rwlock_wrlock(&b->lock);
 	if (do_purge) {
-		dynstats_destroyCounters(b);
+		dynstats_destroyMetrics(b);
 	}
 	ATOMIC_STORE_0_TO_INT(&b->metricCount, &b->mutMetricCount);
 	SLIST_INIT(&b->ctrs);
-	if (! hcreate_r(htab_sz, &b->table)) {
-		errmsg.LogError(errno, RS_RET_INTERNAL_ERROR, "error trying to initialize hash-table for dyn-stats bucket named: %s", b->name);
-		ABORT_FINALIZE(RS_RET_INTERNAL_ERROR);
-	}
+    CHKiRet(dynstats_createMetrics(b));
 finalize_it:
 	pthread_rwlock_unlock(&b->lock);
 	if (iRet != RS_RET_OK) {
@@ -389,65 +447,205 @@ finalize_it:
 	RETiRet;
 }
 
-static rsRetVal
-dynstats_addNewCtr(dynstats_bucket_t *b, const uchar* metric, uint8_t doInitialIncrement) {
-	dynstats_ctr_t *ctr;
-	dynstats_ctr_t *found_ctr;
-	ENTRY lookup, *entry;
-	int found, created;
+static inline rsRetVal
+dynstats_findOrCreateCtr(dynstats_bucket_t *b, dynstats_metric_node_t *n, dynstats_ctr_t **pCtr, uchar *metric, int metric_len, int remaining_metric_len);
+
+static inline rsRetVal
+dynstats_proceedFindOrCreateCtr(dynstats_bucket_t *b, ENTRY *entry, dynstats_ctr_t **pCtr, uchar *metric, int metric_len, int remaining_metric_len) {
+	dynstats_metric_entry_t *e;
 	DEFiRet;
-
-	found = created = 0;
-	ctr = NULL;
-
-	if (ATOMIC_FETCH_32BIT(&b->metricCount, &b->mutMetricCount) >= b->maxCardinality) {
-		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
-	}
-	
-	CHKiRet(dynstats_createCtr(b, metric, &ctr));
-	lookup.data = ctr;
-	lookup.key = ctr->metric;
-
-	pthread_rwlock_wrlock(&b->lock);
-	found = hsearch_r(lookup, FIND, &entry, &b->table);//TODO: see what happens on 2nd ENTER for same key, it may be simplifiable.
-	if (found) {
-		found_ctr = (dynstats_ctr_t*) entry->data;
-		if (doInitialIncrement) {
-			STATSCOUNTER_INC(found_ctr->ctr, found_ctr->mutCtr);
-		}
+	e = (dynstats_metric_entry_t *)entry->data;
+	if (remaining_metric_len > 0) {
+		CHKiRet(dynstats_findOrCreateCtr(b, e->d.nxt, pCtr, metric, metric_len, remaining_metric_len - 1));
 	} else {
-		created = hsearch_r(lookup, ENTER, &entry, &b->table);
-		if (created) {
-			SLIST_INSERT_HEAD(&b->ctrs, ctr, link);
-			if (doInitialIncrement) {
-				STATSCOUNTER_INC(ctr->ctr, ctr->mutCtr);
-			}
-		}
+		*pCtr = e->d.ctr;
 	}
-	pthread_rwlock_unlock(&b->lock);
-
-	if (found) {
-		//ignore
-	} else if (created) {
-		ATOMIC_INC(&b->metricCount, &b->mutMetricCount);
-		STATSCOUNTER_INC(b->ctrNewMetricAdd, b->mutCtrNewMetricAdd);
-	} else {
-		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
-	}
-	
 finalize_it:
-	if ((! created) && (ctr != NULL)) {
+	RETiRet;
+}
+
+static inline rsRetVal
+dynstats_createMetricNodeEntry(dynstats_bucket_t *b, dynstats_metric_entry_t **pEntry, uchar *key) {
+	dynstats_metric_node_t *nxt;
+	dynstats_metric_entry_t *e;
+	DEFiRet;
+	CHKiRet(dynstats_createMetricNode(&nxt));
+	CHKmalloc(e = calloc(1, sizeof(dynstats_metric_entry_t)));
+	e->d.nxt = nxt;
+	e->k = ustrdup(key);
+	*pEntry = e;
+finalize_it:
+	if (iRet != RS_RET_OK) {
+		/*dont worry about destroying counters, because its just cleanup for failed create, no counters can exist anyway*/
+		dynstats_destroyMetricNode(b, nxt, 0);
+	}
+	RETiRet;
+}
+
+static inline rsRetVal
+dynstats_createMetricCtrEntry(dynstats_metric_entry_t **pEntry, dynstats_bucket_t *b, uchar *metric, uchar *key) {
+	dynstats_metric_node_t *nxt;
+	dynstats_metric_entry_t *e;
+	dynstats_ctr_t *ctr;
+	DEFiRet;
+	CHKiRet(dynstats_createCtr(b, metric, &ctr));
+	CHKmalloc(e = calloc(1, sizeof(dynstats_metric_entry_t)));
+	e->d.ctr = ctr;
+	e->k = ustrdup(key);
+	*pEntry = e;
+finalize_it:
+	if (iRet != RS_RET_OK) {
 		dynstats_destroyCtr(b, ctr, 1);
 	}
 	RETiRet;
 }
 
+static inline rsRetVal
+dynstats_insertToMetricNode(dynstats_metric_entry_t *e, dynstats_metric_node_t *n) {
+	ENTRY lookup;
+	ENTRY *entry;
+	int created;
+	DEFiRet;
+	
+	lookup.key = e->k;
+	lookup.data = e;
+	created = hsearch_r(lookup, ENTER, &entry, &n->table);
+	if (! created) {
+		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+	}
+	SLIST_INSERT_HEAD(&n->entries, e, link);
+	n->size++;
+	
+finalize_it:
+	RETiRet;
+}
+
+static inline rsRetVal
+dynstats_initMetric(dynstats_bucket_t *b, dynstats_metric_node_t *n, dynstats_ctr_t **pCtr, uchar *metric, int metric_len, int remaining_metric_len) {
+	ENTRY *entry;
+    ENTRY lookup;
+	uchar key[2];
+    uchar c;
+	int found;
+	uint8_t locked;
+	dynstats_metric_entry_t *e;
+	htable new_table;
+	int new_table_capacity;
+	DEFiRet;
+
+	locked = 0;
+	e = NULL;
+
+	if (ATOMIC_FETCH_32BIT(&b->metricCount, &b->mutMetricCount) >= b->maxCardinality) {
+		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+	}
+
+	if (remaining_metric_len > 0) {
+        key[0] =  metric[metric_len - remaining_metric_len];
+        key[1] = '\0';
+    } else {
+        key[0] = '\0';
+    }
+	lookup.key = key;
+	
+	pthread_rwlock_wrlock(&n->lock);
+	locked = 1;
+	found = hsearch_r(lookup, FIND, &entry, &n->table);
+	if (found) {
+		pthread_rwlock_unlock(&n->lock);
+		pthread_rwlock_rdlock(&n->lock);
+		CHKiRet(dynstats_proceedFindOrCreateCtr(b, entry, pCtr, metric, metric_len, remaining_metric_len));
+	} else {
+		if (n->size == n->capacity) {/* double the size and rehash */
+			new_table_capacity = n->capacity * 2;
+			if (! hcreate_r(new_table_capacity, &new_table)) {
+				ABORT_FINALIZE(RS_RET_INTERNAL_ERROR);
+			}
+			hdestroy_r(&n->table);
+			n->capacity = new_table_capacity;
+			n->table = new_table;
+		}
+		if (remaining_metric_len > 0) {
+			CHKiRet(dynstats_createMetricNodeEntry(b, &e, key));
+			CHKiRet(dynstats_insertToMetricNode(e, n));
+			pthread_rwlock_unlock(&n->lock);
+			pthread_rwlock_rdlock(&n->lock);
+			CHKiRet(dynstats_initMetric(b, e->d.nxt, pCtr, metric, metric_len, remaining_metric_len - 1));
+		} else {
+			CHKiRet(dynstats_createMetricCtrEntry(&e, b, metric, key));
+			CHKiRet(dynstats_insertToMetricNode(e, n));
+			ATOMIC_INC(&b->metricCount, &b->mutMetricCount);
+			STATSCOUNTER_INC(b->ctrNewMetricAdd, b->mutCtrNewMetricAdd);
+			*pCtr = e->d.ctr;
+		}
+	}
+finalize_it:
+	if (locked) {
+		pthread_rwlock_unlock(&n->lock);
+	}
+	if (iRet != RS_RET_OK) {
+		if (e != NULL) {
+			dynstats_destroyMetricEntry(b, e, 1);
+		}
+	}
+	RETiRet;
+}
+
+static inline rsRetVal
+dynstats_findOrCreateCtr(dynstats_bucket_t *b, dynstats_metric_node_t *n, dynstats_ctr_t **pCtr, uchar *metric, int metric_len, int remaining_metric_len) {
+    uchar c;
+    ENTRY lookup;
+    ENTRY *entry;
+    uchar key[2];
+    int found;
+    dynstats_metric_entry_t *e;
+    uint8_t locked;
+    DEFiRet;
+
+    locked = 0;
+    if (remaining_metric_len > 0) {
+        key[0] =  metric[metric_len - remaining_metric_len];
+        key[1] = '\0';
+    } else {
+        key[0] = '\0';
+    }
+
+    lookup.key = key;
+    pthread_rwlock_rdlock(&n->lock);
+    locked = 1;
+    found = hsearch_r(lookup, FIND, &entry, &n->table);
+    if (found) {
+        CHKiRet(dynstats_proceedFindOrCreateCtr(b, entry, pCtr, metric, metric_len, remaining_metric_len));
+    } else {
+        pthread_rwlock_unlock(&n->lock);
+		locked = 0;
+		CHKiRet(dynstats_initMetric(b, n, pCtr, metric, metric_len, remaining_metric_len));
+    }
+finalize_it:
+    if (locked) {
+        pthread_rwlock_unlock(&n->lock);
+    }        
+    RETiRet;
+}
+
+
+static inline rsRetVal
+dynstats_incCtr(dynstats_bucket_t *b, uchar *metric) {
+    dynstats_ctr_t *ctr;
+	int metric_len;
+    DEFiRet;
+	metric_len = ustrlen(metric);
+    pthread_rwlock_rdlock(&b->lock);
+    CHKiRet(dynstats_findOrCreateCtr(b, b->root, &ctr, metric, metric_len, metric_len));
+    STATSCOUNTER_INC(ctr->ctr, ctr->mutCtr);
+finalize_it:
+    pthread_rwlock_unlock(&b->lock);
+    RETiRet;
+}
+
 rsRetVal
 dynstats_inc(dynstats_bucket_t *b, uchar* metric) {
-	ENTRY lookup;
-	ENTRY *found;
 	int succeed;
-	dynstats_ctr_t *ctr;
 	DEFiRet;
 
 	if (ustrlen(metric) == 0) {
@@ -455,20 +653,10 @@ dynstats_inc(dynstats_bucket_t *b, uchar* metric) {
 		FINALIZE;
 	}
 
-	lookup.key = metric;
-	
-	pthread_rwlock_rdlock(&b->lock);
-	succeed = hsearch_r(lookup, FIND, &found, &b->table);
-	if (succeed) {
-		ctr = (dynstats_ctr_t *) found->data;
-		STATSCOUNTER_INC(ctr->ctr, ctr->mutCtr);
-	}
-	pthread_rwlock_unlock(&b->lock);
+	CHKiRet(dynstats_incCtr(b, metric));
 
-	if (!succeed) {
-		CHKiRet(dynstats_addNewCtr(b, metric, 1));
-	}
 finalize_it:
+
 	if (iRet != RS_RET_OK) {
 		STATSCOUNTER_INC(b->ctrOpsOverflow, b->mutCtrOpsOverflow);
 	}

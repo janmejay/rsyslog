@@ -13,8 +13,28 @@ struct dynstats_ctr_s {
     uchar *metric;
 };
 
+typedef struct dynstats_metric_entry_s dynstats_metric_entry_t;
+typedef struct dynstats_metric_node_s dynstats_metric_node_t;
+
+struct dynstats_metric_entry_s {
+    uchar *k;
+    union {
+        dynstats_ctr_t *ctr;
+        dynstats_metric_node_t *nxt;
+    } d;
+    SLIST_ENTRY(dynstats_metric_entry_s) link;
+};
+
+struct dynstats_metric_node_s {
+    pthread_rwlock_t lock;
+    htable table;
+    SLIST_HEAD(, dynstats_metric_entry_s) entries;
+    uint32_t size;
+    uint32_t capacity;
+};
+
 struct dynstats_bucket_s {
-	htable table;
+	dynstats_metric_node_t *root;
     uchar *name;
 	pthread_rwlock_t lock;
 	statsobj_t *stats;
