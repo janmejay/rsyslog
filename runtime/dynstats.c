@@ -558,6 +558,7 @@ dynstats_initMetric(dynstats_bucket_t *b, dynstats_metric_node_t *n, dynstats_ct
 	} else {
 		if (n->size == n->capacity) {/* double the size and rehash */
 			new_table_capacity = n->capacity * 2;
+			memset(&new_table, 0, sizeof(htable));
 			if (! hcreate_r(new_table_capacity, &new_table)) {
 				ABORT_FINALIZE(RS_RET_INTERNAL_ERROR);
 			}

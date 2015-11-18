@@ -184,7 +184,8 @@ if HAVE_VALGRIND
 TESTS +=  \
 	dynstats-vg.sh \
 	dynstats_reset-vg.sh \
-	dynstats_overflow-vg.sh
+	dynstats_overflow-vg.sh \
+	dynstats_node_rehash-vg.sh
 endif
 endif
 
@@ -835,6 +836,7 @@ EXTRA_DIST= \
 	libdbi-basic-vg.sh \
 	dynstats_ctr_reset.sh \
 	dynstats_nometric.sh \
+	dynstats_node_rehash-vg.sh \
 	dynstats_overflow.sh \
 	dynstats_overflow-vg.sh \
 	dynstats_reset.sh \
@@ -844,6 +846,7 @@ EXTRA_DIST= \
 	testsuites/dynstats.conf \
 	testsuites/dynstats_ctr_reset.conf \
 	testsuites/dynstats_empty_input \
+	testsuites/dynstats_common_prefix_input \
 	testsuites/dynstats_input \
 	testsuites/dynstats_input_1 \
 	testsuites/dynstats_input_2 \
