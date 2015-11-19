@@ -27,7 +27,7 @@ struct dynstats_metric_entry_s {
 
 struct dynstats_metric_node_s {
     pthread_rwlock_t lock;
-    htable table;
+    htable *table;
     SLIST_HEAD(, dynstats_metric_entry_s) entries;
     uint32_t size;
     uint32_t capacity;

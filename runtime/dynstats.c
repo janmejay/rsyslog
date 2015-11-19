@@ -86,7 +86,8 @@ static inline void
 dynstats_destroyMetricNode(dynstats_bucket_t *b, dynstats_metric_node_t *n, uint8_t destructStatsCtr) {
     dynstats_metric_entry_t *e;
 
-    hdestroy_r(&n->table);
+    hdestroy_r(n->table);
+	free(n->table);
     while(1) {
 		e = SLIST_FIRST(&n->entries);
 		if (e == NULL) {
@@ -191,7 +192,8 @@ dynstats_createMetricNode(dynstats_metric_node_t **node) {
     n->capacity = DYNSTATS_METRIC_TRIE_DEFAULT_HASHTABLE_CAPACITY;
     pthread_rwlock_init(&n->lock, NULL);
     lock_initialized = 1;
-    if (! hcreate_r(n->capacity, &n->table)) {
+	CHKmalloc(n->table = calloc(1, sizeof(htable)));
+    if (! hcreate_r(n->capacity, n->table)) {
 		ABORT_FINALIZE(RS_RET_INTERNAL_ERROR);
 	}
     SLIST_INIT(&n->entries);
@@ -199,7 +201,10 @@ dynstats_createMetricNode(dynstats_metric_node_t **node) {
     *node = n;
 finalize_it:
     if (iRet != RS_RET_OK) {
-        hdestroy_r(&n->table);
+		if (n->table != NULL) {
+			hdestroy_r(n->table);
+			free(n->table);
+		}
         if (lock_initialized) {
             pthread_rwlock_destroy(&n->lock);
         }
@@ -233,7 +238,7 @@ dynstats_resetBucket(dynstats_bucket_t *b, uint8_t do_purge) {
 finalize_it:
 	pthread_rwlock_unlock(&b->lock);
 	if (iRet != RS_RET_OK) {
-		statsobj.Destruct(&b->stats);
+		errmsg.LogMsg(0, RS_RET_TIMED_OUT, LOG_INFO, "dynstats: reset failed for bucket '%s'", b->name);
 	}
 	RETiRet;
 }
@@ -501,7 +506,7 @@ finalize_it:
 }
 
 static inline rsRetVal
-dynstats_insertToMetricNode(dynstats_metric_entry_t *e, dynstats_metric_node_t *n) {
+dynstats_insertToMetricNodeTable(dynstats_metric_entry_t *e, dynstats_metric_node_t *n) {
 	ENTRY lookup;
 	ENTRY *entry;
 	int created;
@@ -509,15 +514,33 @@ dynstats_insertToMetricNode(dynstats_metric_entry_t *e, dynstats_metric_node_t *
 	
 	lookup.key = e->k;
 	lookup.data = e;
-	created = hsearch_r(lookup, ENTER, &entry, &n->table);
+	created = hsearch_r(lookup, ENTER, &entry, n->table);
 	if (! created) {
 		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
 	}
+	
+finalize_it:
+	RETiRet;
+}
+
+static inline rsRetVal
+dynstats_insertToMetricNode(dynstats_metric_entry_t *e, dynstats_metric_node_t *n) {
+	DEFiRet;
+	
+	CHKiRet(dynstats_insertToMetricNodeTable(e, n));
 	SLIST_INSERT_HEAD(&n->entries, e, link);
 	n->size++;
 	
 finalize_it:
 	RETiRet;
+}
+
+static inline void
+dynstats_rehashMetricNodeEntries(dynstats_metric_node_t *n) {
+	dynstats_metric_entry_t *e;
+	SLIST_FOREACH(e, &n->entries, link) {
+		dynstats_insertToMetricNodeTable(e, n);
+	}
 }
 
 static inline rsRetVal
@@ -529,12 +552,13 @@ dynstats_initMetric(dynstats_bucket_t *b, dynstats_metric_node_t *n, dynstats_ct
 	int found;
 	uint8_t locked;
 	dynstats_metric_entry_t *e;
-	htable new_table;
+	htable *new_table;
 	int new_table_capacity;
 	DEFiRet;
 
 	locked = 0;
 	e = NULL;
+	new_table = NULL;
 
 	if (ATOMIC_FETCH_32BIT(&b->metricCount, &b->mutMetricCount) >= b->maxCardinality) {
 		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
@@ -550,21 +574,24 @@ dynstats_initMetric(dynstats_bucket_t *b, dynstats_metric_node_t *n, dynstats_ct
 	
 	pthread_rwlock_wrlock(&n->lock);
 	locked = 1;
-	found = hsearch_r(lookup, FIND, &entry, &n->table);
+	found = hsearch_r(lookup, FIND, &entry, n->table);
 	if (found) {
 		pthread_rwlock_unlock(&n->lock);
 		pthread_rwlock_rdlock(&n->lock);
 		CHKiRet(dynstats_proceedFindOrCreateCtr(b, entry, pCtr, metric, metric_len, remaining_metric_len));
 	} else {
 		if (n->size == n->capacity) {/* double the size and rehash */
+			CHKmalloc(new_table = calloc(1, sizeof(htable)));
 			new_table_capacity = n->capacity * 2;
-			memset(&new_table, 0, sizeof(htable));
-			if (! hcreate_r(new_table_capacity, &new_table)) {
+			if (! hcreate_r(new_table_capacity, new_table)) {
 				ABORT_FINALIZE(RS_RET_INTERNAL_ERROR);
 			}
-			hdestroy_r(&n->table);
+			hdestroy_r(n->table);
+			free(n->table);
 			n->capacity = new_table_capacity;
 			n->table = new_table;
+			dynstats_rehashMetricNodeEntries(n);
+			new_table = NULL;
 		}
 		if (remaining_metric_len > 0) {
 			CHKiRet(dynstats_createMetricNodeEntry(b, &e, key));
@@ -581,6 +608,10 @@ dynstats_initMetric(dynstats_bucket_t *b, dynstats_metric_node_t *n, dynstats_ct
 		}
 	}
 finalize_it:
+	if (new_table != NULL) {
+		hdestroy_r(new_table);
+		free(new_table);
+	}
 	if (locked) {
 		pthread_rwlock_unlock(&n->lock);
 	}
@@ -614,7 +645,7 @@ dynstats_findOrCreateCtr(dynstats_bucket_t *b, dynstats_metric_node_t *n, dynsta
     lookup.key = key;
     pthread_rwlock_rdlock(&n->lock);
     locked = 1;
-    found = hsearch_r(lookup, FIND, &entry, &n->table);
+    found = hsearch_r(lookup, FIND, &entry, n->table);
     if (found) {
         CHKiRet(dynstats_proceedFindOrCreateCtr(b, entry, pCtr, metric, metric_len, remaining_metric_len));
     } else {
