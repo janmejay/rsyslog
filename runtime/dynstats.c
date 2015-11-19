@@ -628,7 +628,7 @@ finalize_it:
 	}
 	if (iRet != RS_RET_OK) {
 		if (e != NULL) {
-			dynstats_destroyMetricEntry(b, e, 1);
+			//dynstats_destroyMetricEntry(b, e, 1);
 		}
 	}
 	RETiRet;
