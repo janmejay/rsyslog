@@ -47,7 +47,6 @@ struct dynstats_bucket_s {
 	STATSCOUNTER_DEF(ctrMetricsPurged, mutCtrMetricsPurged);
 	ctr_t *pMetricsPurgedCtr;
 	SLIST_ENTRY(dynstats_bucket_s) link;
-    SLIST_HEAD(, dynstats_ctr_s) ctrs;
     uint32_t maxCardinality;
     uint32_t metricCount;
     pthread_mutex_t mutMetricCount;

@@ -226,29 +226,38 @@ finalize_it:
 static rsRetVal
 dynstats_resetBucket(dynstats_bucket_t *b, uint8_t do_purge) {
 	size_t htab_sz;
+	int lock_ret = 0;
+	uint8_t locked = 0;
 	DEFiRet;
 	htab_sz = (size_t) (DYNSTATS_HASHTABLE_SIZE_OVERPROVISIONING * b->maxCardinality + 1);
-	pthread_rwlock_wrlock(&b->lock);
+	CHKiConcCtrl(lock_ret = pthread_rwlock_wrlock(&b->lock));
+	locked = 1;
 	if (do_purge) {
 		dynstats_destroyMetrics(b);
 	}
 	ATOMIC_STORE_0_TO_INT(&b->metricCount, &b->mutMetricCount);
-	SLIST_INIT(&b->ctrs);
     CHKiRet(dynstats_createMetrics(b));
+	timeoutComp(&b->metricCleanupTimeout, b->unusedMetricLife);
 finalize_it:
-	pthread_rwlock_unlock(&b->lock);
+	if (locked) {
+		pthread_rwlock_unlock(&b->lock);
+	}
 	if (iRet != RS_RET_OK) {
-		errmsg.LogMsg(0, RS_RET_TIMED_OUT, LOG_INFO, "dynstats: reset failed for bucket '%s'", b->name);
+		errmsg.LogError(lock_ret, RS_RET_INTERNAL_ERROR, "dynstats: reset failed for bucket '%s'", b->name);
 	}
 	RETiRet;
 }
 
 static inline void
 dynstats_resetIfExpired(dynstats_bucket_t *b) {
-	if (timeoutVal(&b->metricCleanupTimeout) == 0) {
-		errmsg.LogMsg(0, RS_RET_TIMED_OUT, LOG_INFO, "dynstats: bucket '%s' is being reset", b->name);
-		dynstats_resetBucket(b, 1);
-		timeoutComp(&b->metricCleanupTimeout, b->unusedMetricLife);
+	long t_out = 0;
+	if (pthread_rwlock_rdlock(&b->lock) == 0) {
+		t_out = timeoutVal(&b->metricCleanupTimeout);
+		pthread_rwlock_unlock(&b->lock);
+		if (t_out == 0) {
+			errmsg.LogMsg(0, RS_RET_TIMED_OUT, LOG_INFO, "dynstats: bucket '%s' is being reset", b->name);
+			dynstats_resetBucket(b, 1);
+		}
 	}
 }
 
@@ -306,8 +315,6 @@ dynstats_newBucket(const uchar* name, uint8_t resettable, uint32_t maxCardinalit
 
 		CHKiRet(dynstats_addBucketMetrics(bkts, b, name));
 
-		timeoutComp(&b->metricCleanupTimeout, b->unusedMetricLife);
-	
 		pthread_rwlock_wrlock(&bkts->lock);
 		SLIST_INSERT_HEAD(&bkts->list, b, link);
 		pthread_rwlock_unlock(&bkts->lock);
@@ -572,12 +579,14 @@ dynstats_initMetric(dynstats_bucket_t *b, dynstats_metric_node_t *n, dynstats_ct
     }
 	lookup.key = key;
 	
-	pthread_rwlock_wrlock(&n->lock);
+	CHKiConcCtrl(pthread_rwlock_wrlock(&n->lock));
 	locked = 1;
 	found = hsearch_r(lookup, FIND, &entry, n->table);
 	if (found) {
-		pthread_rwlock_unlock(&n->lock);
-		pthread_rwlock_rdlock(&n->lock);
+		CHKiConcCtrl(pthread_rwlock_unlock(&n->lock));
+		locked = 0;
+		CHKiConcCtrl(pthread_rwlock_rdlock(&n->lock));
+		locked = 1;
 		CHKiRet(dynstats_proceedFindOrCreateCtr(b, entry, pCtr, metric, metric_len, remaining_metric_len));
 	} else {
 		if (n->size == n->capacity) {/* double the size and rehash */
@@ -596,8 +605,10 @@ dynstats_initMetric(dynstats_bucket_t *b, dynstats_metric_node_t *n, dynstats_ct
 		if (remaining_metric_len > 0) {
 			CHKiRet(dynstats_createMetricNodeEntry(b, &e, key));
 			CHKiRet(dynstats_insertToMetricNode(e, n));
-			pthread_rwlock_unlock(&n->lock);
-			pthread_rwlock_rdlock(&n->lock);
+			CHKiConcCtrl(pthread_rwlock_unlock(&n->lock));
+			locked = 0;
+			CHKiConcCtrl(pthread_rwlock_rdlock(&n->lock));
+			locked = 1;
 			CHKiRet(dynstats_initMetric(b, e->d.nxt, pCtr, metric, metric_len, remaining_metric_len - 1));
 		} else {
 			CHKiRet(dynstats_createMetricCtrEntry(&e, b, metric, key));
@@ -643,13 +654,13 @@ dynstats_findOrCreateCtr(dynstats_bucket_t *b, dynstats_metric_node_t *n, dynsta
     }
 
     lookup.key = key;
-    pthread_rwlock_rdlock(&n->lock);
+    CHKiConcCtrl(pthread_rwlock_rdlock(&n->lock));
     locked = 1;
     found = hsearch_r(lookup, FIND, &entry, n->table);
     if (found) {
         CHKiRet(dynstats_proceedFindOrCreateCtr(b, entry, pCtr, metric, metric_len, remaining_metric_len));
     } else {
-        pthread_rwlock_unlock(&n->lock);
+        CHKiConcCtrl(pthread_rwlock_unlock(&n->lock));
 		locked = 0;
 		CHKiRet(dynstats_initMetric(b, n, pCtr, metric, metric_len, remaining_metric_len));
     }
@@ -665,13 +676,17 @@ static inline rsRetVal
 dynstats_incCtr(dynstats_bucket_t *b, uchar *metric) {
     dynstats_ctr_t *ctr;
 	int metric_len;
+	int locked = 0;
     DEFiRet;
 	metric_len = ustrlen(metric);
-    pthread_rwlock_rdlock(&b->lock);
+    CHKiConcCtrl(pthread_rwlock_rdlock(&b->lock));
+	locked = 1;
     CHKiRet(dynstats_findOrCreateCtr(b, b->root, &ctr, metric, metric_len, metric_len));
     STATSCOUNTER_INC(ctr->ctr, ctr->mutCtr);
 finalize_it:
-    pthread_rwlock_unlock(&b->lock);
+	if (locked) {
+		pthread_rwlock_unlock(&b->lock);
+	}
     RETiRet;
 }
 
