@@ -578,6 +578,7 @@ dynstats_initMetric(dynstats_bucket_t *b, dynstats_metric_node_t *n, dynstats_ct
 	if (found) {
 		pthread_rwlock_unlock(&n->lock);
 		pthread_rwlock_rdlock(&n->lock);
+		found = hsearch_r(lookup, FIND, &entry, &n->table); /* because rehash may have killed the old table */
 		CHKiRet(dynstats_proceedFindOrCreateCtr(b, entry, pCtr, metric, metric_len, remaining_metric_len));
 	} else {
 		if (n->size == n->capacity) {/* double the size and rehash */
