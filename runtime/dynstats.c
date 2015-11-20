@@ -283,6 +283,7 @@ dynstats_newBucket(const uchar* name, uint8_t resettable, uint32_t maxCardinalit
 	dynstats_bucket_t *b;
 	dynstats_buckets_t *bkts;
 	uint8_t lock_initialized, metric_count_mutex_initialized;
+	pthread_rwlockattr_t bucket_lock_attr;
 	DEFiRet;
 
 	lock_initialized = metric_count_mutex_initialized = 0;
@@ -297,7 +298,10 @@ dynstats_newBucket(const uchar* name, uint8_t resettable, uint32_t maxCardinalit
 		b->unusedMetricLife = 1000 * unusedMetricLife; 
 		CHKmalloc(b->name = ustrdup(name));
 
-		pthread_rwlock_init(&b->lock, NULL);
+		pthread_rwlockattr_init(&bucket_lock_attr);
+		pthread_rwlockattr_setkind_np(&bucket_lock_attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+
+		pthread_rwlock_init(&b->lock, &bucket_lock_attr);
 		lock_initialized = 1;
 		pthread_mutex_init(&b->mutMetricCount, NULL);
 		metric_count_mutex_initialized = 1;
