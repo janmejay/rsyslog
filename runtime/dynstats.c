@@ -122,6 +122,8 @@ dynstats_destroyBucket(dynstats_bucket_t* b) {
 	pthread_mutex_destroy(&b->mutMetricCount);
 	statsobj.DestructCounter(bkts->global_stats, b->pOpsOverflowCtr);
 	statsobj.DestructCounter(bkts->global_stats, b->pNewMetricAddCtr);
+	statsobj.DestructCounter(bkts->global_stats, b->pNoMetricCtr);
+	statsobj.DestructCounter(bkts->global_stats, b->pMetricsPurgedCtr);
 	free(b);
 }
 
@@ -175,6 +177,9 @@ finalize_it:
 		if (b->pNoMetricCtr != NULL) {
 			statsobj.DestructCounter(bkts->global_stats, b->pNoMetricCtr);
 		}
+		if (b->pMetricsPurgedCtr != NULL) {
+			statsobj.DestructCounter(bkts->global_stats, b->pMetricsPurgedCtr);
+		}
 	}
 	RETiRet;
 }
@@ -220,9 +225,7 @@ finalize_it:
 
 static rsRetVal
 dynstats_resetBucket(dynstats_bucket_t *b, uint8_t do_purge) {
-	size_t htab_sz;
 	DEFiRet;
-	htab_sz = (size_t) (DYNSTATS_HASHTABLE_SIZE_OVERPROVISIONING * b->maxCardinality + 1);
 	pthread_rwlock_wrlock(&b->lock);
 	if (do_purge) {
 		dynstats_destroyMetrics(b);
@@ -230,6 +233,7 @@ dynstats_resetBucket(dynstats_bucket_t *b, uint8_t do_purge) {
 	ATOMIC_STORE_0_TO_INT(&b->metricCount, &b->mutMetricCount);
 	SLIST_INIT(&b->ctrs);
     CHKiRet(dynstats_createMetrics(b));
+	timeoutComp(&b->metricCleanupTimeout, b->unusedMetricLife);
 finalize_it:
 	pthread_rwlock_unlock(&b->lock);
 	if (iRet != RS_RET_OK) {
@@ -240,10 +244,13 @@ finalize_it:
 
 static inline void
 dynstats_resetIfExpired(dynstats_bucket_t *b) {
-	if (timeoutVal(&b->metricCleanupTimeout) == 0) {
+	long timeout;
+	pthread_rwlock_rdlock(&b->lock);
+	timeout = timeoutVal(&b->metricCleanupTimeout);
+	pthread_rwlock_unlock(&b->lock);
+	if (timeout == 0) {
 		errmsg.LogMsg(0, RS_RET_TIMED_OUT, LOG_INFO, "dynstats: bucket '%s' is being reset", b->name);
 		dynstats_resetBucket(b, 1);
-		timeoutComp(&b->metricCleanupTimeout, b->unusedMetricLife);
 	}
 }
 
@@ -301,8 +308,6 @@ dynstats_newBucket(const uchar* name, uint8_t resettable, uint32_t maxCardinalit
 
 		CHKiRet(dynstats_addBucketMetrics(bkts, b, name));
 
-		timeoutComp(&b->metricCleanupTimeout, b->unusedMetricLife);
-	
 		pthread_rwlock_wrlock(&bkts->lock);
 		SLIST_INSERT_HEAD(&bkts->list, b, link);
 		pthread_rwlock_unlock(&bkts->lock);
@@ -501,24 +506,43 @@ finalize_it:
 }
 
 static inline rsRetVal
-dynstats_insertToMetricNode(dynstats_metric_entry_t *e, dynstats_metric_node_t *n) {
+dynstats_insertToMetricNodeTable(dynstats_metric_entry_t *e, dynstats_metric_node_t *n) {
 	ENTRY lookup;
 	ENTRY *entry;
 	int created;
 	DEFiRet;
-	
+
 	lookup.key = e->k;
 	lookup.data = e;
 	created = hsearch_r(lookup, ENTER, &entry, &n->table);
 	if (! created) {
 		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
 	}
+
+finalize_it:
+	RETiRet;
+}
+
+static inline rsRetVal
+dynstats_insertToMetricNode(dynstats_metric_entry_t *e, dynstats_metric_node_t *n) {
+	DEFiRet;
+
+	CHKiRet(dynstats_insertToMetricNodeTable(e, n));
 	SLIST_INSERT_HEAD(&n->entries, e, link);
 	n->size++;
 	
 finalize_it:
 	RETiRet;
 }
+
+static inline void
+dynstats_rehashMetricNodeEntries(dynstats_metric_node_t *n) {
+	dynstats_metric_entry_t *e;
+	SLIST_FOREACH(e, &n->entries, link) {
+		dynstats_insertToMetricNodeTable(e, n);
+	}
+}
+
 
 static inline rsRetVal
 dynstats_initMetric(dynstats_bucket_t *b, dynstats_metric_node_t *n, dynstats_ctr_t **pCtr, uchar *metric, int metric_len, int remaining_metric_len) {
@@ -565,6 +589,7 @@ dynstats_initMetric(dynstats_bucket_t *b, dynstats_metric_node_t *n, dynstats_ct
 			hdestroy_r(&n->table);
 			n->capacity = new_table_capacity;
 			n->table = new_table;
+			dynstats_rehashMetricNodeEntries(n);
 		}
 		if (remaining_metric_len > 0) {
 			CHKiRet(dynstats_createMetricNodeEntry(b, &e, key));
@@ -588,6 +613,8 @@ finalize_it:
 		if (e != NULL) {
 			dynstats_destroyMetricEntry(b, e, 1);
 		}
+		*pCtr = NULL;
+		iRet = RS_RET_OK;
 	}
 	RETiRet;
 }
@@ -638,6 +665,9 @@ dynstats_incCtr(dynstats_bucket_t *b, uchar *metric) {
 	metric_len = ustrlen(metric);
     pthread_rwlock_rdlock(&b->lock);
     CHKiRet(dynstats_findOrCreateCtr(b, b->root, &ctr, metric, metric_len, metric_len));
+	if (ctr == NULL) {
+		ABORT_FINALIZE(RS_RET_NONE);
+	}
     STATSCOUNTER_INC(ctr->ctr, ctr->mutCtr);
 finalize_it:
     pthread_rwlock_unlock(&b->lock);
