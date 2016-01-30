@@ -441,7 +441,6 @@ genMsg(char *buf, size_t maxBuf, int *pLenBuf, struct instdata *inst)
 		*pLenBuf = snprintf(buf, maxBuf, "%s\n", MsgToSend);
 	}
 	if (octateCountFramed == 1) {
-		fprintf(stderr, "TCPFLOOD payload sz: %d extra-data sz: %d (limit was: %d)\n", *pLenBuf, edLen, extraDataLen);
 		snprintf(payloadLen, sizeof(payloadLen), "%d ", *pLenBuf);
 		payloadStringLen = strlen(payloadLen);
 		memmove(buf + payloadStringLen, buf, *pLenBuf);
@@ -943,7 +942,6 @@ int main(int argc, char *argv[])
 		case 'j':	jsonCookie = optarg;
 				break;
 		case 'd':
-			printf("OPTARG: -d = %s\n", optarg);
 			    extraDataLen = atoi(optarg);
 				if(extraDataLen > MAX_EXTRADATA_LEN) {
 					fprintf(stderr, "-d max is %d!\n",
