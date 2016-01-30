@@ -942,7 +942,9 @@ int main(int argc, char *argv[])
 				break;
 		case 'j':	jsonCookie = optarg;
 				break;
-		case 'd':	extraDataLen = atoi(optarg);
+		case 'd':
+			printf("OPTARG: -d = %s\n", optarg);
+			    extraDataLen = atoi(optarg);
 				if(extraDataLen > MAX_EXTRADATA_LEN) {
 					fprintf(stderr, "-d max is %d!\n",
 						MAX_EXTRADATA_LEN);
