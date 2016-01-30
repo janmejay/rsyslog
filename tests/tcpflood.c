@@ -441,7 +441,7 @@ genMsg(char *buf, size_t maxBuf, int *pLenBuf, struct instdata *inst)
 		*pLenBuf = snprintf(buf, maxBuf, "%s\n", MsgToSend);
 	}
 	if (octateCountFramed == 1) {
-		fprintf(stderr, "TCPFLOOD payload sz: %d extra-data sz: %d\n", *pLenBuf, edLen);
+		fprintf(stderr, "TCPFLOOD payload sz: %d extra-data sz: %d (limit was: %d)\n", *pLenBuf, edLen, extraDataLen);
 		snprintf(payloadLen, sizeof(payloadLen), "%d ", *pLenBuf);
 		payloadStringLen = strlen(payloadLen);
 		memmove(buf + payloadStringLen, buf, *pLenBuf);
