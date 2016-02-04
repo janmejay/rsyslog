@@ -122,6 +122,8 @@ case $1 in
 		    echo "ERROR: config file '$srcdir/testsuites/$2' not found!"
 		    exit 1
 		fi
+		echo "PWD is: $(pwd)"
+		echo "find trusty.supp: $(find . -name trusty.supp)"
 		valgrind $RS_TESTBENCH_VALGRIND_EXTRA_OPTS --log-fd=1 --error-exitcode=10 --malloc-fill=ff --free-fill=fe --leak-check=full ../tools/rsyslogd -C -n -irsyslog$3.pid -M../runtime/.libs:../.libs -f$srcdir/testsuites/$2 &
 		. $srcdir/diag.sh wait-startup $3
 		echo startup-vg still running
