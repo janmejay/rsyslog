@@ -9,11 +9,6 @@ check_PROGRAMS = $(TESTRUNS) ourtail nettester tcpflood chkseq msleep randomgen 
 TESTS = $(TESTRUNS) 
 #TESTS = $(TESTRUNS) cfg.sh
 
-if HAVE_VALGRIND
-TESTS +=  \
-	discard-rptdmsg-vg.sh
-endif # HAVE_VALGRIND
-
 TESTS +=  \
 	stop-localvar.sh \
 	stop-msgvar.sh \
@@ -160,6 +155,30 @@ TESTS +=  \
 	lookup_table_rscript_reload.sh \
 	multiple_lookup_tables.sh \
 	lookup_table_rscript_reload_without_stub.sh
+
+if HAVE_VALGRIND
+TESTS +=  \
+	discard-rptdmsg-vg.sh \
+	discard-allmark-vg.sh \
+	failover-basic-vg.sh \
+	failover-rptd-vg.sh \
+	failover-no-basic-vg.sh \
+	failover-no-rptd-vg.sh \
+	udp-msgreduc-vg.sh \
+	udp-msgreduc-orgmsg-vg.sh \
+	tcp-msgreduc-vg.sh \
+	rscript_field-vg.sh \
+	unused_lookup_table.sh \
+	lookup_table-vg.sh \
+	array_lookup_table-vg.sh \
+	array_lookup_table_misuse-vg.sh \
+	sparse_array_lookup_table-vg.sh \
+	lookup_table_bad_configs-vg.sh \
+	lookup_table_rscript_reload-vg.sh \
+	lookup_table_rscript_reload_without_stub-vg.sh \
+	multiple_lookup_tables-vg.sh
+endif # HAVE_VALGRIND
+
 
 if ENABLE_MYSQL_TESTS
 TESTS +=  \
