@@ -153,8 +153,8 @@ TESTS +=  \
 	sparse_array_lookup_table.sh \
 	lookup_table_bad_configs.sh \
 	lookup_table_rscript_reload.sh \
-	lookup_table_rscript_reload_without_stub.sh \
-	multiple_lookup_tables.sh
+	multiple_lookup_tables.sh \
+	lookup_table_rscript_reload_without_stub.sh
 
 if HAVE_VALGRIND
 TESTS +=  \
