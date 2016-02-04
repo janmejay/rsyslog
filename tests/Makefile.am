@@ -11,25 +11,7 @@ TESTS = $(TESTRUNS)
 
 if HAVE_VALGRIND
 TESTS +=  \
-	discard-rptdmsg-vg.sh \
-	discard-allmark-vg.sh \
-	failover-basic-vg.sh \
-	failover-rptd-vg.sh \
-	failover-no-basic-vg.sh \
-	failover-no-rptd-vg.sh \
-	udp-msgreduc-vg.sh \
-	udp-msgreduc-orgmsg-vg.sh \
-	tcp-msgreduc-vg.sh \
-	rscript_field-vg.sh \
-	unused_lookup_table.sh \
-	lookup_table-vg.sh \
-	array_lookup_table-vg.sh \
-	array_lookup_table_misuse-vg.sh \
-	sparse_array_lookup_table-vg.sh \
-	lookup_table_bad_configs-vg.sh \
-	lookup_table_rscript_reload-vg.sh \
-	lookup_table_rscript_reload_without_stub-vg.sh \
-	multiple_lookup_tables-vg.sh
+	discard-rptdmsg-vg.sh
 endif # HAVE_VALGRIND
 
 TESTS +=  \
