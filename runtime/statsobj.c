@@ -273,9 +273,9 @@ getStatsLineCEE(statsobj_t *pThis, cstr_t **ppcstr, int cee_cookie, int8_t bRese
 	rsCStrAppendStrWithLen(pcstr, UCHAR_CONSTANT("\""), 1);
 	rsCStrAppendStr(pcstr, pThis->name);
 	rsCStrAppendStrWithLen(pcstr, UCHAR_CONSTANT("\""), 1);
-	rsCStrAppendStrWithLen(pcstr, UCHAR_CONSTANT(","), 1);
 
 	if(pThis->origin != NULL) {
+		rsCStrAppendStrWithLen(pcstr, UCHAR_CONSTANT(","), 1);
 		rsCStrAppendStrWithLen(pcstr, UCHAR_CONSTANT("\""), 1);
 		rsCStrAppendStrWithLen(pcstr, UCHAR_CONSTANT("origin"), 6);
 		rsCStrAppendStrWithLen(pcstr, UCHAR_CONSTANT("\""), 1);
@@ -283,13 +283,12 @@ getStatsLineCEE(statsobj_t *pThis, cstr_t **ppcstr, int cee_cookie, int8_t bRese
 		rsCStrAppendStrWithLen(pcstr, UCHAR_CONSTANT("\""), 1);
 		rsCStrAppendStr(pcstr, pThis->origin);
 		rsCStrAppendStrWithLen(pcstr, UCHAR_CONSTANT("\""), 1);
-		rsCStrAppendStrWithLen(pcstr, UCHAR_CONSTANT(","), 1);
 	}
 
 	/* now add all counters to this line */
 	pthread_mutex_lock(&pThis->mutCtr);
 	for(pCtr = pThis->ctrRoot ; pCtr != NULL ; pCtr = pCtr->next) {
-		rsCStrAppendStrWithLen(pcstr, UCHAR_CONSTANT("\""), 1);
+		rsCStrAppendStrWithLen(pcstr, UCHAR_CONSTANT(",\""), 2);
 		rsCStrAppendStr(pcstr, pCtr->name);
 		rsCStrAppendStrWithLen(pcstr, UCHAR_CONSTANT("\""), 1);
 		cstrAppendChar(pcstr, ':');
@@ -301,14 +300,10 @@ getStatsLineCEE(statsobj_t *pThis, cstr_t **ppcstr, int cee_cookie, int8_t bRese
 			rsCStrAppendInt(pcstr, *(pCtr->val.pInt));
 			break;
 		}
-		if (pCtr->next != NULL) {
-			cstrAppendChar(pcstr, ',');
-		} else {
-			cstrAppendChar(pcstr, '}');
-		}
 		resetResettableCtr(pCtr, bResetCtrs);
 	}
 	pthread_mutex_unlock(&pThis->mutCtr);
+	cstrAppendChar(pcstr, '}');
 
 	CHKiRet(cstrFinalize(pcstr));
 	*ppcstr = pcstr;
