@@ -190,12 +190,20 @@ TESTS +=  \
 	dynstats_ctr_reset.sh \
 	dynstats_nometric.sh \
 	no-dynstats-json.sh \
-	no-dynstats.sh
+	no-dynstats.sh \
+	stats-json.sh \
+	dynstats-json.sh \
+	stats-cee.sh \
+	stats-json-es.sh \
+	dynstats_reset_without_pstats_reset.sh
 if HAVE_VALGRIND
 TESTS +=  \
 	dynstats-vg.sh \
 	dynstats_reset-vg.sh \
-	dynstats_overflow-vg.sh
+	dynstats_overflow-vg.sh \
+	dynstats-json-vg.sh \
+	stats-json-vg.sh \
+	stats-cee-vg.sh
 endif
 endif
 
@@ -272,6 +280,16 @@ TESTS +=  \
 	json_array_looping.sh \
 	json_nonarray_looping.sh \
 	stop_when_array_has_element.sh
+	json_object_looping.sh \
+	json_nonarray_looping.sh
+if HAVE_VALGRIND
+TESTS +=  \
+	json_null_array-vg.sh \
+	json_object_looping-vg.sh \
+	json_array_looping-vg.sh \
+	json_object_suicide_in_loop-vg.sh \
+	json_null-vg.sh
+endif
 endif
 
 if ENABLE_GNUTLS
@@ -844,6 +862,7 @@ EXTRA_DIST= \
 	testsuites/mmpstrucdata.conf \
 	libdbi-basic-vg.sh \
 	dynstats_ctr_reset.sh \
+	dynstats_reset_without_pstats_reset.sh \
 	dynstats_nometric.sh \
 	dynstats_overflow.sh \
 	dynstats_overflow-vg.sh \
@@ -853,6 +872,7 @@ EXTRA_DIST= \
 	dynstats-vg.sh \
 	testsuites/dynstats.conf \
 	testsuites/dynstats_ctr_reset.conf \
+	testsuites/dynstats_reset_without_pstats_reset.conf \
 	testsuites/dynstats_empty_input \
 	testsuites/dynstats_input \
 	testsuites/dynstats_input_1 \
@@ -868,6 +888,17 @@ EXTRA_DIST= \
 	testsuites/no-dynstats-json.conf \
 	no-dynstats.sh \
 	testsuites/no-dynstats.conf \
+	stats-json.sh \
+	stats-json-vg.sh \
+	testsuites/stats-json.conf \
+	stats-cee.sh \
+	stats-cee-vg.sh \
+	testsuites/stats-cee.conf \
+	stats-json-es.sh \
+	testsuites/stats-json-es.conf \
+	dynstats-json.sh \
+	dynstats-json-vg.sh \
+	testsuites/dynstats-json.conf \
 	mmnormalize_variable.sh \
 	mmnormalize_tokenized.sh \
 	testsuites/mmnormalize_variable.conf \
@@ -893,10 +924,17 @@ EXTRA_DIST= \
 	json_array_subscripting.sh \
 	testsuites/json_array_subscripting.conf \
 	testsuites/json_array_input \
+	testsuites/json_object_input \
 	testsuites/json_nonarray_input \
 	json_array_looping.sh \
+	json_object_looping.sh \
+	json_object_looping-vg.sh \
+	json_array_looping-vg.sh \
+	json_object_suicide_in_loop-vg.sh \
 	json_nonarray_looping.sh \
 	testsuites/json_array_looping.conf \
+	testsuites/json_object_looping.conf \
+	testsuites/json_object_suicide_in_loop.conf \
 	mmnormalize_regex.sh \
 	testsuites/mmnormalize_regex.conf \
 	testsuites/mmnormalize_regex.rulebase \
