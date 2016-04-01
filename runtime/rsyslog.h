@@ -617,6 +617,14 @@ void rsrtSetErrLogger(void (*errLogger)(const int, const int, const uchar*));
 				(*(retobj) = json_object_object_get((obj), (key))) == NULL) ? FALSE : TRUE
 #endif
 
+#ifdef HAVE_JSON_OBJECT_OBJECT_LENGTH
+#	define RS_json_object_object_length(obj)   \
+    json_object_object_length((obj))
+#else
+#	define RS_json_object_object_length(obj)               \
+    obj->o.c_object->count
+#endif
+
 #ifndef HAVE_JSON_BOOL
 typedef int json_bool;
 #endif
