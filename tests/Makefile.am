@@ -194,7 +194,6 @@ TESTS +=  \
 	stats-json.sh \
 	dynstats-json.sh \
 	stats-cee.sh \
-	stats-json-es.sh \
 	dynstats_reset_without_pstats_reset.sh
 if HAVE_VALGRIND
 TESTS +=  \
@@ -284,7 +283,6 @@ TESTS +=  \
 	json_nonarray_looping.sh
 if HAVE_VALGRIND
 TESTS +=  \
-	json_null_array-vg.sh \
 	json_object_looping-vg.sh \
 	json_array_looping-vg.sh
 #json_object_suicide_in_loop-vg.sh
