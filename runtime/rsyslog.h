@@ -621,6 +621,8 @@ void rsrtSetErrLogger(void (*errLogger)(const int, const int, const uchar*));
 #	define RS_json_object_object_length(obj)   \
     json_object_object_length((obj))
 #else
+#include <linkhash.h>
+#include <json_object_private.h>
 #	define RS_json_object_object_length(obj)               \
     obj->o.c_object->count
 #endif
