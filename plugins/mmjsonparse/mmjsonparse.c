@@ -260,6 +260,7 @@ ENDdoAction
 static inline void
 setInstParamDefaults(instanceData *pData)
 {
+	free(pData->cookie);
 	pData->cookie = NULL;
 	pData->bUseRawMsg = 0;
 }

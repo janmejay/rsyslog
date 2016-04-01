@@ -286,9 +286,8 @@ if HAVE_VALGRIND
 TESTS +=  \
 	json_null_array-vg.sh \
 	json_object_looping-vg.sh \
-	json_array_looping-vg.sh \
-	json_object_suicide_in_loop-vg.sh \
-	json_null-vg.sh
+	json_array_looping-vg.sh
+#json_object_suicide_in_loop-vg.sh
 endif
 endif
 

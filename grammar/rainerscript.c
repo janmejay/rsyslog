@@ -3019,6 +3019,7 @@ cnfIteratorDestruct(struct cnfitr *itr)
 	itr->var = NULL;
 	if (itr->collection != NULL) cnfexprDestruct(itr->collection);
 	itr->collection = NULL;
+	free(itr);
 }
 
 struct cnfstmt *
