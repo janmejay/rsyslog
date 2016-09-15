@@ -83,6 +83,8 @@ case "${host}" in
   ;;
 esac
 
+AM_CONDITIONAL(OS_LINUX, test x$os_type == xlinux)
+
 AC_DEFINE_UNQUOTED([HOSTENV], "$host", [the host environment, can be queried via a system variable])
 
 # Checks for libraries.

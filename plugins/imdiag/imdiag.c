@@ -249,24 +249,25 @@ injectMsg(uchar *pszCmd, tcps_sess_t *pSess)
 	ratelimit_t *ratelimit = NULL;
 	DEFiRet;
 
-    litteralMsg = NULL;
+	litteralMsg = NULL;
 
-    CHKiRet(ratelimitNew(&ratelimit, "imdiag", "injectmsg"));
+	CHKiRet(ratelimitNew(&ratelimit, "imdiag", "injectmsg"));
 	/* we do not check errors here! */
-	getFirstWord(&pszCmd, wordBuf, sizeof(wordBuf)/sizeof(uchar), TO_LOWERCASE);
-    if (ustrcmp(UCHAR_CONSTANT("litteral"), wordBuf) == 0) { /* user has provided content for a message */
-        ++pszCmd; /* ignore following space */
-        CHKiRet(doInjectMsg(pszCmd, ratelimit));
-        nMsgs = 1;
-    } else { /* assume 2 args, (from_idx, to_idx) */
-        iFrom = atoi((char*)wordBuf);
-        getFirstWord(&pszCmd, wordBuf, sizeof(wordBuf)/sizeof(uchar), TO_LOWERCASE);
-        nMsgs = atoi((char*)wordBuf);
-        for(i = 0 ; i < nMsgs ; ++i) {
-            CHKiRet(doInjectNumericSuffixMsg(i + iFrom, ratelimit));
-        }
-    }
-    CHKiRet(sendResponse(pSess, "%d messages injected\n", nMsgs));
+	getFirstWord(&pszCmd, wordBuf, sizeof(wordBuf), TO_LOWERCASE);
+	if (ustrcmp(UCHAR_CONSTANT("litteral"), wordBuf) == 0) {
+		/* user has provided content for a message */
+		++pszCmd; /* ignore following space */
+		CHKiRet(doInjectMsg(pszCmd, ratelimit));
+		nMsgs = 1;
+	} else { /* assume 2 args, (from_idx, count) */
+		iFrom = atoi((char*)wordBuf);
+		getFirstWord(&pszCmd, wordBuf, sizeof(wordBuf), TO_LOWERCASE);
+		nMsgs = atoi((char*)wordBuf);
+		for(i = 0 ; i < nMsgs ; ++i) {
+			CHKiRet(doInjectNumericSuffixMsg(i + iFrom, ratelimit));
+		}
+	}
+	CHKiRet(sendResponse(pSess, "%d messages injected\n", nMsgs));
 	
 	DBGPRINTF("imdiag: %d messages injected\n", nMsgs);
 

@@ -25,6 +25,8 @@
 #include "rsyslog.h"
 
 #include <signal.h>
+#include <stdlib.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 #ifdef HAVE_LIBLOGGING_STDLOG
 #  include <liblogging/stdlog.h>
@@ -685,7 +687,11 @@ startMainQueue(qqueue_t *pQueue)
 void
 rsyslogd_submitErrMsg(const int severity, const int iErr, const uchar *msg)
 {
-	logmsgInternal(iErr, LOG_SYSLOG|(severity & 0x07), msg, 0);
+	if (glbl.GetGlobalInputTermState() == 1) {
+		dfltErrLogger(severity, iErr, msg);
+	} else {
+		logmsgInternal(iErr, LOG_SYSLOG|(severity & 0x07), msg, 0);
+	}
 }
 
 static inline rsRetVal
@@ -1494,10 +1500,13 @@ mainloop(void)
 		select(1, NULL, NULL, NULL, &tvSelectTimeout);
 
 		if(bChildDied) {
-			int child;
+			pid_t child;
 			do {
 				child = waitpid(-1, NULL, WNOHANG);
 				DBGPRINTF("rsyslogd: child %d has terminated\n", child);
+				if (child != -1) {
+					errmsg.LogError(0, RS_RET_OK, "Child %d has terminated, reaped by main-loop.", child);
+				}
 			} while(child > 0);
 			bChildDied = 0;
 		}
@@ -1549,6 +1558,7 @@ deinitAll(void)
 	/* close the inputs */
 	DBGPRINTF("Terminating input threads...\n");
 	glbl.SetGlobalInputTermination();
+	
 	thrdTerminateAll();
 
 	/* and THEN send the termination log message (see long comment above) */

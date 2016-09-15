@@ -157,6 +157,23 @@ TESTS +=  \
 	multiple_lookup_tables-vg.sh
 endif # HAVE_VALGRIND
 
+if ENABLE_OMPROG
+TESTS +=  \
+	omprog-cleanup.sh \
+	omprog-cleanup-with-outfile.sh
+if OS_LINUX
+TESTS += \
+	omprog-cleanup-when-unresponsive.sh
+endif
+if HAVE_VALGRIND
+TESTS +=  \
+	omprog-cleanup-vg.sh
+if OS_LINUX
+TESTS += \
+	omprog-cleanup-when-unresponsive-vg.sh
+endif
+endif
+endif
 
 if ENABLE_MYSQL_TESTS
 TESTS +=  \
@@ -707,6 +724,16 @@ EXTRA_DIST= \
 	testsuites/sndrcv_gzip_rcvr.conf \
 	pipeaction.sh \
 	testsuites/pipeaction.conf \
+	omprog-cleanup.sh \
+	omprog-cleanup-vg.sh \
+	omprog-cleanup-with-outfile.sh \
+	omprog-cleanup-when-unresponsive.sh \
+	omprog-cleanup-when-unresponsive-vg.sh \
+	testsuites/omprog-cleanup.conf \
+	testsuites/omprog-cleanup-outfile.conf \
+	testsuites/omprog-cleanup-unresponsive.conf \
+	testsuites/omprog-test-bin.sh \
+  testsuites/term-ignoring-script.sh \
 	pipe_noreader.sh \
 	testsuites/pipe_noreader.conf \
 	uxsock_simple.sh \

@@ -606,6 +606,8 @@ rsRetVal rsrtExit(void);
 int rsrtIsInit(void);
 void rsrtSetErrLogger(void (*errLogger)(const int, const int, const uchar*));
 
+void dfltErrLogger(const int, const int, const uchar *errMsg);
+
 
 /* our own support for breaking changes in json-c */
 #ifdef HAVE_JSON_OBJECT_OBJECT_GET_EX
