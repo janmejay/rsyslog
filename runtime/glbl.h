@@ -8,18 +8,18 @@
  * Please note that there currently is no glbl.c file as we do not yet
  * have any implementations.
  *
- * Copyright 2008-2015 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2008-2017 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
+ *
  *       http://www.apache.org/licenses/LICENSE-2.0
  *       -or-
  *       see COPYING.ASL20 in the source distribution
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -41,6 +41,7 @@
 
 extern pid_t glbl_ourpid;
 extern int bProcessInternalMessages;
+extern int bPermitSlashInProgramname;
 #ifdef HAVE_LIBLOGGING_STDLOG
 extern stdlog_channel_t stdlog_hdl;
 #endif
@@ -109,16 +110,21 @@ ENDinterface(glbl)
 PROTOTYPEObj(glbl);
 
 extern int glblDebugOnShutdown;	/* start debug log when we are shut down */
+extern int glblReportNewSenders;
+extern int glblReportGoneAwaySenders;
+extern int glblSenderStatsTimeout;
+extern int glblSenderKeepTrack;
+extern int glblUnloadModules;
 extern short janitorInterval;
 
-static inline pid_t glblGetOurPid(void) { return glbl_ourpid; }
-static inline void glblSetOurPid(pid_t pid) { glbl_ourpid = pid; }
+#define glblGetOurPid() glbl_ourpid
+#define glblSetOurPid(pid) { glbl_ourpid = (pid); }
 
 void glblPrepCnf(void);
 void glblProcessCnf(struct cnfobj *o);
 void glblProcessTimezone(struct cnfobj *o);
 void glblProcessMainQCnf(struct cnfobj *o);
-void glblDestructMainqCnfObj();
+void glblDestructMainqCnfObj(void);
 void glblDoneLoadCnf(void);
 const uchar * glblGetWorkDirRaw(void);
 tzinfo_t* glblFindTimezoneInfo(char *id);

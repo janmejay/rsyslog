@@ -2,7 +2,7 @@
  *
  * Module begun 2011-04-19 by Rainer Gerhards
  *
- * Copyright 2011-2015 Adiscon GmbH.
+ * Copyright 2011-2016 Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
@@ -27,6 +27,7 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <pwd.h>
 #include <grp.h>
 #include <stdarg.h>
 #include <sys/resource.h>
@@ -83,19 +84,34 @@ rsconf_t *runConf = NULL;/* the currently running config */
 rsconf_t *loadConf = NULL;/* the config currently being loaded (no concurrent config load supported!) */
 
 /* hardcoded standard templates (used for defaults) */
-static uchar template_DebugFormat[] = "\"Debug line with all properties:\nFROMHOST: '%FROMHOST%', fromhost-ip: '%fromhost-ip%', HOSTNAME: '%HOSTNAME%', PRI: %PRI%,\nsyslogtag '%syslogtag%', programname: '%programname%', APP-NAME: '%APP-NAME%', PROCID: '%PROCID%', MSGID: '%MSGID%',\nTIMESTAMP: '%TIMESTAMP%', STRUCTURED-DATA: '%STRUCTURED-DATA%',\nmsg: '%msg%'\nescaped msg: '%msg:::drop-cc%'\ninputname: %inputname% rawmsg: '%rawmsg%'\n$!:%$!%\n$.:%$.%\n$/:%$/%\n\n\"";
-static uchar template_SyslogProtocol23Format[] = "\"<%PRI%>1 %TIMESTAMP:::date-rfc3339% %HOSTNAME% %APP-NAME% %PROCID% %MSGID% %STRUCTURED-DATA% %msg%\n\"";
+static uchar template_DebugFormat[] = "\"Debug line with all properties:\nFROMHOST: '%FROMHOST%', fromhost-ip: "
+"'%fromhost-ip%', HOSTNAME: '%HOSTNAME%', PRI: %PRI%,\nsyslogtag '%syslogtag%', programname: '%programname%', "
+"APP-NAME: '%APP-NAME%', PROCID: '%PROCID%', MSGID: '%MSGID%',\nTIMESTAMP: '%TIMESTAMP%', "
+"STRUCTURED-DATA: '%STRUCTURED-DATA%',\nmsg: '%msg%'\nescaped msg: '%msg:::drop-cc%'\ninputname: %inputname% "
+"rawmsg: '%rawmsg%'\n$!:%$!%\n$.:%$.%\n$/:%$/%\n\n\"";
+static uchar template_SyslogProtocol23Format[] = "\"<%PRI%>1 %TIMESTAMP:::date-rfc3339% %HOSTNAME% %APP-NAME% "
+"%PROCID% %MSGID% %STRUCTURED-DATA% %msg%\n\"";
 static uchar template_TraditionalFileFormat[] = "=RSYSLOG_TraditionalFileFormat";
 static uchar template_FileFormat[] = "=RSYSLOG_FileFormat";
 static uchar template_ForwardFormat[] = "=RSYSLOG_ForwardFormat";
 static uchar template_TraditionalForwardFormat[] = "=RSYSLOG_TraditionalForwardFormat";
-static uchar template_WallFmt[] = "\"\r\n\7Message from syslogd@%HOSTNAME% at %timegenerated% ...\r\n %syslogtag%%msg%\n\r\"";
+static uchar template_WallFmt[] = "\"\r\n\7Message from syslogd@%HOSTNAME% at %timegenerated% ...\r\n "
+"%syslogtag%%msg%\n\r\"";
 static uchar template_StdUsrMsgFmt[] = "\" %syslogtag%%msg%\n\r\"";
-static uchar template_StdDBFmt[] = "\"insert into SystemEvents (Message, Facility, FromHost, Priority, DeviceReportedTime, ReceivedAt, InfoUnitID, SysLogTag) values ('%msg%', %syslogfacility%, '%HOSTNAME%', %syslogpriority%, '%timereported:::date-mysql%', '%timegenerated:::date-mysql%', %iut%, '%syslogtag%')\",SQL";
-static uchar template_StdPgSQLFmt[] = "\"insert into SystemEvents (Message, Facility, FromHost, Priority, DeviceReportedTime, ReceivedAt, InfoUnitID, SysLogTag) values ('%msg%', %syslogfacility%, '%HOSTNAME%', %syslogpriority%, '%timereported:::date-pgsql%', '%timegenerated:::date-pgsql%', %iut%, '%syslogtag%')\",STDSQL";
+static uchar template_StdDBFmt[] = "\"insert into SystemEvents (Message, Facility, FromHost, Priority, "
+"DeviceReportedTime, ReceivedAt, InfoUnitID, SysLogTag) values ('%msg%', %syslogfacility%, "
+"'%HOSTNAME%', %syslogpriority%, '%timereported:::date-mysql%', '%timegenerated:::date-mysql%', %iut%, "
+"'%syslogtag%')\",SQL";
+static uchar template_StdPgSQLFmt[] = "\"insert into SystemEvents (Message, Facility, FromHost, Priority, "
+"DeviceReportedTime, ReceivedAt, InfoUnitID, SysLogTag) values ('%msg%', %syslogfacility%, "
+"'%HOSTNAME%', %syslogpriority%, '%timereported:::date-pgsql%', '%timegenerated:::date-pgsql%', %iut%, "
+"'%syslogtag%')\",STDSQL";
 static uchar template_spoofadr[] = "\"%fromhost-ip%\"";
 static uchar template_SysklogdFileFormat[] = "\"%TIMESTAMP% %HOSTNAME% %syslogtag%%msg:::sp-if-no-1st-sp%%msg%\n\"";
-static uchar template_StdJSONFmt[] = "\"{\\\"message\\\":\\\"%msg:::json%\\\",\\\"fromhost\\\":\\\"%HOSTNAME:::json%\\\",\\\"facility\\\":\\\"%syslogfacility-text%\\\",\\\"priority\\\":\\\"%syslogpriority-text%\\\",\\\"timereported\\\":\\\"%timereported:::date-rfc3339%\\\",\\\"timegenerated\\\":\\\"%timegenerated:::date-rfc3339%\\\"}\"";
+static uchar template_StdJSONFmt[] = "\"{\\\"message\\\":\\\"%msg:::json%\\\",\\\"fromhost\\\":\\\""
+"%HOSTNAME:::json%\\\",\\\"facility\\\":\\\"%syslogfacility-text%\\\",\\\"priority\\\":\\\""
+"%syslogpriority-text%\\\",\\\"timereported\\\":\\\"%timereported:::date-rfc3339%\\\",\\\"timegenerated\\\":\\\""
+"%timegenerated:::date-rfc3339%\\\"}\"";
 /* end templates */
 
 /* tables for interfacing with the v6 config system (as far as we need to) */
@@ -121,22 +137,26 @@ static struct cnfparamblk parserpblk =
 /* forward-definitions */
 void cnfDoCfsysline(char *ln);
 
-/* Standard-Constructor
- */
-BEGINobjConstruct(rsconf) /* be sure to specify the object type also in END macro! */
+int rsconfNeedDropPriv(rsconf_t *const cnf)
+{
+	return ((cnf->globals.gidDropPriv != 0) || (cnf->globals.uidDropPriv != 0));
+}
+
+static void cnfSetDefaults(rsconf_t *pThis)
+{
+	pThis->globals.bAbortOnUncleanConfig = 0;
+	pThis->globals.bReduceRepeatMsgs = 0;
 	pThis->globals.bDebugPrintTemplateList = 1;
 	pThis->globals.bDebugPrintModuleList = 0;
 	pThis->globals.bDebugPrintCfSysLineHandlerList = 0;
 	pThis->globals.bLogStatusMsgs = DFLT_bLogStatusMsgs;
 	pThis->globals.bErrMsgToStderr = 1;
 	pThis->globals.umask = -1;
+	pThis->globals.gidDropPrivKeepSupplemental = 0;
 	pThis->templates.root = NULL;
 	pThis->templates.last = NULL;
 	pThis->templates.lastStatic = NULL;
 	pThis->actions.nbrActions = 0;
-	lookupInitCnf(&pThis->lu_tabs);
-	CHKiRet(llInit(&pThis->rulesets.llRulesets, rulesetDestructForLinkedList,
-			rulesetKeyDestruct, strcasecmp));
 	/* queue params */
 	pThis->globals.mainQ.iMainMsgQueueSize = 100000;
 	pThis->globals.mainQ.iMainMsgQHighWtrMark = 80000;
@@ -160,14 +180,25 @@ BEGINobjConstruct(rsconf) /* be sure to specify the object type also in END macr
 	pThis->globals.mainQ.bMainMsgQSaveOnShutdown = 1;
 	pThis->globals.mainQ.iMainMsgQueueDeqtWinFromHr = 0;
 	pThis->globals.mainQ.iMainMsgQueueDeqtWinToHr = 25;
-	/* end queue params */
+}
+
+
+/* Standard-Constructor
+ */
+BEGINobjConstruct(rsconf) /* be sure to specify the object type also in END macro! */
+	cnfSetDefaults(pThis);
+	lookupInitCnf(&pThis->lu_tabs);
+	CHKiRet(dynstats_initCnf(&pThis->dynstats_buckets));
+	CHKiRet(llInit(&pThis->rulesets.llRulesets, rulesetDestructForLinkedList,
+			rulesetKeyDestruct, strcasecmp));
 finalize_it:
 ENDobjConstruct(rsconf)
 
 
 /* ConstructionFinalizer
  */
-rsRetVal rsconfConstructFinalize(rsconf_t __attribute__((unused)) *pThis)
+static rsRetVal
+rsconfConstructFinalize(rsconf_t __attribute__((unused)) *pThis)
 {
 	DEFiRet;
 	ISOBJ_TYPE_assert(pThis, rsconf);
@@ -177,7 +208,7 @@ rsRetVal rsconfConstructFinalize(rsconf_t __attribute__((unused)) *pThis)
 
 /* call freeCnf() module entry points AND free the module entries themselfes.
  */
-static inline void
+static void
 freeCnf(rsconf_t *pThis)
 {
 	cfgmodules_etry_t *etry, *del;
@@ -196,17 +227,21 @@ freeCnf(rsconf_t *pThis)
 
 
 /* destructor for the rsconf object */
+PROTOTYPEobjDestruct(rsconf);
 BEGINobjDestruct(rsconf) /* be sure to specify the object type also in END and CODESTART macros! */
 CODESTARTobjDestruct(rsconf)
 	freeCnf(pThis);
 	tplDeleteAll(pThis);
+	dynstats_destroyAllBuckets();
 	free(pThis->globals.mainQ.pszMainMsgQFName);
 	free(pThis->globals.pszConfDAGFile);
+	lookupDestroyCnf();
 	llDestroy(&(pThis->rulesets.llRulesets));
 ENDobjDestruct(rsconf)
 
 
 /* DebugPrint support for the rsconf object */
+PROTOTYPEObjDebugPrint(rsconf);
 BEGINobjDebugPrint(rsconf) /* be sure to specify the object type also in END and CODESTART macros! */
 	cfgmodules_etry_t *modNode;
 
@@ -264,7 +299,7 @@ CODESTARTobjDebugPrint(rsconf)
 ENDobjDebugPrint(rsconf)
 
 
-rsRetVal
+static rsRetVal
 parserProcessCnf(struct cnfobj *o)
 {
 	struct cnfparamvals *pvals;
@@ -314,7 +349,7 @@ finalize_it:
 
 
 /* Process input() objects */
-rsRetVal
+static rsRetVal
 inputProcessCnf(struct cnfobj *o)
 {
 	struct cnfparamvals *pvals;
@@ -351,7 +386,7 @@ finalize_it:
 extern int yylineno;
 
 void
-parser_warnmsg(char *fmt, ...)
+parser_warnmsg(const char *fmt, ...)
 {
 	va_list ap;
 	char errBuf[1024];
@@ -366,7 +401,7 @@ parser_warnmsg(char *fmt, ...)
 }
 
 void
-parser_errmsg(char *fmt, ...)
+parser_errmsg(const char *fmt, ...)
 {
 	va_list ap;
 	char errBuf[1024];
@@ -385,8 +420,9 @@ parser_errmsg(char *fmt, ...)
 	va_end(ap);
 }
 
+int yyerror(const char *s); /* we need this prototype to make compiler happy */
 int
-yyerror(char *s)
+yyerror(const char *s)
 {
 	parser_errmsg("%s on token '%s'", s, yytext);
 	return 0;
@@ -416,7 +452,10 @@ void cnfDoObj(struct cnfobj *o)
 		inputProcessCnf(o);
 		break;
 	case CNFOBJ_LOOKUP_TABLE:
-		lookupProcessCnf(o);
+		lookupTableDefProcessCnf(o);
+		break;
+	case CNFOBJ_DYN_STATS:
+		dynstats_processCnf(o);
 		break;
 	case CNFOBJ_PARSER:
 		parserProcessCnf(o);
@@ -433,6 +472,7 @@ void cnfDoObj(struct cnfobj *o)
 		/* these types are processed at a later stage */
 		bChkUnuse = 0;
 		break;
+	case CNFOBJ_ACTION:
 	default:
 		dbgprintf("cnfDoObj program error: unexpected object type %u\n",
 			 o->objType);
@@ -484,29 +524,37 @@ void cnfDoBSDHost(char *ln)
 
 /* drop to specified group
  * if something goes wrong, the function never returns
- * Note that such an abort can cause damage to on-disk structures, so we should
- * re-design the "interface" in the long term. -- rgerhards, 2008-11-26
  */
-static void doDropPrivGid(int iGid)
+static
+rsRetVal doDropPrivGid(void)
 {
 	int res;
 	uchar szBuf[1024];
+	DEFiRet;
 
-	res = setgroups(0, NULL); /* remove all supplementary group IDs */
-	if(res) {
-		perror("could not remove supplemental group IDs");
-		exit(1);
+	if(!ourConf->globals.gidDropPrivKeepSupplemental) {
+		res = setgroups(0, NULL); /* remove all supplemental group IDs */
+		if(res) {
+			rs_strerror_r(errno, (char*)szBuf, sizeof(szBuf));
+			errmsg.LogError(0, RS_RET_ERR_DROP_PRIV,
+					"could not remove supplemental group IDs: %s", szBuf);
+			ABORT_FINALIZE(RS_RET_ERR_DROP_PRIV);
+		}
+		DBGPRINTF("setgroups(0, NULL): %d\n", res);
 	}
-	DBGPRINTF("setgroups(0, NULL): %d\n", res);
-	res = setgid(iGid);
+	res = setgid(ourConf->globals.gidDropPriv);
 	if(res) {
-		/* if we can not set the userid, this is fatal, so let's unconditionally abort */
-		perror("could not set requested group id");
-		exit(1);
+		rs_strerror_r(errno, (char*)szBuf, sizeof(szBuf));
+		errmsg.LogError(0, RS_RET_ERR_DROP_PRIV,
+				"could not set requested group id: %s", szBuf);
+		ABORT_FINALIZE(RS_RET_ERR_DROP_PRIV);
 	}
-	DBGPRINTF("setgid(%d): %d\n", iGid, res);
-	snprintf((char*)szBuf, sizeof(szBuf)/sizeof(uchar), "rsyslogd's groupid changed to %d", iGid);
+	DBGPRINTF("setgid(%d): %d\n", ourConf->globals.gidDropPriv, res);
+	snprintf((char*)szBuf, sizeof(szBuf), "rsyslogd's groupid changed to %d",
+		 ourConf->globals.gidDropPriv);
 	logmsgInternal(NO_ERRCODE, LOG_SYSLOG|LOG_INFO, szBuf, 0);
+finalize_it:
+	RETiRet;
 }
 
 
@@ -519,6 +567,23 @@ static void doDropPrivUid(int iUid)
 {
 	int res;
 	uchar szBuf[1024];
+	struct passwd *pw;
+	gid_t gid;
+
+	/* Try to set appropriate supplementary groups for this user.
+	 * Failure is not fatal.
+	 */
+	pw = getpwuid(iUid);
+	if (pw) {
+		gid = getgid();
+		res = initgroups(pw->pw_name, gid);
+		DBGPRINTF("initgroups(%s, %d): %d\n", pw->pw_name, gid, res);
+	} else {
+		rs_strerror_r(errno, (char*)szBuf, sizeof(szBuf));
+		errmsg.LogError(0, NO_ERRCODE,
+				"could not get username for userid %d: %s",
+				iUid, szBuf);
+	}
 
 	res = setuid(iUid);
 	if(res) {
@@ -527,7 +592,7 @@ static void doDropPrivUid(int iUid)
 		exit(1);
 	}
 	DBGPRINTF("setuid(%d): %d\n", iUid, res);
-	snprintf((char*)szBuf, sizeof(szBuf)/sizeof(uchar), "rsyslogd's userid changed to %d", iUid);
+	snprintf((char*)szBuf, sizeof(szBuf), "rsyslogd's userid changed to %d", iUid);
 	logmsgInternal(NO_ERRCODE, LOG_SYSLOG|LOG_INFO, szBuf, 0);
 }
 
@@ -537,13 +602,13 @@ static void doDropPrivUid(int iUid)
  * set by the user. After this method has been executed, the previous
  * privileges can no be re-gained.
  */
-static inline rsRetVal
+static rsRetVal
 dropPrivileges(rsconf_t *cnf)
 {
 	DEFiRet;
 
 	if(cnf->globals.gidDropPriv != 0) {
-		doDropPrivGid(ourConf->globals.gidDropPriv);
+		CHKiRet(doDropPrivGid());
 		DBGPRINTF("group privileges have been dropped to gid %u\n", (unsigned) 
 			  ourConf->globals.gidDropPriv);
 	}
@@ -554,6 +619,7 @@ dropPrivileges(rsconf_t *cnf)
 			  ourConf->globals.uidDropPriv);
 	}
 
+finalize_it:
 	RETiRet;
 }
 
@@ -737,8 +803,8 @@ startInputModules(void)
 
 
 /* activate the main queue */
-static inline rsRetVal
-activateMainQueue()
+static rsRetVal
+activateMainQueue(void)
 {
 	struct cnfobj *mainqCnfObj;
 	DEFiRet;
@@ -784,7 +850,7 @@ setUmask(int iUmask)
  * version of rsyslog does not support this. Future versions probably will.
  * Begun 2011-04-20, rgerhards
  */
-rsRetVal
+static rsRetVal
 activate(rsconf_t *cnf)
 {
 	DEFiRet;
@@ -949,33 +1015,9 @@ finalize_it:
 /* legacy config system: reset config variables to default values.  */
 static rsRetVal resetConfigVariables(uchar __attribute__((unused)) *pp, void __attribute__((unused)) *pVal)
 {
-	loadConf->globals.bLogStatusMsgs = DFLT_bLogStatusMsgs;
-	loadConf->globals.bDebugPrintTemplateList = 1;
-	loadConf->globals.bDebugPrintCfSysLineHandlerList = 1;
-	loadConf->globals.bDebugPrintModuleList = 1;
-	loadConf->globals.bAbortOnUncleanConfig = 0;
-	loadConf->globals.bReduceRepeatMsgs = 0;
 	free(loadConf->globals.mainQ.pszMainMsgQFName);
-	loadConf->globals.mainQ.pszMainMsgQFName = NULL;
-	loadConf->globals.mainQ.iMainMsgQueueSize = 10000;
-	loadConf->globals.mainQ.iMainMsgQHighWtrMark = 8000;
-	loadConf->globals.mainQ.iMainMsgQLowWtrMark = 2000;
-	loadConf->globals.mainQ.iMainMsgQDiscardMark = 9800;
-	loadConf->globals.mainQ.iMainMsgQDiscardSeverity = 8;
-	loadConf->globals.mainQ.iMainMsgQueMaxFileSize = 1024 * 1024;
-	loadConf->globals.mainQ.iMainMsgQueueNumWorkers = 1;
-	loadConf->globals.mainQ.iMainMsgQPersistUpdCnt = 0;
-	loadConf->globals.mainQ.bMainMsgQSyncQeueFiles = 0;
-	loadConf->globals.mainQ.iMainMsgQtoQShutdown = 1500;
-	loadConf->globals.mainQ.iMainMsgQtoActShutdown = 1000;
-	loadConf->globals.mainQ.iMainMsgQtoEnq = 2000;
-	loadConf->globals.mainQ.iMainMsgQtoWrkShutdown = 60000;
-	loadConf->globals.mainQ.iMainMsgQWrkMinMsgs = 100;
-	loadConf->globals.mainQ.iMainMsgQDeqSlowdown = 0;
-	loadConf->globals.mainQ.bMainMsgQSaveOnShutdown = 1;
-	loadConf->globals.mainQ.MainMsgQueType = QUEUETYPE_FIXED_ARRAY;
-	loadConf->globals.mainQ.iMainMsgQueMaxDiskSpace = 0;
-	loadConf->globals.mainQ.iMainMsgQueDeqBatchSize = 32;
+
+	cnfSetDefaults(loadConf);
 
 	return RS_RET_OK;
 }
@@ -1002,7 +1044,7 @@ regBuildInModule(rsRetVal (*modInit)(), uchar *name, void *pModHdlr)
 	DEFiRet;
 	CHKiRet(module.doModInit(modInit, name, pModHdlr, &pMod));
 	readyModForCnf(pMod, &pNew, &pLast);
-	addModToCnfList(pNew, pLast);
+	addModToCnfList(&pNew, pLast);
 finalize_it:
 	RETiRet;
 }
@@ -1012,7 +1054,7 @@ finalize_it:
  * very first version begun on 2007-07-23 by rgerhards
  */
 static rsRetVal
-loadBuildInModules()
+loadBuildInModules(void)
 {
 	DEFiRet;
 
@@ -1063,7 +1105,7 @@ finalize_it:
 
 
 /* intialize the legacy config system */
-static inline rsRetVal 
+static rsRetVal 
 initLegacyConf(void)
 {
 	DEFiRet;
@@ -1100,7 +1142,7 @@ initLegacyConf(void)
 		NULL, &loadConf->globals.uidDropPriv, NULL));
 	CHKiRet(regCfSysLineHdlr((uchar *)"privdroptogroup", 0, eCmdHdlrGID,
 		NULL, &loadConf->globals.gidDropPriv, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"privdroptogroupid", 0, eCmdHdlrGID,
+	CHKiRet(regCfSysLineHdlr((uchar *)"privdroptogroupid", 0, eCmdHdlrInt,
 		NULL, &loadConf->globals.gidDropPriv, NULL));
 	CHKiRet(regCfSysLineHdlr((uchar *)"generateconfiggraph", 0, eCmdHdlrGetWord,
 		NULL, &loadConf->globals.pszConfDAGFile, NULL));
@@ -1225,7 +1267,7 @@ finalize_it:
 /* validate the current configuration, generate error messages, do 
  * optimizations, etc, etc,...
  */
-static inline rsRetVal
+static rsRetVal
 validateConf(void)
 {
 	DEFiRet;
@@ -1260,10 +1302,10 @@ validateConf(void)
  * object that holds the currently-being-loaded config ptr.
  * Begun 2011-04-20, rgerhards
  */
-rsRetVal
+static rsRetVal
 load(rsconf_t **cnf, uchar *confFile)
 {
-	int iNbrActions;
+	int iNbrActions = 0;
 	int r;
 	DEFiRet;
 
@@ -1344,8 +1386,6 @@ CODESTARTobjQueryInterface(rsconf)
 	 * work here (if we can support an older interface version - that,
 	 * of course, also affects the "if" above).
 	 */
-	pIf->Construct = rsconfConstruct;
-	pIf->ConstructFinalize = rsconfConstructFinalize;
 	pIf->Destruct = rsconfDestruct;
 	pIf->DebugPrint = rsconfDebugPrint;
 	pIf->Load = load;

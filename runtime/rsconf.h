@@ -1,6 +1,6 @@
 /* The rsconf object. It models a complete rsyslog configuration.
  *
- * Copyright 2011 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2011-2016 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
@@ -26,6 +26,7 @@
 #include "linkedlist.h"
 #include "queue.h"
 #include "lookup.h"
+#include "dynstats.h"
 
 /* --- configuration objects (the plan is to have ALL upper layers in this file) --- */
 
@@ -70,6 +71,7 @@ struct globals_s {
 				      config) if there was any issue in conf */
 	int uidDropPriv;	/* user-id to which priveleges should be dropped to */
 	int gidDropPriv;	/* group-id to which priveleges should be dropped to */
+	int gidDropPrivKeepSupplemental; /* keep supplemental groups when dropping? */
 	int umask;		/* umask to use */
 	uchar *pszConfDAGFile;	/* name of config DAG file, non-NULL means generate one */
 
@@ -77,7 +79,7 @@ struct globals_s {
 	int bReduceRepeatMsgs; /* reduce repeated message - 0 - no, 1 - yes */
 
 	//TODO: other representation for main queue? Or just load it differently?
-	queuecnf_t mainQ;	/* main queue paramters */
+	queuecnf_t mainQ;	/* main queue parameters */
 };
 
 /* (global) defaults are global in the sense that they are accessible
@@ -145,6 +147,7 @@ struct rsconf_s {
 	defaults_t defaults;
 	templates_t templates;
 	lookup_tables_t lu_tabs;
+	dynstats_buckets_t dynstats_buckets;
 	outchannels_t och;
 	actions_t actions;
 	rulesets_t rulesets;
@@ -160,8 +163,6 @@ struct rsconf_s {
 /* interfaces */
 BEGINinterface(rsconf) /* name must also be changed in ENDinterface macro! */
 	INTERFACEObjDebugPrint(rsconf);
-	rsRetVal (*Construct)(rsconf_t **ppThis);
-	rsRetVal (*ConstructFinalize)(rsconf_t __attribute__((unused)) *pThis);
 	rsRetVal (*Destruct)(rsconf_t **ppThis);
 	rsRetVal (*Load)(rsconf_t **ppThis, uchar *confFile);
 	rsRetVal (*Activate)(rsconf_t *ppThis);
@@ -178,9 +179,7 @@ extern rsconf_t *runConf;/* the currently running config */
 extern rsconf_t *loadConf;/* the config currently being loaded (no concurrent config load supported!) */
 
 
-static inline int rsconfNeedDropPriv(rsconf_t *const cnf) {
-	return ((cnf->globals.gidDropPriv != 0) || (cnf->globals.uidDropPriv != 0));
-}
+int rsconfNeedDropPriv(rsconf_t *const cnf);
 
 /* some defaults (to be removed?) */
 #define DFLT_bLogStatusMsgs 1

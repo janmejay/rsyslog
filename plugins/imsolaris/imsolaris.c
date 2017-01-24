@@ -182,7 +182,7 @@ readLog(int fd, uchar *pRcv, int iMaxLine)
 	struct strbuf ctl;
 	struct log_ctl hdr;
 	int flags;
-	msg_t *pMsg;
+	smsg_t *pMsg;
 	int ret;
 	char errStr[1024];
 
@@ -227,7 +227,7 @@ finalize_it:
  * This mimics the (strange) behaviour of the original syslogd.
  * rgerhards, 2010-04-19
  */
-static inline rsRetVal
+static rsRetVal
 getMsgs(thrdInfo_t *pThrd, int timeout)
 {
 	DEFiRet;
@@ -248,7 +248,7 @@ getMsgs(thrdInfo_t *pThrd, int timeout)
 	if((size_t) iMaxLine < sizeof(bufRcv) - 1) {
 		pRcv = bufRcv;
 	} else {
-		CHKmalloc(pRcv = (uchar*) malloc(sizeof(uchar) * (iMaxLine + 1)));
+		CHKmalloc(pRcv = (uchar*) malloc(iMaxLine + 1));
 	}
 
 	 while(pThrd->bShallStop != RSTRUE) {

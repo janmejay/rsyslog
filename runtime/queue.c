@@ -12,7 +12,7 @@
  * function names - this makes it really hard to read and does not provide much
  * benefit, at least I (now) think so...
  *
- * Copyright 2008-2015 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2008-2016 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
@@ -45,6 +45,7 @@
 #include <sys/stat.h>	 /* required for HP UX */
 #include <time.h>
 #include <errno.h>
+#include <inttypes.h>
 
 #include "rsyslog.h"
 #include "queue.h"
@@ -79,16 +80,21 @@ unsigned int iOverallQueueSize = 0;
 #endif
 
 /* forward-definitions */
-static inline rsRetVal doEnqSingleObj(qqueue_t *pThis, flowControl_t flowCtlType, msg_t *pMsg);
+static inline rsRetVal doEnqSingleObj(qqueue_t *pThis, flowControl_t flowCtlType, smsg_t *pMsg);
 static rsRetVal qqueueChkPersist(qqueue_t *pThis, int nUpdates);
 static rsRetVal RateLimiter(qqueue_t *pThis);
+/*  AIXPORT : return type mismatch corrected */
+#if defined (_AIX)
+static rsRetVal qqueueChkStopWrkrDA(qqueue_t *pThis);
+#else
 static int qqueueChkStopWrkrDA(qqueue_t *pThis);
+#endif
 static rsRetVal GetDeqBatchSize(qqueue_t *pThis, int *pVal);
 static rsRetVal ConsumerDA(qqueue_t *pThis, wti_t *pWti);
 static rsRetVal batchProcessed(qqueue_t *pThis, wti_t *pWti);
 static rsRetVal qqueueMultiEnqObjNonDirect(qqueue_t *pThis, multi_submit_t *pMultiSub);
 static rsRetVal qqueueMultiEnqObjDirect(qqueue_t *pThis, multi_submit_t *pMultiSub);
-static rsRetVal qAddDirect(qqueue_t *pThis, msg_t *pMsg);
+static rsRetVal qAddDirect(qqueue_t *pThis, smsg_t *pMsg);
 static rsRetVal qDestructDirect(qqueue_t __attribute__((unused)) *pThis);
 static rsRetVal qConstructDirect(qqueue_t __attribute__((unused)) *pThis);
 static rsRetVal qDestructDisk(qqueue_t *pThis);
@@ -125,7 +131,8 @@ static struct cnfparamdescr cnfpdescr[] = {
 	{ "queue.dequeueslowdown", eCmdHdlrInt, 0 },
 	{ "queue.dequeuetimebegin", eCmdHdlrInt, 0 },
 	{ "queue.dequeuetimeend", eCmdHdlrInt, 0 },
-	{ "queue.cry.provider", eCmdHdlrGetWord, 0 }
+	{ "queue.cry.provider", eCmdHdlrGetWord, 0 },
+	{ "queue.samplinginterval", eCmdHdlrInt, 0 }
 };
 static struct cnfparamblk pblk =
 	{ CNFPARAMBLK_VERSION,
@@ -134,6 +141,7 @@ static struct cnfparamblk pblk =
 	};
 
 /* debug aid */
+#if 0
 static inline void displayBatchState(batch_t *pBatch)
 {
 	int i;
@@ -141,6 +149,8 @@ static inline void displayBatchState(batch_t *pBatch)
 		DBGPRINTF("displayBatchState %p[%d]: %d\n", pBatch, i, pBatch->eltState[i]);
 	}
 }
+#endif
+static rsRetVal qqueuePersist(qqueue_t *pThis, int bIsCheckpoint);
 
 /***********************************************************************
  * we need a private data structure, the "to-delete" list. As C does
@@ -176,7 +186,7 @@ static inline toDeleteLst_t *tdlPeek(qqueue_t *pQueue)
  * element itself is destroyed. Must not be called when the list
  * is empty.
  */
-static inline rsRetVal tdlPop(qqueue_t *pQueue)
+static rsRetVal tdlPop(qqueue_t *pQueue)
 {
 	toDeleteLst_t *pRemove;
 	DEFiRet;
@@ -196,7 +206,8 @@ static inline rsRetVal tdlPop(qqueue_t *pQueue)
  * structure, populates it with the values provided and links the new
  * element into the correct place inside the list.
  */
-static inline rsRetVal tdlAdd(qqueue_t *pQueue, qDeqID deqID, int nElemDeq)
+static rsRetVal
+tdlAdd(qqueue_t *pQueue, qDeqID deqID, int nElemDeq)
 {
 	toDeleteLst_t *pNew;
 	toDeleteLst_t *pPrev;
@@ -231,10 +242,10 @@ finalize_it:
 
 /* methods */
 
-static inline char *
+static const char *
 getQueueTypeName(queueType_t t)
 {
-	char *r;
+	const char *r;
 
 	switch(t) {
 	case QUEUETYPE_FIXED_ARRAY: 
@@ -320,9 +331,9 @@ getLogicalQueueSize(qqueue_t *pThis)
  * This functions works "around" the regular deque mechanism, because it is only used to
  * clean up (in cases where message loss is acceptable). 
  */
-static inline void queueDrain(qqueue_t *pThis)
+static void queueDrain(qqueue_t *pThis)
 {
-	msg_t *pMsg;
+	smsg_t *pMsg;
 	ASSERT(pThis != NULL);
 
 	BEGINfunc
@@ -346,7 +357,7 @@ static inline void queueDrain(qqueue_t *pThis)
  * this point in time. The mutex must be locked when
  * ths function is called. -- rgerhards, 2008-01-25
  */
-static inline rsRetVal
+static rsRetVal
 qqueueAdviseMaxWorkers(qqueue_t *pThis)
 {
 	DEFiRet;
@@ -412,7 +423,7 @@ StartDA(qqueue_t *pThis)
 	CHKiRet(qqueueConstruct(&pThis->pqDA, QUEUETYPE_DISK , 1, 0, pThis->pConsumer));
 
 	/* give it a name */
-	snprintf((char*) pszDAQName, sizeof(pszDAQName)/sizeof(uchar), "%s[DA]", obj.GetName((obj_t*) pThis));
+	snprintf((char*) pszDAQName, sizeof(pszDAQName), "%s[DA]", obj.GetName((obj_t*) pThis));
 	obj.SetName((obj_t*) pThis->pqDA, pszDAQName);
 
 	/* as the created queue is the same object class, we take the
@@ -555,7 +566,7 @@ static rsRetVal qDestructFixedArray(qqueue_t *pThis)
 }
 
 
-static rsRetVal qAddFixedArray(qqueue_t *pThis, msg_t* in)
+static rsRetVal qAddFixedArray(qqueue_t *pThis, smsg_t* in)
 {
 	DEFiRet;
 
@@ -569,7 +580,7 @@ static rsRetVal qAddFixedArray(qqueue_t *pThis, msg_t* in)
 }
 
 
-static rsRetVal qDeqFixedArray(qqueue_t *pThis, msg_t **out)
+static rsRetVal qDeqFixedArray(qqueue_t *pThis, smsg_t **out)
 {
 	DEFiRet;
 
@@ -630,7 +641,7 @@ static rsRetVal qDestructLinkedList(qqueue_t __attribute__((unused)) *pThis)
 	RETiRet;
 }
 
-static rsRetVal qAddLinkedList(qqueue_t *pThis, msg_t* pMsg)
+static rsRetVal qAddLinkedList(qqueue_t *pThis, smsg_t* pMsg)
 {
 	qLinkedList_t *pEntry;
 	DEFiRet;
@@ -656,7 +667,7 @@ finalize_it:
 }
 
 
-static rsRetVal qDeqLinkedList(qqueue_t *pThis, msg_t **ppMsg)
+static rsRetVal qDeqLinkedList(qqueue_t *pThis, smsg_t **ppMsg)
 {
 	qLinkedList_t *pEntry;
 	DEFiRet;
@@ -703,7 +714,7 @@ static rsRetVal qDelLinkedList(qqueue_t *pThis)
  * states, which can trigger different processing in the higher layers.
  * rgerhards, 2011-05-03
  */
-static inline rsRetVal
+static rsRetVal
 queueSwitchToEmergencyMode(qqueue_t *pThis, rsRetVal initiatingError)
 {
 	pThis->iQueueSize = 0;
@@ -743,6 +754,7 @@ qqueueLoadPersStrmInfoFixup(strm_t *pStrm, qqueue_t __attribute__((unused)) *pTh
 	ISOBJ_TYPE_assert(pStrm, strm);
 	ISOBJ_TYPE_assert(pThis, qqueue);
 	CHKiRet(strm.SetDir(pStrm, pThis->pszSpoolDir, pThis->lenSpoolDir));
+	CHKiRet(strm.SetbSync(pStrm, pThis->bSyncQueueFiles));
 finalize_it:
 	RETiRet;
 }
@@ -910,8 +922,17 @@ static rsRetVal qDestructDisk(qqueue_t *pThis)
 	ASSERT(pThis != NULL);
 
 	free(pThis->pszQIFNam);
-	if(pThis->tVars.disk.pWrite != NULL)
+	if(pThis->tVars.disk.pWrite != NULL) {
+		int64 currOffs;
+		strm.GetCurrOffset(pThis->tVars.disk.pWrite, &currOffs);
+		if(currOffs == 0) {
+			/* if no data is present, we can (and must!) delete this
+			 * file. Else we can leave garbagge after termination.
+			 */
+			strm.SetbDeleteOnClose(pThis->tVars.disk.pWrite, 1);
+		}
 		strm.Destruct(&pThis->tVars.disk.pWrite);
+	}
 	if(pThis->tVars.disk.pReadDeq != NULL)
 		strm.Destruct(&pThis->tVars.disk.pReadDeq);
 	if(pThis->tVars.disk.pReadDel != NULL)
@@ -920,10 +941,11 @@ static rsRetVal qDestructDisk(qqueue_t *pThis)
 	RETiRet;
 }
 
-static rsRetVal qAddDisk(qqueue_t *pThis, msg_t* pMsg)
+static rsRetVal qAddDisk(qqueue_t *pThis, smsg_t* pMsg)
 {
 	DEFiRet;
 	number_t nWriteCount;
+	const int oldfile = strmGetCurrFileNum(pThis->tVars.disk.pWrite);
 
 	ASSERT(pThis != NULL);
 
@@ -943,12 +965,24 @@ static rsRetVal qAddDisk(qqueue_t *pThis, msg_t* pMsg)
 	DBGOPRINT((obj_t*) pThis, "write wrote %lld octets to disk, queue disk size now %lld octets, EnqOnly:%d\n",
 		   nWriteCount, pThis->tVars.disk.sizeOnDisk, pThis->bEnqOnly);
 
+	/* Did we have a change in the on-disk file? If so, we
+	 * should do a "robustness sync" of the .qi file to guard
+	 * against the most harsh consequences of kill -9 and power off.
+	 */
+	const int newfile = strmGetCurrFileNum(pThis->tVars.disk.pWrite);
+	if(newfile != oldfile) {
+		DBGOPRINT((obj_t*) pThis, "current to-be-written-to file has changed from "
+			"number %d to number %d - requiring a .qi write for robustness\n",
+			oldfile, newfile);
+		pThis->tVars.disk.nForcePersist = 2;
+	}
+
 finalize_it:
 	RETiRet;
 }
 
 
-static rsRetVal qDeqDisk(qqueue_t *pThis, msg_t **ppMsg)
+static rsRetVal qDeqDisk(qqueue_t *pThis, smsg_t **ppMsg)
 {
 	DEFiRet;
 	iRet = objDeserializeWithMethods(ppMsg, (uchar*) "msg", 3, pThis->tVars.disk.pReadDeq, NULL,
@@ -969,7 +1003,7 @@ static rsRetVal qDestructDirect(qqueue_t __attribute__((unused)) *pThis)
 	return RS_RET_OK;
 }
 
-static rsRetVal qAddDirectWithWti(qqueue_t *pThis, msg_t* pMsg, wti_t *pWti)
+static rsRetVal qAddDirectWithWti(qqueue_t *pThis, smsg_t* pMsg, wti_t *pWti)
 {
 	batch_t singleBatch;
 	batch_obj_t batchObj;
@@ -1004,7 +1038,7 @@ static rsRetVal qAddDirectWithWti(qqueue_t *pThis, msg_t* pMsg, wti_t *pWti)
  * to obtain a dummy pWti.
  */
 static rsRetVal
-qAddDirect(qqueue_t *pThis, msg_t* pMsg)
+qAddDirect(qqueue_t *pThis, smsg_t* pMsg)
 {
 	wti_t *pWti;
 	DEFiRet;
@@ -1025,11 +1059,23 @@ qAddDirect(qqueue_t *pThis, msg_t* pMsg)
  * things truely different. -- rgerhards, 2008-02-12
  */
 static rsRetVal
-qqueueAdd(qqueue_t *pThis, msg_t *pMsg)
+qqueueAdd(qqueue_t *pThis, smsg_t *pMsg)
 {
 	DEFiRet;
 
 	ASSERT(pThis != NULL);
+
+	static int msgCnt = 0;
+
+	if(pThis->iSmpInterval > 0)
+	{
+		msgCnt = (msgCnt + 1) % (pThis->iSmpInterval);
+		if(msgCnt != 0)
+		{
+		        msgDestruct(&pMsg);
+			goto finalize_it;
+		}
+	}
 
 	CHKiRet(pThis->qAdd(pThis, pMsg));
 
@@ -1055,7 +1101,7 @@ finalize_it:
 /* generic code to dequeue a queue entry
  */
 static rsRetVal
-qqueueDeq(qqueue_t *pThis, msg_t **ppMsg)
+qqueueDeq(qqueue_t *pThis, smsg_t **ppMsg)
 {
 	DEFiRet;
 
@@ -1086,7 +1132,7 @@ qqueueDeq(qqueue_t *pThis, msg_t **ppMsg)
  * and DA queue to try complete processing.
  * rgerhards, 2009-10-14
  */
-static inline rsRetVal
+static rsRetVal
 tryShutdownWorkersWithinQueueTimeout(qqueue_t *pThis)
 {
 	struct timespec tTimeout;
@@ -1395,6 +1441,7 @@ qqueueSetDefaultsActionQueue(qqueue_t *pThis)
 	pThis->iDeqSlowdown = 0;
 	pThis->iDeqtWinFromHr = 0;
 	pThis->iDeqtWinToHr = 25;		 /* disable time-windowed dequeuing by default */
+	pThis->iSmpInterval = 0;                 /* disable sampling */
 }
 
 
@@ -1425,6 +1472,7 @@ qqueueSetDefaultsRulesetQueue(qqueue_t *pThis)
 	pThis->iDeqSlowdown = 0;
 	pThis->iDeqtWinFromHr = 0;
 	pThis->iDeqtWinToHr = 25;		 /* disable time-windowed dequeuing by default */
+	pThis->iSmpInterval = 0;                 /* disable sampling */
 }
 
 
@@ -1441,7 +1489,7 @@ qqueueSetDefaultsRulesetQueue(qqueue_t *pThis)
  * the return state!
  * rgerhards, 2008-01-24
  */
-static int qqueueChkDiscardMsg(qqueue_t *pThis, int iQueueSize, msg_t *pMsg)
+static int qqueueChkDiscardMsg(qqueue_t *pThis, int iQueueSize, smsg_t *pMsg)
 {
 	DEFiRet;
 	rsRetVal iRetLocal;
@@ -1470,11 +1518,11 @@ finalize_it:
 
 /* Finally remove n elements from the queue store.
  */
-static inline rsRetVal
+static rsRetVal
 DoDeleteBatchFromQStore(qqueue_t *pThis, int nElem)
 {
 	int i;
-	off64_t bytesDel;
+	off64_t bytesDel = 0; /* keep CLANG static anaylzer happy */
 	DEFiRet;
 
 	ISOBJ_TYPE_assert(pThis, qqueue);
@@ -1517,6 +1565,10 @@ DoDeleteBatchFromQStore(qqueue_t *pThis, int nElem)
 		  getLogicalQueueSize(pThis), getPhysicalQueueSize(pThis));
 	++pThis->deqIDDel; /* one more batch dequeued */
 
+	if((pThis->qType == QUEUETYPE_DISK) && (bytesDel != 0)) {
+		qqueuePersist(pThis, QUEUE_CHECKPOINT); /* robustness persist .qi file */
+	}
+
 	RETiRet;
 }
 
@@ -1524,7 +1576,7 @@ DoDeleteBatchFromQStore(qqueue_t *pThis, int nElem)
 /* remove messages from the physical queue store that are fully processed. This is
  * controlled via the to-delete list.
  */
-static inline rsRetVal
+static rsRetVal
 DeleteBatchFromQStore(qqueue_t *pThis, batch_t *pBatch)
 {
 	toDeleteLst_t *pTdl;
@@ -1564,11 +1616,11 @@ finalize_it:
  * processed are enqueued again. The new enqueue is necessary because we have a
  * rgerhards, 2009-05-13
  */
-static inline rsRetVal
+static rsRetVal
 DeleteProcessedBatch(qqueue_t *pThis, batch_t *pBatch)
 {
 	int i;
-	msg_t *pMsg;
+	smsg_t *pMsg;
 	int nEnqueued = 0;
 	rsRetVal localRet;
 	DEFiRet;
@@ -1611,14 +1663,14 @@ DeleteProcessedBatch(qqueue_t *pThis, batch_t *pBatch)
  * This must only be called when the queue mutex is LOOKED, otherwise serious
  * malfunction will happen.
  */
-static inline rsRetVal
-DequeueConsumableElements(qqueue_t *pThis, wti_t *pWti, int *piRemainingQueueSize)
+static rsRetVal
+DequeueConsumableElements(qqueue_t *pThis, wti_t *pWti, int *piRemainingQueueSize, int *const pSkippedMsgs)
 {
 	int nDequeued;
 	int nDiscarded;
 	int nDeleted;
 	int iQueueSize;
-	msg_t *pMsg;
+	smsg_t *pMsg;
 	rsRetVal localRet;
 	DEFiRet;
 
@@ -1629,8 +1681,42 @@ DequeueConsumableElements(qqueue_t *pThis, wti_t *pWti, int *piRemainingQueueSiz
 	if(pThis->qType == QUEUETYPE_DISK) {
 		pThis->tVars.disk.deqFileNumIn = strmGetCurrFileNum(pThis->tVars.disk.pReadDeq);
 	}
+
 	while((iQueueSize = getLogicalQueueSize(pThis)) > 0 && nDequeued < pThis->iDeqBatchSize) {
-		CHKiRet(qqueueDeq(pThis, &pMsg));
+		int rd_fd = -1;
+		int64_t rd_offs = 0;
+		int wr_fd = -1;
+		int64_t wr_offs = 0;
+		if(pThis->tVars.disk.pReadDeq != NULL) {
+			rd_fd = strmGetCurrFileNum(pThis->tVars.disk.pReadDeq);
+			rd_offs = pThis->tVars.disk.pReadDeq->iCurrOffs;
+		}
+		if(pThis->tVars.disk.pWrite != NULL) {
+			wr_fd = strmGetCurrFileNum(pThis->tVars.disk.pWrite);
+			wr_offs = pThis->tVars.disk.pWrite->iCurrOffs;
+		}
+		if(rd_fd != -1 && rd_fd == wr_fd && rd_offs == wr_offs) {
+			DBGPRINTF("problem on disk queue '%s': "
+					//"queue size log %d, phys %d, but rd_fd=wr_rd=%d and offs=%lld\n",
+					"queue size log %d, phys %d, but rd_fd=wr_rd=%d and offs=%" PRId64 "\n",
+					obj.GetName((obj_t*) pThis), iQueueSize, pThis->iQueueSize,
+					rd_fd, rd_offs);
+			*pSkippedMsgs = iQueueSize;
+#			ifdef ENABLE_IMDIAG
+			iOverallQueueSize -= iQueueSize;
+#			endif
+			pThis->iQueueSize -= iQueueSize;
+			iQueueSize = 0;
+			break;
+		}
+
+		localRet = qqueueDeq(pThis, &pMsg);
+		if(localRet == RS_RET_FILE_NOT_FOUND) {
+			DBGPRINTF("fatal error on disk queue '%s': file '%s' "
+				"not found, queue size said to be %d",
+				obj.GetName((obj_t*) pThis), "...", iQueueSize);
+		}
+		CHKiRet(localRet);
 
 		/* check if we should discard this element */
 		localRet = qqueueChkDiscardMsg(pThis, pThis->iQueueSize, pMsg);
@@ -1671,13 +1757,18 @@ finalize_it:
  * rgerhards, 2009-04-22
  */
 static rsRetVal
-DequeueConsumable(qqueue_t *pThis, wti_t *pWti)
+DequeueConsumable(qqueue_t *pThis, wti_t *pWti, int *const pSkippedMsgs)
 {
 	DEFiRet;
 	int iQueueSize = 0; /* keep the compiler happy... */
 
+	*pSkippedMsgs = 0;
 	/* dequeue element batch (still protected from mutex) */
-	iRet = DequeueConsumableElements(pThis, pWti, &iQueueSize);
+	iRet = DequeueConsumableElements(pThis, pWti, &iQueueSize, pSkippedMsgs);
+	if(*pSkippedMsgs > 0) {
+		DBGOPRINT((obj_t*) pThis, "lost %d messages from diskqueue (invalid .qi file)",
+			*pSkippedMsgs);
+	}
 
 	/* awake some flow-controlled sources if we can do this right now */
 	/* TODO: this could be done better from a performance point of view -- do it only if
@@ -1699,7 +1790,14 @@ DequeueConsumable(qqueue_t *pThis, wti_t *pWti)
 
 	if(iRet != RS_RET_OK && iRet != RS_RET_DISCARDMSG) {
 		DBGOPRINT((obj_t*) pThis, "error %d dequeueing element - ignoring, but strange things "
-			  "may happen\n", iRet);
+					  "may happen\n", iRet);
+#if 0	// This does not work when we run on the main queue
+	// TODO: find better work-around
+		errmsg.LogError(0, iRet, "problem on disk queue '%s': "
+				"error dequeueing element - we ignore this for now, but it "
+				"may cause future trouble.",
+				obj.GetName((obj_t*) pThis));
+#endif
 	}
 
 	RETiRet;
@@ -1810,15 +1908,15 @@ RateLimiter(qqueue_t *pThis)
  * cancelled, else it will leave back an inconsistent state.
  * rgerhards, 2009-05-20
  */
-static inline rsRetVal
-DequeueForConsumer(qqueue_t *pThis, wti_t *pWti)
+static rsRetVal
+DequeueForConsumer(qqueue_t *pThis, wti_t *pWti, int *const pSkippedMsgs)
 {
 	DEFiRet;
 
 	ISOBJ_TYPE_assert(pThis, qqueue);
 	ISOBJ_TYPE_assert(pWti, wti);
 
-	CHKiRet(DequeueConsumable(pThis, pWti));
+	CHKiRet(DequeueConsumable(pThis, pWti, pSkippedMsgs));
 
 	if(pWti->batch.nElem == 0)
 		ABORT_FINALIZE(RS_RET_IDLE);
@@ -1867,12 +1965,14 @@ ConsumerReg(qqueue_t *pThis, wti_t *pWti)
 {
 	int iCancelStateSave;
 	int bNeedReLock = 0;	/**< do we need to lock the mutex again? */
+	int skippedMsgs = 0;	/**< did the queue loose any messages (can happen with 
+	                         ** disk queue if .qi file is corrupt */
 	DEFiRet;
 
 	ISOBJ_TYPE_assert(pThis, qqueue);
 	ISOBJ_TYPE_assert(pWti, wti);
 
-	iRet = DequeueForConsumer(pThis, pWti);
+	iRet = DequeueForConsumer(pThis, pWti, &skippedMsgs);
 	if(iRet == RS_RET_FILE_NOT_FOUND) {
 		/* This is a fatal condition and means the queue is almost unusable */
 		d_pthread_mutex_unlock(pThis->mut);
@@ -1888,6 +1988,14 @@ ConsumerReg(qqueue_t *pThis, wti_t *pWti)
 	/* we now have a non-idle batch of work, so we can release the queue mutex and process it */
 	d_pthread_mutex_unlock(pThis->mut);
 	bNeedReLock = 1;
+
+	/* report errors, now that we are outside of queue lock */
+	if(skippedMsgs > 0) {
+		errmsg.LogError(0, 0, "problem on disk queue '%s': "
+				"queue files contain %d messages fewer than specified "
+				"in .qi file -- we lost those messages. That's all we know.",
+				obj.GetName((obj_t*) pThis), skippedMsgs);
+	}
 
 	/* at this spot, we may be cancelled */
 	pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &iCancelStateSave);
@@ -1936,12 +2044,13 @@ ConsumerDA(qqueue_t *pThis, wti_t *pWti)
 	int i;
 	int iCancelStateSave;
 	int bNeedReLock = 0;	/**< do we need to lock the mutex again? */
+	int skippedMsgs = 0;
 	DEFiRet;
 
 	ISOBJ_TYPE_assert(pThis, qqueue);
 	ISOBJ_TYPE_assert(pWti, wti);
 
-	CHKiRet(DequeueForConsumer(pThis, pWti));
+	CHKiRet(DequeueForConsumer(pThis, pWti, &skippedMsgs));
 
 	/* we now have a non-idle batch of work, so we can release the queue mutex and process it */
 	d_pthread_mutex_unlock(pThis->mut);
@@ -2118,7 +2227,7 @@ qqueueStart(qqueue_t *pThis) /* this is the ConstructionFinalizer */
 			/* special handling */
 			pThis->iNumWorkerThreads = 1; /* we need exactly one worker */
 			/* pre-construct file name for .qi file */
-			pThis->lenQIFNam = snprintf((char*)pszQIFNam, sizeof(pszQIFNam) / sizeof(uchar),
+			pThis->lenQIFNam = snprintf((char*)pszQIFNam, sizeof(pszQIFNam),
 				"%s/%s.qi", (char*) pThis->pszSpoolDir, (char*)pThis->pszFilePrefix);
 			pThis->pszQIFNam = ustrdup(pszQIFNam);
 			DBGOPRINT((obj_t*) pThis, ".qi file name is '%s', len %d\n", pThis->pszQIFNam,
@@ -2360,10 +2469,13 @@ finalize_it:
  * and 0 otherwise.
  * rgerhards, 2008-01-10
  */
-static rsRetVal qqueuePersist(qqueue_t *pThis, int bIsCheckpoint)
+static rsRetVal
+qqueuePersist(qqueue_t *pThis, int bIsCheckpoint)
 {
 	DEFiRet;
+	char *tmpQIFName = NULL;
 	strm_t *psQIF = NULL; /* Queue Info File */
+	char errStr[1024];
 
 	ASSERT(pThis != NULL);
 
@@ -2392,11 +2504,23 @@ static rsRetVal qqueuePersist(qqueue_t *pThis, int bIsCheckpoint)
 		FINALIZE; /* nothing left to do, so be happy */
 	}
 
+#ifdef _AIX
+	const int lentmpQIFName = strlen( pThis->pszQIFNam) + strlen(".tmp") + 1;
+	tmpQIFName = malloc(sizeof(char)*lentmpQIFName);
+	if(tmpQIFName == NULL)
+                tmpQIFName = (char*)pThis->pszQIFNam;
+	snprintf(tmpQIFName, lentmpQIFName, "%s.tmp", pThis->pszQIFNam);
+#else 
+	const int lentmpQIFName = asprintf((char **)&tmpQIFName, "%s.tmp", pThis->pszQIFNam);
+	if(tmpQIFName == NULL)
+		tmpQIFName = (char*)pThis->pszQIFNam;
+#endif
+
 	CHKiRet(strm.Construct(&psQIF));
 	CHKiRet(strm.SettOperationsMode(psQIF, STREAMMODE_WRITE_TRUNC));
 	CHKiRet(strm.SetbSync(psQIF, pThis->bSyncQueueFiles));
 	CHKiRet(strm.SetsType(psQIF, STREAMTYPE_FILE_SINGLE));
-	CHKiRet(strm.SetFName(psQIF, pThis->pszQIFNam, pThis->lenQIFNam));
+	CHKiRet(strm.SetFName(psQIF, (uchar*) tmpQIFName, lentmpQIFName));
 	CHKiRet(strm.ConstructFinalize(psQIF));
 
 	/* first, write the property bag for ourselfs
@@ -2415,6 +2539,17 @@ static rsRetVal qqueuePersist(qqueue_t *pThis, int bIsCheckpoint)
 		CHKiRet(strm.Serialize(pThis->tVars.disk.pWrite, psQIF));
 	if(pThis->tVars.disk.pReadDel != NULL)
 		CHKiRet(strm.Serialize(pThis->tVars.disk.pReadDel, psQIF));
+
+	strm.Destruct(&psQIF);
+	if(tmpQIFName != (char*)pThis->pszQIFNam) { /* pointer, not string comparison! */
+		if(rename(tmpQIFName, (char*)pThis->pszQIFNam) != 0) {
+			rs_strerror_r(errno, errStr, sizeof(errStr));
+			DBGOPRINT((obj_t*) pThis,
+				"FATAL error: renaming temporary .qi file failed: %s\n",
+				errStr);
+			ABORT_FINALIZE(RS_RET_RENAME_TMP_QI_ERROR);
+		}
+	}
 	
 	/* tell the input file object that it must not delete the file on close if the queue
 	 * is non-empty - but only if we are not during a simple checkpoint
@@ -2430,6 +2565,8 @@ static rsRetVal qqueuePersist(qqueue_t *pThis, int bIsCheckpoint)
 	pThis->bNeedDelQIF = 1;
 
 finalize_it:
+	if(tmpQIFName != (char*)pThis->pszQIFNam) /* pointer, not string comparison! */
+		free(tmpQIFName);
 	if(psQIF != NULL)
 		strm.Destruct(&psQIF);
 
@@ -2444,7 +2581,7 @@ finalize_it:
  * nUpdates is the number of updates since the last call to this function.
  * It may be > 1 due to batches. -- rgerhards, 2009-05-12
  */
-static rsRetVal qqueueChkPersist(qqueue_t *pThis, int nUpdates)
+static rsRetVal qqueueChkPersist(qqueue_t *const pThis, const int nUpdates)
 {
 	DEFiRet;
 	ISOBJ_TYPE_assert(pThis, qqueue);
@@ -2471,7 +2608,7 @@ finalize_it:
  * depending on the queue configuration (e.g. store on remote machine).
  * rgerhards, 2009-05-26
  */
-static inline rsRetVal
+static rsRetVal
 DoSaveOnShutdown(qqueue_t *pThis)
 {
 	struct timespec tTimeout;
@@ -2507,6 +2644,7 @@ DoSaveOnShutdown(qqueue_t *pThis)
 /* destructor for the queue object */
 BEGINobjDestruct(qqueue) /* be sure to specify the object type also in END and CODESTART macros! */
 CODESTARTobjDestruct(qqueue)
+	DBGOPRINT((obj_t*) pThis, "shutdown: begin to destruct queue\n");
 	if(pThis->bQueueStarted) {
 		/* shut down all workers
 		 * We do not need to shutdown workers when we are in enqueue-only mode or we are a
@@ -2626,7 +2764,7 @@ qqueueSetFilePrefix(qqueue_t *pThis, uchar *pszPrefix, size_t iLenPrefix)
 	if(pszPrefix == NULL) /* just unset the prefix! */
 		ABORT_FINALIZE(RS_RET_OK);
 
-	if((pThis->pszFilePrefix = MALLOC(sizeof(uchar) * iLenPrefix + 1)) == NULL)
+	if((pThis->pszFilePrefix = MALLOC(iLenPrefix + 1)) == NULL)
 		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
 	memcpy(pThis->pszFilePrefix, pszPrefix, iLenPrefix + 1);
 	pThis->lenFilePrefix = iLenPrefix;
@@ -2660,8 +2798,8 @@ finalize_it:
  * Note that the queue mutex MUST already be locked when this function is called.
  * rgerhards, 2009-06-16
  */
-static inline rsRetVal
-doEnqSingleObj(qqueue_t *pThis, flowControl_t flowCtlType, msg_t *pMsg)
+static rsRetVal
+doEnqSingleObj(qqueue_t *pThis, flowControl_t flowCtlType, smsg_t *pMsg)
 {
 	DEFiRet;
 	int err;
@@ -2772,6 +2910,19 @@ doEnqSingleObj(qqueue_t *pThis, flowControl_t flowCtlType, msg_t *pMsg)
 	CHKiRet(qqueueAdd(pThis, pMsg));
 	STATSCOUNTER_SETMAX_NOMUT(pThis->ctrMaxqsize, pThis->iQueueSize);
 
+	/* check if we had a file rollover and need to persist
+	 * the .qi file for robustness reasons.
+	 * Note: the n=2 write is required for closing the old file and
+	 * the n=1 write is required after opening and writing to the new
+	 * file.
+	 */
+	if(pThis->tVars.disk.nForcePersist > 0) {
+		DBGOPRINT((obj_t*) pThis, ".qi file write required for robustness reasons (n=%d)\n",
+			pThis->tVars.disk.nForcePersist);
+		pThis->tVars.disk.nForcePersist--;
+		qqueuePersist(pThis, QUEUE_CHECKPOINT);
+	}
+
 finalize_it:
 	RETiRet;
 }
@@ -2844,14 +2995,15 @@ finalize_it:
  * Enqueues the new element and awakes worker thread.
  */
 rsRetVal
-qqueueEnqMsg(qqueue_t *pThis, flowControl_t flowCtlType, msg_t *pMsg)
+qqueueEnqMsg(qqueue_t *pThis, flowControl_t flowCtlType, smsg_t *pMsg)
 {
 	DEFiRet;
 	int iCancelStateSave;
-
 	ISOBJ_TYPE_assert(pThis, qqueue);
 
-	if(pThis->qType != QUEUETYPE_DIRECT) {
+	const int isNonDirectQ = pThis->qType != QUEUETYPE_DIRECT;
+
+	if(isNonDirectQ) {
 		pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &iCancelStateSave);
 		d_pthread_mutex_lock(pThis->mut);
 	}
@@ -2861,7 +3013,7 @@ qqueueEnqMsg(qqueue_t *pThis, flowControl_t flowCtlType, msg_t *pMsg)
 	qqueueChkPersist(pThis, 1);
 
 finalize_it:
-	if(pThis->qType != QUEUETYPE_DIRECT) {
+	if(isNonDirectQ) {
 		/* make sure at least one worker is running. */
 		qqueueAdviseMaxWorkers(pThis);
 		/* and release the mutex */
@@ -2892,7 +3044,7 @@ queueCnfParamsSet(struct nvlst *lst)
 }
 
 
-static inline rsRetVal
+static rsRetVal
 initCryprov(qqueue_t *pThis, struct nvlst *lst)
 {
 	uchar szDrvrName[1024];
@@ -3016,6 +3168,8 @@ qqueueApplyCnfParam(qqueue_t *pThis, struct nvlst *lst)
 			pThis->iDeqtWinFromHr = pvals[i].val.d.n;
 		} else if(!strcmp(pblk.descr[i].name, "queue.dequeuetimeend")) {
 			pThis->iDeqtWinToHr = pvals[i].val.d.n;
+		} else if(!strcmp(pblk.descr[i].name, "queue.samplinginterval")) {
+			pThis->iSmpInterval = pvals[i].val.d.n;
 		} else {
 			DBGPRINTF("queue: program error, non-handled "
 			  "param '%s'\n", pblk.descr[i].name);
@@ -3059,10 +3213,8 @@ DEFpropSetMeth(qqueue, toEnq, long)
 DEFpropSetMeth(qqueue, iHighWtrMrk, int)
 DEFpropSetMeth(qqueue, iLowWtrMrk, int)
 DEFpropSetMeth(qqueue, iDiscardMrk, int)
-DEFpropSetMeth(qqueue, iFullDlyMrk, int)
 DEFpropSetMeth(qqueue, iDiscardSeverity, int)
 DEFpropSetMeth(qqueue, iLightDlyMrk, int)
-DEFpropSetMeth(qqueue, bIsDA, int)
 DEFpropSetMeth(qqueue, iNumWorkerThreads, int)
 DEFpropSetMeth(qqueue, iMinMsgsPerWrkr, int)
 DEFpropSetMeth(qqueue, bSaveOnShutdown, int)
@@ -3070,6 +3222,7 @@ DEFpropSetMeth(qqueue, pAction, action_t*)
 DEFpropSetMeth(qqueue, iDeqSlowdown, int)
 DEFpropSetMeth(qqueue, iDeqBatchSize, int)
 DEFpropSetMeth(qqueue, sizeOnDiskMax, int64)
+DEFpropSetMeth(qqueue, iSmpInterval, int)
 
 
 /* This function can be used as a generic way to set properties. Only the subset
@@ -3103,7 +3256,7 @@ finalize_it:
 #undef	isProp
 
 /* dummy */
-rsRetVal qqueueQueryInterface(void) { return RS_RET_NOT_IMPLEMENTED; }
+static rsRetVal qqueueQueryInterface(void) { return RS_RET_NOT_IMPLEMENTED; }
 
 /* Initialize the stream class. Must be called as the very first method
  * before anything else is called inside this class.

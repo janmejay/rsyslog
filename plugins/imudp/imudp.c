@@ -4,7 +4,7 @@
  * NOTE: read comments in module-template.h to understand how this file
  *       works!
  *
- * Copyright 2007-2014 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2007-2016 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of rsyslog.
  *
@@ -34,7 +34,7 @@
 #include <sys/socket.h>
 #include <pthread.h>
 #include <signal.h>
-#if HAVE_SYS_EPOLL_H
+#ifdef HAVE_SYS_EPOLL_H
 #	include <sys/epoll.h>
 #endif
 #ifdef HAVE_SCHED_H
@@ -100,6 +100,7 @@ static time_t ttLastDiscard = 0;	/* timestamp when a message from a non-permitte
 /* config vars for legacy config system */
 static struct configSettings_s {
 	uchar *pszBindAddr;		/* IP to bind socket to */
+	char  *pszBindDevice;		/* Device to bind socket to */
 	uchar *pszSchedPolicy;		/* scheduling policy string */
 	uchar *pszBindRuleset;		/* name of Ruleset to bind to */
 	int iSchedPrio;			/* scheduling priority */
@@ -108,6 +109,7 @@ static struct configSettings_s {
 
 struct instanceConf_s {
 	uchar *pszBindAddr;		/* IP to bind socket to */
+	char  *pszBindDevice;		/* Device to bind socket to */
 	uchar *pszBindPort;		/* Port to bind socket to */
 	uchar *pszBindRuleset;		/* name of ruleset to bind to */
 	uchar *inputname;
@@ -116,6 +118,10 @@ struct instanceConf_s {
 	int ratelimitInterval;
 	int ratelimitBurst;
 	int rcvbuf;			/* 0 means: do not set, keep OS default */
+	/*  0 means:  IP_FREEBIND is disabled
+	1 means:  IP_FREEBIND enabled + warning disabled
+	1+ means: IP+FREEBIND enabled + warning enabled */
+	int ipfreebind;
 	struct instanceConf_s *next;
 	sbool bAppendPortToInpname;
 };
@@ -176,9 +182,11 @@ static struct cnfparamdescr inppdescr[] = {
 	{ "name", eCmdHdlrGetWord, 0 },
 	{ "name.appendport", eCmdHdlrBinary, 0 },
 	{ "address", eCmdHdlrString, 0 },
+	{ "device", eCmdHdlrString, 0 },
 	{ "ratelimit.interval", eCmdHdlrInt, 0 },
 	{ "ratelimit.burst", eCmdHdlrInt, 0 },
 	{ "rcvbufsize", eCmdHdlrSize, 0 },
+	{ "ipfreebind", eCmdHdlrInt, 0 },
 	{ "ruleset", eCmdHdlrString, 0 }
 };
 static struct cnfparamblk inppblk =
@@ -189,7 +197,8 @@ static struct cnfparamblk inppblk =
 
 #include "im-helper.h" /* must be included AFTER the type definitions! */
 
-/* create input instance, set default paramters, and
+
+/* create input instance, set default parameters, and
  * add it to the list of instances.
  */
 static rsRetVal
@@ -203,12 +212,14 @@ createInstance(instanceConf_t **pinst)
 
 	inst->pszBindPort = NULL;
 	inst->pszBindAddr = NULL;
+	inst->pszBindDevice = NULL;
 	inst->pszBindRuleset = NULL;
 	inst->inputname = NULL;
 	inst->bAppendPortToInpname = 0;
 	inst->ratelimitBurst = 10000; /* arbitrary high limit */
 	inst->ratelimitInterval = 0; /* off */
 	inst->rcvbuf = 0;
+	inst->ipfreebind = IPFREEBIND_ENABLED_WITH_LOG;
 	inst->dfltTZ = NULL;
 
 	/* node created, let's add to config */
@@ -242,6 +253,11 @@ static rsRetVal addInstance(void __attribute__((unused)) *pVal, uchar *pNewVal)
 	} else {
 		CHKmalloc(inst->pszBindAddr = ustrdup(cs.pszBindAddr));
 	}
+	if((cs.pszBindDevice == NULL) || (cs.pszBindDevice[0] == '\0')) {
+		inst->pszBindDevice= NULL;
+	} else {
+		CHKmalloc(inst->pszBindDevice = strdup(cs.pszBindDevice));
+	}
 	if((cs.pszBindRuleset == NULL) || (cs.pszBindRuleset[0] == '\0')) {
 		inst->pszBindRuleset = NULL;
 	} else {
@@ -258,7 +274,7 @@ finalize_it:
  * the instance config description, tries to bind the socket and, if that
  * succeeds, adds it to the list of existing listen sockets.
  */
-static inline rsRetVal
+static rsRetVal
 addListner(instanceConf_t *inst)
 {
 	DEFiRet;
@@ -285,7 +301,7 @@ addListner(instanceConf_t *inst)
 
 	DBGPRINTF("Trying to open syslog UDP ports at %s:%s.\n", bindName, inst->pszBindPort);
 
-	newSocks = net.create_udp_socket(bindAddr, port, 1, inst->rcvbuf);
+	newSocks = net.create_udp_socket(bindAddr, port, 1, inst->rcvbuf, inst->ipfreebind, inst->pszBindDevice);
 	if(newSocks != NULL) {
 		/* we now need to add the new sockets to the existing set */
 		/* ready to copy */
@@ -373,13 +389,13 @@ std_checkRuleset_genErrMsg(__attribute__((unused)) modConfData_t *modConf, insta
 /* This function processes received data. It provides unified handling
  * in cases where recvmmsg() is available and not.
  */
-static inline rsRetVal
+static rsRetVal
 processPacket(struct lstn_s *lstn, struct sockaddr_storage *frominetPrev, int *pbIsPermitted,
 	uchar *rcvBuf, ssize_t lenRcvBuf, struct syslogTime *stTime, time_t ttGenTime,
 	struct sockaddr_storage *frominet, socklen_t socklen, multi_submit_t *multiSub)
 {
 	DEFiRet;
-	msg_t *pMsg = NULL;
+	smsg_t *pMsg = NULL;
 
 	if(lenRcvBuf == 0)
 		FINALIZE; /* this looks a bit strange, but practice shows it happens... */
@@ -417,7 +433,7 @@ processPacket(struct lstn_s *lstn, struct sockaddr_storage *frominetPrev, int *p
 		*pbIsPermitted = 1; /* no check -> everything permitted */
 	}
 
-	DBGPRINTF("recv(%d,%d),acl:%d,msg:%.128s\n", lstn->sock, (int) lenRcvBuf, *pbIsPermitted, rcvBuf);
+	DBGPRINTF("recv(%d,%d),acl:%d,msg:%.*s\n", lstn->sock, (int) lenRcvBuf, *pbIsPermitted, (int)lenRcvBuf, rcvBuf);
 
 	if(*pbIsPermitted != 0)  {
 		/* we now create our own message object and submit it to the queue */
@@ -454,15 +470,18 @@ finalize_it:
  * an appropriate version is compiled (as such we need to maintain both!).
  */
 #ifdef HAVE_RECVMMSG
-static inline rsRetVal
-processSocket(struct wrkrInfo_s *pWrkr, struct lstn_s *lstn, struct sockaddr_storage *frominetPrev, int *pbIsPermitted)
+static rsRetVal
+processSocket(struct wrkrInfo_s *pWrkr, struct lstn_s *lstn, struct sockaddr_storage *frominetPrev,
+int *pbIsPermitted)
 {
 	DEFiRet;
 	int iNbrTimeUsed;
-	time_t ttGenTime;
+	time_t ttGenTime = 0; /* to avoid clang static analyzer false positive */
+		/* note: we do never use this time, because we always get a 
+		 * requery below on first loop iteration */
 	struct syslogTime stTime;
 	char errStr[1024];
-	msg_t *pMsgs[CONF_NUM_MULTISUB];
+	smsg_t *pMsgs[CONF_NUM_MULTISUB];
 	multi_submit_t multiSub;
 	int nelem;
 	int i;
@@ -507,7 +526,7 @@ processSocket(struct wrkrInfo_s *pWrkr, struct lstn_s *lstn, struct sockaddr_sto
 		}
 
 		if((runModConf->iTimeRequery == 0) || (iNbrTimeUsed++ % runModConf->iTimeRequery) == 0) {
-			datetime.getCurrTime(&stTime, &ttGenTime);
+			datetime.getCurrTime(&stTime, &ttGenTime, TIME_IN_LOCALTIME);
 		}
 
 		pWrkr->ctrMsgsRcvd += nelem;
@@ -537,8 +556,9 @@ finalize_it:
  * matter where the actual loss occurs - it is always random, because we depend
  * on scheduling order. -- rgerhards, 2008-10-02
  */
-static inline rsRetVal
-processSocket(struct wrkrInfo_s *pWrkr, struct lstn_s *lstn, struct sockaddr_storage *frominetPrev, int *pbIsPermitted)
+static rsRetVal
+processSocket(struct wrkrInfo_s *pWrkr, struct lstn_s *lstn, struct sockaddr_storage *frominetPrev,
+int *pbIsPermitted)
 {
 	int iNbrTimeUsed;
 	time_t ttGenTime;
@@ -546,7 +566,7 @@ processSocket(struct wrkrInfo_s *pWrkr, struct lstn_s *lstn, struct sockaddr_sto
 	ssize_t lenRcvBuf;
 	struct sockaddr_storage frominet;
 	multi_submit_t multiSub;
-	msg_t *pMsgs[CONF_NUM_MULTISUB];
+	smsg_t *pMsgs[CONF_NUM_MULTISUB];
 	char errStr[1024];
 	struct msghdr mh;
 	struct iovec iov[1];
@@ -580,7 +600,7 @@ processSocket(struct wrkrInfo_s *pWrkr, struct lstn_s *lstn, struct sockaddr_sto
 
 		++pWrkr->ctrMsgsRcvd;
 		if((runModConf->iTimeRequery == 0) || (iNbrTimeUsed++ % runModConf->iTimeRequery) == 0) {
-			datetime.getCurrTime(&stTime, &ttGenTime);
+			datetime.getCurrTime(&stTime, &ttGenTime, TIME_IN_LOCALTIME);
 		}
 
 		CHKiRet(processPacket(lstn, frominetPrev, pbIsPermitted, pWrkr->pRcvBuf, lenRcvBuf, &stTime,
@@ -598,7 +618,7 @@ finalize_it:
 /* check configured scheduling priority.
  * Precondition: iSchedPolicy must have been set
  */
-static inline rsRetVal
+static rsRetVal
 checkSchedulingPriority(modConfData_t *modConf)
 {
     	DEFiRet;
@@ -615,9 +635,8 @@ checkSchedulingPriority(modConfData_t *modConf)
 			modConf->pszSchedPolicy);
 		ABORT_FINALIZE(RS_RET_VALIDATION_RUN);
 	}
-#endif
-
 finalize_it:
+#endif
 	RETiRet;
 }
 
@@ -709,9 +728,9 @@ setSchedParams(modConfData_t *modConf)
 	if(err != 0) {
 		errmsg.LogError(err, NO_ERRCODE, "imudp: pthread_setschedparam() failed - ignoring");
 	}
+finalize_it:
 #	endif
 
-finalize_it:
 	RETiRet;
 }
 
@@ -723,7 +742,8 @@ finalize_it:
  */
 #if defined(HAVE_EPOLL_CREATE1) || defined(HAVE_EPOLL_CREATE)
 #define NUM_EPOLL_EVENTS 10
-rsRetVal rcvMainLoop(struct wrkrInfo_s *pWrkr)
+static rsRetVal
+rcvMainLoop(struct wrkrInfo_s *const __restrict__ pWrkr)
 {
 	DEFiRet;
 	int nfds;
@@ -747,6 +767,13 @@ rsRetVal rcvMainLoop(struct wrkrInfo_s *pWrkr)
 	nLstn = 0;
 	for(lstn = lcnfRoot ; lstn != NULL ; lstn = lstn->next)
 		++nLstn;
+
+	if(nLstn == 0) {
+		errmsg.LogError(errno, RS_RET_ERR,
+			"imudp error: we have 0 listeners, terminating"
+			"worker thread");
+		ABORT_FINALIZE(RS_RET_ERR);
+	}
 	CHKmalloc(udpEPollEvt = calloc(nLstn, sizeof(struct epoll_event)));
 
 #if defined(EPOLL_CLOEXEC) && defined(HAVE_EPOLL_CREATE1)
@@ -804,7 +831,8 @@ finalize_it:
 }
 #else /* #if HAVE_EPOLL_CREATE1 */
 /* this is the code for the select() interface */
-rsRetVal rcvMainLoop(thrdInfo_t *pWrkr)
+static rsRetVal
+rcvMainLoop(struct wrkrInfo_s *const __restrict__ pWrkr)
 {
 	DEFiRet;
 	int maxfds;
@@ -831,7 +859,7 @@ rsRetVal rcvMainLoop(thrdInfo_t *pWrkr)
 		for(lstn = lcnfRoot ; lstn != NULL ; lstn = lstn->next) {
 			if (lstn->sock != -1) {
 				if(Debug)
-					net.debugListenInfo(lstn->sock, "UDP");
+					net.debugListenInfo(lstn->sock, (char*)"UDP");
 				FD_SET(lstn->sock, &readfds);
 				if(lstn->sock>maxfds) maxfds=lstn->sock;
 			}
@@ -863,7 +891,7 @@ rsRetVal rcvMainLoop(thrdInfo_t *pWrkr)
 #endif /* #if HAVE_EPOLL_CREATE1 */
 
 
-static inline rsRetVal
+static rsRetVal
 createListner(es_str_t *port, struct cnfparamvals *pvals)
 {
 	instanceConf_t *inst;
@@ -881,14 +909,14 @@ createListner(es_str_t *port, struct cnfparamvals *pvals)
 		} else if(!strcmp(inppblk.descr[i].name, "name")) {
 			if(inst->inputname != NULL) {
 				errmsg.LogError(0, RS_RET_INVALID_PARAMS, "imudp: name and inputname "
-						"paramter specified - only one can be used");
+						"parameter specified - only one can be used");
 				ABORT_FINALIZE(RS_RET_INVALID_PARAMS);
 			}
 			inst->inputname = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
 		} else if(!strcmp(inppblk.descr[i].name, "name.appendport")) {
 			if(bAppendPortUsed) {
 				errmsg.LogError(0, RS_RET_INVALID_PARAMS, "imudp: name.appendport and "
-						"inputname.appendport paramter specified - only one can be used");
+						"inputname.appendport parameter specified - only one can be used");
 				ABORT_FINALIZE(RS_RET_INVALID_PARAMS);
 			}
 			inst->bAppendPortToInpname = (int) pvals[i].val.d.n;
@@ -916,6 +944,8 @@ createListner(es_str_t *port, struct cnfparamvals *pvals)
 			inst->dfltTZ = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
 		} else if(!strcmp(inppblk.descr[i].name, "address")) {
 			inst->pszBindAddr = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else if(!strcmp(inppblk.descr[i].name, "device")) {
+			inst->pszBindDevice = (char*)es_str2cstr(pvals[i].val.d.estr, NULL);
 		} else if(!strcmp(inppblk.descr[i].name, "ruleset")) {
 			inst->pszBindRuleset = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
 		} else if(!strcmp(inppblk.descr[i].name, "ratelimit.burst")) {
@@ -923,7 +953,16 @@ createListner(es_str_t *port, struct cnfparamvals *pvals)
 		} else if(!strcmp(inppblk.descr[i].name, "ratelimit.interval")) {
 			inst->ratelimitInterval = (int) pvals[i].val.d.n;
 		} else if(!strcmp(inppblk.descr[i].name, "rcvbufsize")) {
-			inst->rcvbuf = (int) pvals[i].val.d.n;
+			const uint64_t val = pvals[i].val.d.n;
+			if(val > 1024 * 1024 * 1024) {
+				errmsg.LogError(0, RS_RET_MISSING_CNFPARAMS,
+					"imudp: rcvbufsize maximum is 1 GiB, using "
+					"default instead");
+			} else {
+				inst->rcvbuf = (int) val;
+			}
+		} else if(!strcmp(inppblk.descr[i].name, "ipfreebind")) {
+			inst->ipfreebind = (int) pvals[i].val.d.n;
 		} else {
 			dbgprintf("imudp: program error, non-handled "
 			  "param '%s'\n", inppblk.descr[i].name);
@@ -977,6 +1016,7 @@ CODESTARTbeginCnfLoad
 	cs.pszBindRuleset = NULL;
 	cs.pszSchedPolicy = NULL;
 	cs.pszBindAddr = NULL;
+	cs.pszBindDevice = NULL;
 	cs.iSchedPrio = SCHED_PRIO_UNSET;
 	cs.iTimeRequery = TIME_REQUERY_DFLT;
 ENDbeginCnfLoad
@@ -1054,6 +1094,7 @@ finalize_it:
 	free(cs.pszBindRuleset);
 	free(cs.pszSchedPolicy);
 	free(cs.pszBindAddr);
+	free(cs.pszBindDevice);
 ENDendCnfLoad
 
 
@@ -1096,7 +1137,7 @@ BEGINactivateCnf
 CODESTARTactivateCnf
 	/* caching various settings */
 	iMaxLine = glbl.GetMaxLine();
-	lenRcvBuf = (iMaxLine + 1) * sizeof(char);
+	lenRcvBuf = iMaxLine + 1;
 #	ifdef HAVE_RECVMMSG
 	lenRcvBuf *= runModConf->batchSize;
 #	endif
@@ -1120,6 +1161,7 @@ CODESTARTfreeCnf
 	for(inst = pModConf->root ; inst != NULL ; ) {
 		free(inst->pszBindPort);
 		free(inst->pszBindAddr);
+		free(inst->pszBindDevice);
 		free(inst->inputname);
 		free(inst->dfltTZ);
 		del = inst;
@@ -1133,13 +1175,13 @@ static void *
 wrkr(void *myself)
 {
 	struct wrkrInfo_s *pWrkr = (struct wrkrInfo_s*) myself;
-#	if HAVE_PRCTL && defined PR_SET_NAME
+#	if defined(HAVE_PRCTL) && defined(PR_SET_NAME)
 	uchar *pszDbgHdr;
 #	endif
 	uchar thrdName[32];
 
 	snprintf((char*)thrdName, sizeof(thrdName), "imudp(w%d)", pWrkr->id);
-#	if HAVE_PRCTL && defined PR_SET_NAME
+#	if defined(HAVE_PRCTL) && defined(PR_SET_NAME)
 	/* set thread name - we ignore if the call fails, has no harsh consequences... */
 	if(prctl(PR_SET_NAME, thrdName, 0, 0, 0) != 0) {
 		DBGPRINTF("prctl failed, not setting thread name for '%s'\n", thrdName);
@@ -1277,6 +1319,8 @@ static rsRetVal resetConfigVariables(uchar __attribute__((unused)) *pp, void __a
 {
 	free(cs.pszBindAddr);
 	cs.pszBindAddr = NULL;
+	free(cs.pszBindDevice);
+	cs.pszBindDevice = NULL;
 	free(cs.pszSchedPolicy);
 	cs.pszSchedPolicy = NULL;
 	free(cs.pszBindRuleset);

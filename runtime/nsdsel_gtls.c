@@ -2,7 +2,7 @@
  *
  * An implementation of the nsd select() interface for GnuTLS.
  * 
- * Copyright (C) 2008-2012 Adiscon GmbH.
+ * Copyright (C) 2008-2016 Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
@@ -44,6 +44,17 @@ DEFobjStaticHelpers
 DEFobjCurrIf(errmsg)
 DEFobjCurrIf(glbl)
 DEFobjCurrIf(nsdsel_ptcp)
+
+static rsRetVal
+gtlsHasRcvInBuffer(nsd_gtls_t *pThis)
+{
+	/* we have a valid receive buffer one such is allocated and 
+	 * NOT exhausted!
+	 */
+	DBGPRINTF("hasRcvInBuffer on nsd %p: pszRcvBuf %p, lenRcvBuf %d\n", pThis,
+		pThis->pszRcvBuf, pThis->lenRcvBuf);
+	return(pThis->pszRcvBuf != NULL && pThis->lenRcvBuf != -1);
+	}
 
 
 /* Standard-Constructor
@@ -152,6 +163,7 @@ doRetry(nsd_gtls_t *pNsd)
 			pNsd->rtryCall = gtlsRtry_None; /* we are done */
 			gnuRet = 0;
 			break;
+		case gtlsRtry_None:
 		default:
 			assert(0); /* this shall not happen! */
 			dbgprintf("ERROR: pNsd->rtryCall invalid in nsdsel_gtls.c:%d\n", __LINE__);
@@ -163,7 +175,8 @@ doRetry(nsd_gtls_t *pNsd)
 		pNsd->rtryCall = gtlsRtry_None; /* we are done */
 	} else if(gnuRet != GNUTLS_E_AGAIN && gnuRet != GNUTLS_E_INTERRUPTED) {
 		uchar *pErr = gtlsStrerror(gnuRet);
-		errmsg.LogError(0, RS_RET_GNUTLS_ERR, "unexpected GnuTLS error %d in %s:%d: %s\n", gnuRet, __FILE__, __LINE__, pErr); \
+		errmsg.LogError(0, RS_RET_GNUTLS_ERR, "unexpected GnuTLS error %d in %s:%d: %s\n",
+		gnuRet, __FILE__, __LINE__, pErr); \
 		free(pErr);
 		pNsd->rtryCall = gtlsRtry_None; /* we are also done... ;) */
 		ABORT_FINALIZE(RS_RET_GNUTLS_ERR);
@@ -175,7 +188,6 @@ doRetry(nsd_gtls_t *pNsd)
 finalize_it:
 	if(iRet != RS_RET_OK && iRet != RS_RET_CLOSED && iRet != RS_RET_RETRY)
 		pNsd->bAbortConn = 1; /* request abort */
-dbgprintf("XXXXXX: doRetry: iRet %d, pNsd->bAbortConn %d\n", iRet, pNsd->bAbortConn);
 	RETiRet;
 }
 
@@ -198,7 +210,7 @@ IsReady(nsdsel_t *pNsdsel, nsd_t *pNsd, nsdsel_waitOp_t waitOp, int *pbIsReady)
 				   pThis, pThis->iBufferRcvReady);
 			FINALIZE;
 		}
-		if(pNsdGTLS->rtryCall != gtlsRtry_None) {
+		if(pNsdGTLS->rtryCall == gtlsRtry_handshake) {
 			CHKiRet(doRetry(pNsdGTLS));
 			/* we used this up for our own internal processing, so the socket
 			 * is not ready from the upper layer point of view.
@@ -206,6 +218,14 @@ IsReady(nsdsel_t *pNsdsel, nsd_t *pNsd, nsdsel_waitOp_t waitOp, int *pbIsReady)
 			*pbIsReady = 0;
 			FINALIZE;
 		}
+		else if(pNsdGTLS->rtryCall == gtlsRtry_recv) {
+			iRet = doRetry(pNsdGTLS);
+			if(iRet == RS_RET_OK) {
+				*pbIsReady = 0;
+				FINALIZE;
+			}
+		}
+
 		/* now we must ensure that we do not fall back to PTCP if we have
 		 * done a "dummy" select. In that case, we know when the predicate
 		 * is not matched here, we do not have data available for this

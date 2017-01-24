@@ -22,7 +22,7 @@
  * machine to a separate module which then is called via the DoCharRcvd() interface
  * of this class here. -- rgerhards, 2009-06-01
  *
- * Copyright 2007-2012 Adiscon GmbH.
+ * Copyright 2007-2016 Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
@@ -72,6 +72,10 @@
 #include "errmsg.h"
 #include "prop.h"
 #include "unicode-helper.h"
+
+#if !defined(_AIX)
+#pragma GCC diagnostic ignored "-Wswitch-enum"
+#endif 
 
 MODULE_TYPE_LIB
 MODULE_TYPE_NOKEEP
@@ -157,7 +161,7 @@ onErrClose(strms_sess_t *pSess)
 /* add new listener port to listener port list
  * rgerhards, 2009-05-21
  */
-static inline rsRetVal
+static rsRetVal
 addNewLstnPort(strmsrv_t *pThis, uchar *pszPort)
 {
 	strmLstnPortList_t *pEntry;
@@ -169,7 +173,11 @@ addNewLstnPort(strmsrv_t *pThis, uchar *pszPort)
 	CHKmalloc(pEntry = MALLOC(sizeof(strmLstnPortList_t)));
 	pEntry->pszPort = pszPort;
 	pEntry->pSrv = pThis;
-	CHKmalloc(pEntry->pszInputName = ustrdup(pThis->pszInputName));
+	if((pEntry->pszInputName = ustrdup(pThis->pszInputName)) == NULL) {
+		DBGPRINTF("strmsrv/addNewLstnPort: OOM in strdup()\n");
+		free(pEntry);
+		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+	}
 
 	/* and add to list */
 	pEntry->pNext = pThis->pLstnPorts;
@@ -352,7 +360,7 @@ finalize_it:
 /* Initialize STRM listener socket for a single port
  * rgerhards, 2009-05-21
  */
-static inline rsRetVal
+static rsRetVal
 initSTRMListener(strmsrv_t *pThis, strmLstnPortList_t *pPortEntry)
 {
 	DEFiRet;
@@ -513,7 +521,9 @@ RunCancelCleanup(void *arg)
 
 
 /* This function is called to gather input. */
+#if !defined(_AIX)
 #pragma GCC diagnostic ignored "-Wempty-body"
+#endif
 static rsRetVal
 Run(strmsrv_t *pThis)
 {
@@ -623,7 +633,9 @@ finalize_it: /* this is a very special case - this time only we do not exit the 
 
 	RETiRet;
 }
+#if !defined(_AIX)
 #pragma GCC diagnostic warning "-Wempty-body"
+#endif
 
 
 /* Standard-Constructor */

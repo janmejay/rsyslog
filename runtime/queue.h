@@ -52,7 +52,7 @@ typedef enum {
 /* list member definition for linked list types of queues: */
 typedef struct qLinkedList_S {
 	struct qLinkedList_S *pNext;
-	msg_t *pMsg;
+	smsg_t *pMsg;
 } qLinkedList_t;
 
 
@@ -111,8 +111,8 @@ struct queue_s {
 	/* type-specific handlers (set during construction) */
 	rsRetVal (*qConstruct)(struct queue_s *pThis);
 	rsRetVal (*qDestruct)(struct queue_s *pThis);
-	rsRetVal (*qAdd)(struct queue_s *pThis, msg_t *pMsg);
-	rsRetVal (*qDeq)(struct queue_s *pThis, msg_t **ppMsg);
+	rsRetVal (*qAdd)(struct queue_s *pThis, smsg_t *pMsg);
+	rsRetVal (*qDeq)(struct queue_s *pThis, smsg_t **ppMsg);
 	rsRetVal (*qDel)(struct queue_s *pThis);
 	/* end type-specific handler */
 	/* public entry points (set during construction, permit to set best algorithm for params selected) */
@@ -166,6 +166,7 @@ struct queue_s {
 			strm_t *pWrite;   /* current file to be written */
 			strm_t *pReadDeq; /* current file for dequeueing */
 			strm_t *pReadDel; /* current file for deleting */
+			int nForcePersist;/* force persist of .qi file the next "n" times */
 		} disk;
 	} tVars;
 	sbool	useCryprov;	/* quicker than checkig ptr (1 vs 8 bytes!) */
@@ -182,6 +183,7 @@ struct queue_s {
 	STATSCOUNTER_DEF(ctrFDscrd, mutCtrFDscrd)
 	STATSCOUNTER_DEF(ctrNFDscrd, mutCtrNFDscrd)
 	int ctrMaxqsize; /* NOT guarded by a mutex */
+	int iSmpInterval; /* line interval of sampling logs */
 };
 
 
@@ -194,7 +196,7 @@ struct queue_s {
 
 /* prototypes */
 rsRetVal qqueueDestruct(qqueue_t **ppThis);
-rsRetVal qqueueEnqMsg(qqueue_t *pThis, flowControl_t flwCtlType, msg_t *pMsg);
+rsRetVal qqueueEnqMsg(qqueue_t *pThis, flowControl_t flwCtlType, smsg_t *pMsg);
 rsRetVal qqueueStart(qqueue_t *pThis);
 rsRetVal qqueueSetMaxFileSize(qqueue_t *pThis, size_t iMaxFileSize);
 rsRetVal qqueueSetFilePrefix(qqueue_t *pThis, uchar *pszPrefix, size_t iLenPrefix);

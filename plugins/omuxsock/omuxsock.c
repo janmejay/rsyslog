@@ -4,7 +4,7 @@
  * NOTE: read comments in module-template.h to understand how this file
  *       works!
  *
- * Copyright 2010-2015 Adiscon GmbH.
+ * Copyright 2010-2016 Adiscon GmbH.
  *
  * This file is part of rsyslog.
  *
@@ -109,7 +109,7 @@ static rsRetVal doTryResume(instanceData *pData);
 /* this function gets the default template. It coordinates action between
  * old-style and new-style configuration parts.
  */
-static inline uchar*
+static uchar*
 getDfltTpl(void)
 {
 	if(loadModConf != NULL && loadModConf->tplName != NULL)
@@ -126,7 +126,7 @@ getDfltTpl(void)
  * is we do not permit this directive after the v2 config system has been used to set
  * the parameter.
  */
-rsRetVal
+static rsRetVal
 setLegacyDfltTpl(void __attribute__((unused)) *pVal, uchar* newVal)
 {
 	DEFiRet;
@@ -144,7 +144,7 @@ finalize_it:
 }
 
 
-static inline rsRetVal
+static rsRetVal
 closeSocket(instanceData *pData)
 {
 	DEFiRet;
@@ -278,7 +278,7 @@ static rsRetVal sendMsg(instanceData *pData, char *msg, size_t len)
 		 * call fails. Then, lsent has the error status, even though
 		 * the sendto() succeeded. -- rgerhards, 2007-06-22
 		 */
-		lenSent = sendto(pData->sock, msg, len, 0, &pData->addr, sizeof(pData->addr));
+		lenSent = sendto(pData->sock, msg, len, 0, (const struct sockaddr *)&pData->addr, sizeof(pData->addr));
 		if(lenSent == len) {
 			int eno = errno;
 			char errStr[1024];
@@ -294,7 +294,7 @@ finalize_it:
 
 /* open socket to remote system
  */
-static inline rsRetVal
+static rsRetVal
 openSocket(instanceData *pData)
 {
 	DEFiRet;
@@ -404,7 +404,7 @@ ENDparseSelectorAct
 /* a common function to free our configuration variables - used both on exit
  * and on $ResetConfig processing. -- rgerhards, 2008-05-16
  */
-static inline void
+static void
 freeConfigVars(void)
 {
 	free(cs.tplName);
@@ -453,7 +453,8 @@ CODEmodInit_QueryRegCFSLineHdlr
 
 	CHKiRet(regCfSysLineHdlr((uchar *)"omuxsockdefaulttemplate", 0, eCmdHdlrGetWord, setLegacyDfltTpl, NULL, NULL));
 	CHKiRet(regCfSysLineHdlr((uchar *)"omuxsocksocket", 0, eCmdHdlrGetWord, NULL, &cs.sockName, NULL));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler, resetConfigVariables, NULL, STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler, resetConfigVariables,
+	NULL, STD_LOADABLE_MODULE_ID));
 ENDmodInit
 
 /* vim:set ai:

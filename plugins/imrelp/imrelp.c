@@ -4,7 +4,7 @@
  *
  * File begun on 2008-03-13 by RGerhards
  *
- * Copyright 2008-2015 Adiscon GmbH.
+ * Copyright 2008-2016 Adiscon GmbH.
  *
  * This file is part of rsyslog.
  *
@@ -201,7 +201,7 @@ static relpRetVal
 onSyslogRcv(void *pUsr, uchar *pHostname, uchar *pIP, uchar *msg, size_t lenMsg)
 {
 	prop_t *pProp = NULL;
-	msg_t *pMsg;
+	smsg_t *pMsg;
 	instanceConf_t *inst = (instanceConf_t*) pUsr;
 	DEFiRet;
 
@@ -228,7 +228,7 @@ finalize_it:
 
 /* ------------------------------ end callbacks ------------------------------ */
 
-/* create input instance, set default paramters, and
+/* create input instance, set default parameters, and
  * add it to the list of instances.
  */
 static rsRetVal
@@ -323,7 +323,7 @@ addListner(modConfData_t __attribute__((unused)) *modConf, instanceConf_t *inst)
 	DEFiRet;
 	if(pRelpEngine == NULL) {
 		CHKiRet(relpEngineConstruct(&pRelpEngine));
-		CHKiRet(relpEngineSetDbgprint(pRelpEngine, dbgprintf));
+		CHKiRet(relpEngineSetDbgprint(pRelpEngine, (void (*)(char *, ...))dbgprintf));
 		CHKiRet(relpEngineSetFamily(pRelpEngine, glbl.GetDefPFFamily()));
 		CHKiRet(relpEngineSetEnableCmd(pRelpEngine, (uchar*) "syslog", eRelpCmdState_Required));
 		CHKiRet(relpEngineSetSyslogRcv2(pRelpEngine, onSyslogRcv));
@@ -399,9 +399,25 @@ addListner(modConfData_t __attribute__((unused)) *modConf, instanceConf_t *inst)
 		}
 	}
 	relpRet = relpEngineListnerConstructFinalize(pRelpEngine, pSrv);
-	if(relpRet != RELP_RET_OK) {
+	/* re-check error TLS error codes. librelp seems to emit them only
+	 * after finalize in some cases...
+	 */
+	if(relpRet == RELP_RET_ERR_NO_TLS) {
+		errmsg.LogError(0, RS_RET_RELP_NO_TLS,
+				"imrelp: could not activate relp TLS listener, librelp "
+				"does not support it (most probably GnuTLS lib "
+				"is too old)!");
+		ABORT_FINALIZE(RS_RET_RELP_NO_TLS);
+	} else if(relpRet == RELP_RET_ERR_NO_TLS_AUTH) {
+		errmsg.LogError(0, RS_RET_RELP_NO_TLS_AUTH,
+				"imrelp: could not activate relp TLS listener with "
+				"authentication, librelp does not support it "
+				"(most probably GnuTLS lib is too old)! "
+				"Note: anonymous TLS is probably supported.");
+		ABORT_FINALIZE(RS_RET_RELP_NO_TLS_AUTH);
+	} else if(relpRet != RELP_RET_OK) {
 		errmsg.LogError(0, RS_RET_RELP_ERR,
-				"imrelp: could not activate relp listner, code %d", relpRet);
+				"imrelp: could not activate relp listener, code %d", relpRet);
 		ABORT_FINALIZE(RS_RET_RELP_ERR);
 	}
 
@@ -589,6 +605,7 @@ CODESTARTfreeCnf
 		free(inst->pszInputName);
 		free(inst->pristring);
 		free(inst->authmode);
+		prop.Destruct(&inst->pInputName);
 		statsobj.Destruct(&(inst->data.stats));
 		for(i = 0 ; i <  inst->permittedPeers.nmemb ; ++i) {
 			free(inst->permittedPeers.name[i]);

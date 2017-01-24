@@ -6,7 +6,7 @@
  *
  * File begun on 2009-11-04 by RGerhards
  *
- * Copyright 2007-2014 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2007-2015 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of rsyslog.
  *
@@ -42,10 +42,12 @@
 #include "parser.h"
 #include "datetime.h"
 #include "unicode-helper.h"
-
+#ifdef _AIX
+#endif
 MODULE_TYPE_PARSER
 MODULE_TYPE_NOKEEP
 PARSER_NAME("rsyslog.rfc3164")
+MODULE_CNFNAME("pmrfc3164")
 
 /* internal structures
  */
@@ -60,6 +62,25 @@ DEFobjCurrIf(datetime)
 static int bParseHOSTNAMEandTAG;	/* cache for the equally-named global param - performance enhancement */
 
 
+/* parser instance parameters */
+static struct cnfparamdescr parserpdescr[] = {
+	{ "detect.yearaftertimestamp", eCmdHdlrBinary, 0 },
+	{ "permit.squarebracketsinhostname", eCmdHdlrBinary, 0 },
+	{ "permit.slashesinhostname", eCmdHdlrBinary, 0 }
+};
+static struct cnfparamblk parserpblk =
+	{ CNFPARAMBLK_VERSION,
+	  sizeof(parserpdescr)/sizeof(struct cnfparamdescr),
+	  parserpdescr
+	};
+
+struct instanceConf_s {
+	int bDetectYearAfterTimestamp;
+	int bPermitSquareBracketsInHostname;
+	int bPermitSlashesInHostname;
+};
+
+
 BEGINisCompatibleWithFeature
 CODESTARTisCompatibleWithFeature
 	if(eFeat == sFEATUREAutomaticSanitazion)
@@ -69,9 +90,77 @@ CODESTARTisCompatibleWithFeature
 ENDisCompatibleWithFeature
 
 
+/* create input instance, set default parameters, and
+ * add it to the list of instances.
+ */
+static rsRetVal
+createInstance(instanceConf_t **pinst)
+{
+	instanceConf_t *inst;
+	DEFiRet;
+	CHKmalloc(inst = MALLOC(sizeof(instanceConf_t)));
+	inst->bDetectYearAfterTimestamp = 0;
+	inst->bPermitSquareBracketsInHostname = 0;
+	inst->bPermitSlashesInHostname = 0;
+	bParseHOSTNAMEandTAG=glbl.GetParseHOSTNAMEandTAG();
+	*pinst = inst;
+finalize_it:
+	RETiRet;
+}
+
+BEGINnewParserInst
+	struct cnfparamvals *pvals = NULL;
+	int i;
+CODESTARTnewParserInst
+	DBGPRINTF("newParserInst (pmrfc3164)\n");
+
+	inst = NULL;
+	CHKiRet(createInstance(&inst));
+
+	if(lst == NULL)
+		FINALIZE;  /* just set defaults, no param block! */
+
+	if((pvals = nvlstGetParams(lst, &parserpblk, NULL)) == NULL) {
+		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+	}
+
+	if(Debug) {
+		dbgprintf("parser param blk in pmrfc3164:\n");
+		cnfparamsPrint(&parserpblk, pvals);
+	}
+
+	for(i = 0 ; i < parserpblk.nParams ; ++i) {
+		if(!pvals[i].bUsed)
+			continue;
+		if(!strcmp(parserpblk.descr[i].name, "detect.yearaftertimestamp")) {
+			inst->bDetectYearAfterTimestamp = (int) pvals[i].val.d.n;
+		} else if(!strcmp(parserpblk.descr[i].name, "permit.squarebracketsinhostname")) {
+			inst->bPermitSquareBracketsInHostname = (int) pvals[i].val.d.n;
+		} else if(!strcmp(parserpblk.descr[i].name, "permit.slashesinhostname")) {
+			inst->bPermitSlashesInHostname = (int) pvals[i].val.d.n;
+		} else {
+			dbgprintf("pmrfc3164: program error, non-handled "
+			  "param '%s'\n", parserpblk.descr[i].name);
+		}
+	}
+finalize_it:
+CODE_STD_FINALIZERnewParserInst
+	if(lst != NULL)
+		cnfparamvalsDestruct(pvals, &parserpblk);
+	if(iRet != RS_RET_OK)
+		free(inst);
+ENDnewParserInst
+
+
+BEGINfreeParserInst
+CODESTARTfreeParserInst
+	dbgprintf("pmrfc3164: free parser instance %p\n", pInst);
+ENDfreeParserInst
+
+
 /* parse a legay-formatted syslog message.
  */
-BEGINparse
+BEGINparse2
 	uchar *p2parse;
 	int lenMsg;
 	int i;	/* general index for parsing */
@@ -81,7 +170,8 @@ CODESTARTparse
 	DBGPRINTF("Message will now be parsed by the legacy syslog parser (one size fits all... ;)).\n");
 	assert(pMsg != NULL);
 	assert(pMsg->pszRawMsg != NULL);
-	lenMsg = pMsg->iLenRawMsg - pMsg->offAfterPRI; /* note: offAfterPRI is already the number of PRI chars (do not add one!) */
+	lenMsg = pMsg->iLenRawMsg - pMsg->offAfterPRI;
+	/* note: offAfterPRI is already the number of PRI chars (do not add one!) */
 	p2parse = pMsg->pszRawMsg + pMsg->offAfterPRI; /* point to start of text, after PRI */
 	setProtocolVersion(pMsg, MSG_LEGACY_PROTOCOL);
 	if(pMsg->iFacility == (LOG_INVLD>>3))
@@ -96,14 +186,17 @@ CODESTARTparse
 	 */
 	if(datetime.ParseTIMESTAMP3339(&(pMsg->tTIMESTAMP), &p2parse, &lenMsg) == RS_RET_OK) {
 		/* we are done - parse pointer is moved by ParseTIMESTAMP3339 */;
-	} else if(datetime.ParseTIMESTAMP3164(&(pMsg->tTIMESTAMP), &p2parse, &lenMsg, NO_PARSE3164_TZSTRING) == RS_RET_OK) {
+	} else if(datetime.ParseTIMESTAMP3164(&(pMsg->tTIMESTAMP), &p2parse, &lenMsg, NO_PARSE3164_TZSTRING,
+	pInst->bDetectYearAfterTimestamp) == RS_RET_OK) {
 		if(pMsg->dfltTZ[0] != '\0')
 			applyDfltTZ(&pMsg->tTIMESTAMP, pMsg->dfltTZ);
 		/* we are done - parse pointer is moved by ParseTIMESTAMP3164 */;
-	} else if(*p2parse == ' ' && lenMsg > 1) { /* try to see if it is slighly malformed - HP procurve seems to do that sometimes */
+	} else if(*p2parse == ' ' && lenMsg > 1) {
+	/* try to see if it is slighly malformed - HP procurve seems to do that sometimes */
 		++p2parse;	/* move over space */
 		--lenMsg;
-		if(datetime.ParseTIMESTAMP3164(&(pMsg->tTIMESTAMP), &p2parse, &lenMsg, NO_PARSE3164_TZSTRING) == RS_RET_OK) {
+		if(datetime.ParseTIMESTAMP3164(&(pMsg->tTIMESTAMP), &p2parse, &lenMsg, NO_PARSE3164_TZSTRING,
+		pInst->bDetectYearAfterTimestamp) == RS_RET_OK) {
 			/* indeed, we got it! */
 			/* we are done - parse pointer is moved by ParseTIMESTAMP3164 */;
 		} else {/* parse pointer needs to be restored, as we moved it off-by-one
@@ -139,13 +232,31 @@ CODESTARTparse
 		 * the fields. I think this logic shall work with any type of syslog message.
 		 * rgerhards, 2009-06-23: and I now have extended this logic to every character
 		 * that is not a valid hostname.
+		 * A "hostname" can validly include "[]" at the beginning and end. This sometimes
+		 * happens with IP address (e.g. "[192.168.0.1]"). This must be turned on via
+		 * an option as it may interfere with non-hostnames in some message formats.
+		 * rgerhards, 2015-04-20
 		 */
 		if(lenMsg > 0 && pMsg->msgFlags & PARSE_HOSTNAME) {
 			i = 0;
-			while(i < lenMsg && (isalnum(p2parse[i]) || p2parse[i] == '.'
-				|| p2parse[i] == '_' || p2parse[i] == '-') && i < (CONF_HOSTNAME_MAXSIZE - 1)) {
+			int bHadSBracket = 0;
+			if(pInst->bPermitSquareBracketsInHostname) {
+				if(i < lenMsg && p2parse[i] == '[') {
+					bHadSBracket = 1;
+					bufParseHOSTNAME[0] = '[';
+					++i;
+				}
+			}
+			while(i < lenMsg
+			        && (isalnum(p2parse[i]) || p2parse[i] == '.'
+					|| p2parse[i] == '_' || p2parse[i] == '-'
+					|| (p2parse[i] == ']' && bHadSBracket)
+					|| (p2parse[i] == '/' && pInst->bPermitSlashesInHostname) )
+				&& i < (CONF_HOSTNAME_MAXSIZE - 1)) {
 				bufParseHOSTNAME[i] = p2parse[i];
 				++i;
+				if(p2parse[i] == ']')
+					break;	/* must be closing bracket */
 			}
 
 			if(i == lenMsg) {
@@ -156,12 +267,31 @@ CODESTARTparse
 				lenMsg -= i;
 				bufParseHOSTNAME[i] = '\0';
 				MsgSetHOSTNAME(pMsg, bufParseHOSTNAME, i);
-			} else if(i > 0 && p2parse[i] == ' ' && isalnum(p2parse[i-1])) {
-				/* we got a hostname! */
-				p2parse += i + 1; /* "eat" it (including SP delimiter) */
-				lenMsg -= i + 1;
-				bufParseHOSTNAME[i] = '\0';
-				MsgSetHOSTNAME(pMsg, bufParseHOSTNAME, i);
+			} else {
+				int isHostName = 0;
+				if(i > 0) {
+					if(bHadSBracket) {
+						if(p2parse[i] == ']') {
+							bufParseHOSTNAME[i] = ']';
+							++i;
+							isHostName = 1;
+						}
+					} else {
+						if(isalnum(p2parse[i-1])) {
+							isHostName = 1;
+						}
+					}
+					if(p2parse[i] != ' ')
+						isHostName = 0;
+				}
+
+				if(isHostName) {
+					/* we got a hostname! */
+					p2parse += i + 1; /* "eat" it (including SP delimiter) */
+					lenMsg -= i + 1;
+					bufParseHOSTNAME[i] = '\0';
+					MsgSetHOSTNAME(pMsg, bufParseHOSTNAME, i);
+				}
 			}
 		}
 
@@ -204,7 +334,7 @@ CODESTARTparse
 
 finalize_it:
 	MsgSetMSGoffs(pMsg, p2parse - pMsg->pszRawMsg);
-ENDparse
+ENDparse2
 
 
 BEGINmodExit
@@ -219,14 +349,15 @@ ENDmodExit
 
 BEGINqueryEtryPt
 CODESTARTqueryEtryPt
-CODEqueryEtryPt_STD_PMOD_QUERIES
+CODEqueryEtryPt_STD_PMOD2_QUERIES
 CODEqueryEtryPt_IsCompatibleWithFeature_IF_OMOD_QUERIES
 ENDqueryEtryPt
 
 
 BEGINmodInit(pmrfc3164)
 CODESTARTmodInit
-	*ipIFVersProvided = CURR_MOD_IF_VERSION; /* we only support the current interface specification */
+	*ipIFVersProvided = CURR_MOD_IF_VERSION;
+	/* we only support the current interface specification */
 CODEmodInit_QueryRegCFSLineHdlr
 	CHKiRet(objUse(glbl, CORE_COMPONENT));
 	CHKiRet(objUse(errmsg, CORE_COMPONENT));
@@ -234,7 +365,8 @@ CODEmodInit_QueryRegCFSLineHdlr
 	CHKiRet(objUse(datetime, CORE_COMPONENT));
 
 	DBGPRINTF("rfc3164 parser init called\n");
- 	bParseHOSTNAMEandTAG = glbl.GetParseHOSTNAMEandTAG(); /* cache value, is set only during rsyslogd option processing */
+ 	bParseHOSTNAMEandTAG = glbl.GetParseHOSTNAMEandTAG();
+	/* cache value, is set only during rsyslogd option processing */
 
 
 ENDmodInit

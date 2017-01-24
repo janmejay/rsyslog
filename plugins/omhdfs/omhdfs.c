@@ -156,7 +156,7 @@ finalize_it:
  * the instance data.
  */
 
-static inline rsRetVal
+static rsRetVal
 fileObjConstruct(file_t **ppFile)
 {
 	file_t *pFile;
@@ -173,7 +173,7 @@ finalize_it:
 	RETiRet;
 }
 
-static inline void
+static void
 fileObjAddUser(file_t *pFile)
 {
 	/* init mutex only when second user is added */
@@ -213,7 +213,7 @@ filePrepare(file_t *pFile)
 	/* file does not exist, create it (and eventually parent directories */
 	if(1) { // check if bCreateDirs
 		len = ustrlen(pFile->name) + 1;
-		CHKmalloc(pszWork = MALLOC(sizeof(uchar) * len));
+		CHKmalloc(pszWork = MALLOC(len));
 		memcpy(pszWork, pFile->name, len);
 		for(p = pszWork+1 ; *p ; p++)
 			if(*p == '/') {
@@ -244,7 +244,7 @@ fileObjDestruct4Hashtable(void *ptr)
 }
 
 
-static inline rsRetVal
+static rsRetVal
 fileOpen(file_t *pFile)
 {
 	DEFiRet;
@@ -291,7 +291,7 @@ finalize_it:
 
 
 /* Note: lenWrite is reset to zero on successful write! */
-static inline rsRetVal
+static rsRetVal
 fileWrite(file_t *pFile, uchar *buf, size_t *lenWrite)
 {
 	DEFiRet;
@@ -312,7 +312,6 @@ fileWrite(file_t *pFile, uchar *buf, size_t *lenWrite)
 		}
 	}
 
-dbgprintf("XXXXX: omhdfs writing %u bytes\n", *lenWrite);
 	tSize num_written_bytes = hdfsWrite(pFile->fs, pFile->fh, buf, *lenWrite);
 	if((unsigned) num_written_bytes != *lenWrite) {
 		errmsg.LogError(errno, RS_RET_ERR_HDFS_WRITE,
@@ -328,7 +327,7 @@ finalize_it:
 }
 
 
-static inline rsRetVal
+static rsRetVal
 fileClose(file_t *pFile)
 {
 	DEFiRet;
@@ -359,7 +358,7 @@ finalize_it:
  * buffer. In that case, the new data will written with its own
  * write operation.
  */
-static inline rsRetVal
+static rsRetVal
 addData(instanceData *pData, uchar *buf)
 {
 	unsigned len;
@@ -371,7 +370,6 @@ addData(instanceData *pData, uchar *buf)
 		memcpy((char*) pData->ioBuf + pData->offsBuf, buf, len);
 		pData->offsBuf += len;
 	} else {
-dbgprintf("XXXXX: not enough room, need to flush\n");
 		CHKiRet(fileWrite(pData->pFile, pData->ioBuf, &pData->offsBuf));
 		if(len >= sizeof(pData->ioBuf)) {
 			CHKiRet(fileWrite(pData->pFile, buf, &len));
@@ -426,7 +424,7 @@ ENDtryResume
 
 BEGINbeginTransaction
 CODESTARTbeginTransaction
-dbgprintf("omhdfs: beginTransaction\n");
+	DBGPRINTF("omhdfs: beginTransaction\n");
 ENDbeginTransaction
 
 
@@ -444,7 +442,7 @@ ENDdoAction
 BEGINendTransaction
 	instanceData *pData = pWrkrData->pData;
 CODESTARTendTransaction
-dbgprintf("omhdfs: endTransaction\n");
+	DBGPRINTF("omhdfs: endTransaction\n");
 	pthread_mutex_lock(&mutDoAct);
 	if(pData->offsBuf != 0) {
 		DBGPRINTF("omhdfs: data unwritten at end of transaction, persisting...\n");
@@ -568,7 +566,8 @@ CODEmodInit_QueryRegCFSLineHdlr
 	CHKiRet(regCfSysLineHdlr((uchar *)"omhdfshost", 0, eCmdHdlrGetWord, NULL, &cs.hdfsHost, NULL));
 	CHKiRet(regCfSysLineHdlr((uchar *)"omhdfsport", 0, eCmdHdlrInt, NULL, &cs.hdfsPort, NULL));
 	CHKiRet(regCfSysLineHdlr((uchar *)"omhdfsdefaulttemplate", 0, eCmdHdlrGetWord, NULL, &cs.dfltTplName, NULL));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler, resetConfigVariables, NULL, STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler, resetConfigVariables,
+	NULL, STD_LOADABLE_MODULE_ID));
 	DBGPRINTF("omhdfs: module compiled with rsyslog version %s.\n", VERSION);
 CODEmodInit_QueryRegCFSLineHdlr
 ENDmodInit

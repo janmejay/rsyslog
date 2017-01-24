@@ -1,7 +1,7 @@
 /* This is the template processing code of rsyslog.
  * begun 2004-11-17 rgerhards
  *
- * Copyright 2004-2014 Rainer Gerhards and Adiscon
+ * Copyright 2004-2016 Rainer Gerhards and Adiscon
  *
  * This file is part of rsyslog.
  *
@@ -48,6 +48,9 @@
 #include "parserif.h"
 #include "unicode-helper.h"
 
+#if !defined(_AIX)
+#pragma GCC diagnostic ignored "-Wswitch-enum"
+#endif
 /* static data */
 DEFobjCurrIf(obj)
 DEFobjCurrIf(errmsg)
@@ -62,7 +65,8 @@ static struct cnfparamdescr cnfparamdescr[] = {
 	{ "subtree", eCmdHdlrString, 0 },
 	{ "option.stdsql", eCmdHdlrBinary, 0 },
 	{ "option.sql", eCmdHdlrBinary, 0 },
-	{ "option.json", eCmdHdlrBinary, 0 }
+	{ "option.json", eCmdHdlrBinary, 0 },
+	{ "option.casesensitive", eCmdHdlrBinary, 0 }
 };
 static struct cnfparamblk pblk =
 	{ CNFPARAMBLK_VERSION,
@@ -74,6 +78,8 @@ static struct cnfparamdescr cnfparamdescrProperty[] = {
 	{ "name", eCmdHdlrString, 1 },
 	{ "outname", eCmdHdlrString, 0 },
 	{ "dateformat", eCmdHdlrString, 0 },
+	{ "date.inutc", eCmdHdlrBinary, 0 },
+	{ "compressspace", eCmdHdlrBinary, 0 },
 	{ "caseconversion", eCmdHdlrString, 0 },
 	{ "controlcharacters", eCmdHdlrString, 0 },
 	{ "securepath", eCmdHdlrString, 0 },
@@ -89,6 +95,7 @@ static struct cnfparamdescr cnfparamdescrProperty[] = {
 	{ "regex.match", eCmdHdlrInt, 0 },
 	{ "regex.submatch", eCmdHdlrInt, 0 },
 	{ "droplastlf", eCmdHdlrBinary, 0 },
+	{ "fixedwidth", eCmdHdlrBinary, 0 },
 	{ "mandatory", eCmdHdlrBinary, 0 },
 	{ "spifno1stsp", eCmdHdlrBinary, 0 }
 };
@@ -145,7 +152,7 @@ finalize_it:
  */
 rsRetVal
 tplToString(struct template *__restrict__ const pTpl,
-	    msg_t *__restrict__ const pMsg,
+	    smsg_t *__restrict__ const pMsg,
 	    actWrkrIParams_t *__restrict const iparam,
 	    struct syslogTime *const ttNow)
 {
@@ -205,6 +212,11 @@ tplToString(struct template *__restrict__ const pTpl,
 				doEscape(&pVal, &iLenVal, &bMustBeFreed, JSON_ESCAPE);
 			else if(pTpl->optFormatEscape == STDSQL_ESCAPE)
 				doEscape(&pVal, &iLenVal, &bMustBeFreed, STDSQL_ESCAPE);
+		} else {
+			DBGPRINTF("TplToString: invalid entry type %d\n", pTpe->eEntryType);
+			pVal = (uchar*) "*LOGIC ERROR*";
+			iLenVal = sizeof("*LOGIC ERROR*") - 1;
+			bMustBeFreed = 0;
 		}
 		/* got source, now copy over */
 		if(iLenVal > 0) { /* may be zero depending on property */
@@ -248,7 +260,7 @@ finalize_it:
  * rgerhards, 2009-04-03
  */
 rsRetVal
-tplToArray(struct template *pTpl, msg_t *pMsg, uchar*** ppArr, struct syslogTime *ttNow)
+tplToArray(struct template *pTpl, smsg_t *pMsg, uchar*** ppArr, struct syslogTime *ttNow)
 {
 	DEFiRet;
 	struct templateEntry *pTpe;
@@ -302,6 +314,12 @@ tplToArray(struct template *pTpl, msg_t *pMsg, uchar*** ppArr, struct syslogTime
 
 finalize_it:
 	*ppArr = (iRet == RS_RET_OK) ? pArr : NULL;
+	if(iRet == RS_RET_OK) {
+		*ppArr = pArr;
+	} else {
+		*ppArr = NULL;
+		free(pArr);
+	}
 
 	RETiRet;
 }
@@ -313,7 +331,7 @@ finalize_it:
  * rgerhards, 2012-08-29
  */
 rsRetVal
-tplToJSON(struct template *pTpl, msg_t *pMsg, struct json_object **pjson, struct syslogTime *ttNow)
+tplToJSON(struct template *pTpl, smsg_t *pMsg, struct json_object **pjson, struct syslogTime *ttNow)
 {
 	struct templateEntry *pTpe;
 	rs_size_t propLen;
@@ -324,7 +342,8 @@ tplToJSON(struct template *pTpl, msg_t *pMsg, struct json_object **pjson, struct
 	DEFiRet;
 
 	if(pTpl->bHaveSubtree){
-		localRet = jsonFind(pMsg->json, &pTpl->subtree, pjson);
+		if(jsonFind(pMsg->json, &pTpl->subtree, pjson) != RS_RET_OK)
+			*pjson = NULL;
 		if(*pjson == NULL) {
 			/* we need to have a root object! */
 			*pjson = json_object_new_object();
@@ -393,12 +412,17 @@ finalize_it:
 static void doEmergencyEscape(register uchar *p, int mode)
 {
 	while(*p) {
-		if((mode == SQL_ESCAPE||mode == STDSQL_ESCAPE) && *p == '\'')
+		if((mode == SQL_ESCAPE||mode == STDSQL_ESCAPE) && *p == '\'') {
 			*p = '"';
-		else if((mode == JSON_ESCAPE) && *p == '"')
-			*p = '\'';
-		else if((mode == SQL_ESCAPE) && *p == '\\')
+		} else if(mode == JSON_ESCAPE) {
+			if(*p == '"') {
+				*p = '\'';
+			} else if(*p == '\\' ) {
+				*p = '/';
+			}
+		} else if((mode == SQL_ESCAPE) && *p == '\\') {
 			*p = '/';
+		}
 		++p;
 	}
 }
@@ -449,7 +473,7 @@ doEscape(uchar **pp, rs_size_t *pLen, unsigned short *pbMustBeFreed, int mode)
 		for(p = *pp ; *p && *p != '\'' && *p != '\\' ; ++p)
 			;
 	else if(mode == JSON_ESCAPE)
-		for(p = *pp ; *p && *p != '"' ; ++p)
+		for(p = *pp ; *p &&  (*p == '"' || *p == '\\' ) ; ++p)
 			;
 	/* when we get out of the loop, we are either at the
 	 * string terminator or the first character to escape */
@@ -467,14 +491,14 @@ doEscape(uchar **pp, rs_size_t *pLen, unsigned short *pbMustBeFreed, int mode)
 		} else if((mode == SQL_ESCAPE) && *p == '\\') {
 			CHKiRet(cstrAppendChar(pStrB, '\\'));
 			iLen++;	/* reflect the extra character */
-		} else if((mode == JSON_ESCAPE) && *p == '"') {
+		} else if((mode == JSON_ESCAPE) &&  (*p == '"' || *p == '\\' )) {
 			CHKiRet(cstrAppendChar(pStrB, '\\'));
 			iLen++;	/* reflect the extra character */
 		}
 		CHKiRet(cstrAppendChar(pStrB, *p));
 		++p;
 	}
-	CHKiRet(cstrFinalize(pStrB));
+	cstrFinalize(pStrB);
 	CHKiRet(cstrConvSzStrAndDestruct(&pStrB, &pszGenerated, 0));
 
 	if(*pbMustBeFreed)
@@ -499,7 +523,7 @@ finalize_it:
  * or NULL (if it fails). Pointer to associated template list entry 
  * must be provided.
  */
-struct templateEntry* tpeConstruct(struct template *pTpl)
+static struct templateEntry* tpeConstruct(struct template *pTpl)
 {
 	struct templateEntry *pTpe;
 
@@ -521,6 +545,31 @@ struct templateEntry* tpeConstruct(struct template *pTpl)
 	pTpl->tpenElements++;
 
 	return(pTpe);
+}
+
+
+/* Helper function to apply case-sensitivity to templates.
+ */
+static void
+apply_case_sensitivity(struct template *pTpl)
+{
+	if(pTpl->optCaseSensitive) return;
+
+	struct templateEntry *pTpe;
+
+	for(pTpe = pTpl->pEntryRoot ; pTpe != NULL ; pTpe = pTpe->pNext) {
+		if(pTpe->eEntryType == FIELD) {
+			if(pTpe->data.field.msgProp.id == PROP_CEE        ||
+			   pTpe->data.field.msgProp.id == PROP_LOCAL_VAR  ||
+			   pTpe->data.field.msgProp.id == PROP_GLOBAL_VAR   ) {
+				uchar* p;
+				p = pTpe->fieldName;
+				for ( ; *p; ++p) *p = tolower(*p);
+				p = pTpe->data.field.msgProp.name;
+				for ( ; *p; ++p) *p = tolower(*p);
+			}
+		}
+	}
 }
 
 
@@ -675,7 +724,7 @@ static void doOptions(unsigned char **pp, struct templateEntry *pTpe)
 	while(*p && *p != '%' && *p != ':') {
 		/* outer loop - until end of options */
 		i = 0;
-		while((i < sizeof(Buf) / sizeof(char)) &&
+		while((i < sizeof(Buf)-1) &&
 		      *p && *p != '%' && *p != ':' && *p != ',') {
 			/* inner loop - until end of ONE option */
 			Buf[i++] = tolower((int)*p);
@@ -730,12 +779,16 @@ static void doOptions(unsigned char **pp, struct templateEntry *pTpe)
 			pTpe->data.field.eDateFormat = tplFmtOrdinal;
 		 } else if (!strcmp((char*)Buf, "date-week")) {
 			pTpe->data.field.eDateFormat = tplFmtWeek;
+		 } else if(!strcmp((char*)Buf, "date-utc")) {
+			pTpe->data.field.options.bDateInUTC = 1;
 		 } else if(!strcmp((char*)Buf, "lowercase")) {
 			pTpe->data.field.eCaseConv = tplCaseConvLower;
 		 } else if(!strcmp((char*)Buf, "uppercase")) {
 			pTpe->data.field.eCaseConv = tplCaseConvUpper;
 		 } else if(!strcmp((char*)Buf, "sp-if-no-1st-sp")) {
 			pTpe->data.field.options.bSPIffNo1stSP = 1;
+		 } else if(!strcmp((char*)Buf, "compressspace")) {
+			pTpe->data.field.options.bCompressSP = 1;
 		 } else if(!strcmp((char*)Buf, "escape-cc")) {
 			pTpe->data.field.options.bEscapeCC = 1;
 		 } else if(!strcmp((char*)Buf, "drop-cc")) {
@@ -750,6 +803,8 @@ static void doOptions(unsigned char **pp, struct templateEntry *pTpe)
 			pTpe->data.field.options.bSecPathReplace = 1;
 		 } else if(!strcmp((char*)Buf, "pos-end-relative")) {
 			pTpe->data.field.options.bFromPosEndRelative = 1;
+		 } else if(!strcmp((char*)Buf, "fixed-width")) {
+			pTpe->data.field.options.bFixedWidth = 1;
 		 } else if(!strcmp((char*)Buf, "csv")) {
 			if(hasFormat(pTpe)) {
 				errmsg.LogError(0, NO_ERRCODE, "error: can only specify "
@@ -826,8 +881,8 @@ do_Parameter(uchar **pp, struct template *pTpl)
 	pTpe->eEntryType = FIELD;
 
 	while(*p && *p != '%' && *p != ':') {
-		cstrAppendChar(pStrProp, tolower(*p));
-		++p; /* do NOT do this in tolower()! */
+		cstrAppendChar(pStrProp, *p);
+		++p;
 	}
 
 	/* got the name */
@@ -948,7 +1003,8 @@ do_Parameter(uchar **pp, struct template *pTpl)
 					pTpe->data.field.has_fields = 1;
 					if(!isdigit((int)*p)) {
 						/* complain and use default */
-						errmsg.LogError(0, NO_ERRCODE, "error: invalid character in frompos after \"F,\", property: '%%%s' - using 9 (HT) as field delimiter",
+						errmsg.LogError(0, NO_ERRCODE, "error: invalid character in "
+"frompos after \"F,\", property: '%%%s' - using 9 (HT) as field delimiter",
 						    (char*) *pp);
 						pTpe->data.field.field_delim = 9;
 					} else {
@@ -956,7 +1012,8 @@ do_Parameter(uchar **pp, struct template *pTpl)
 						while(isdigit((int)*p))
 							iNum = iNum * 10 + *p++ - '0';
 						if(iNum < 0 || iNum > 255) {
-							errmsg.LogError(0, NO_ERRCODE, "error: non-USASCII delimiter character value %d in template - using 9 (HT) as substitute", iNum);
+							errmsg.LogError(0, NO_ERRCODE, "error: non-USASCII delimiter "
+"character value %d in template - using 9 (HT) as substitute", iNum);
 							pTpe->data.field.field_delim = 9;
 						} else {
 							pTpe->data.field.field_delim = iNum;
@@ -1135,6 +1192,7 @@ do_Parameter(uchar **pp, struct template *pTpl)
 
 	/* save field name - if none was given, use the property name instead */
 	if(pStrField == NULL) {
+		/* FIXME Global Var?   AND   Lower case? */
 		if(pTpe->data.field.msgProp.id == PROP_CEE || pTpe->data.field.msgProp.id == PROP_LOCAL_VAR) {
 			/* in CEE case, we remove "$!"/"$." from the fieldname - it's just our indicator */
 			pTpe->fieldName = ustrdup(cstrGetSzStrNoNULL(pStrProp)+2);
@@ -1212,12 +1270,11 @@ finalize_it:
 /* Add a new template line
  * returns pointer to new object if it succeeds, NULL otherwise.
  */
-struct template *tplAddLine(rsconf_t *conf, char* pName, uchar** ppRestOfConfLine)
+struct template *tplAddLine(rsconf_t *conf, const char* pName, uchar** ppRestOfConfLine)
 {
 	struct template *pTpl;
  	unsigned char *p;
 	int bDone;
-	char optBuf[128]; /* buffer for options - should be more than enough... */
 	size_t i;
 	rsRetVal localRet;
 
@@ -1228,7 +1285,7 @@ struct template *tplAddLine(rsconf_t *conf, char* pName, uchar** ppRestOfConfLin
 	
 	DBGPRINTF("tplAddLine processing template '%s'\n", pName);
 	pTpl->iLenName = strlen(pName);
-	pTpl->pszName = (char*) MALLOC(sizeof(char) * (pTpl->iLenName + 1));
+	pTpl->pszName = (char*) MALLOC(pTpl->iLenName + 1);
 	if(pTpl->pszName == NULL) {
 		dbgprintf("tplAddLine could not alloc memory for template name!");
 		pTpl->iLenName = 0;
@@ -1317,8 +1374,9 @@ struct template *tplAddLine(rsconf_t *conf, char* pName, uchar** ppRestOfConfLin
 			++p;
 		
 		/* read option word */
+		char optBuf[128] = { '\0' }; /* buffer for options - should be more than enough... */
 		i = 0;
-		while(i < sizeof(optBuf) / sizeof(char) - 1
+		while((i < (sizeof(optBuf) - 1))
 		      && *p && *p != '=' && *p !=',' && *p != '\n') {
 			optBuf[i++] = tolower((int)*p);
 			++p;
@@ -1339,12 +1397,15 @@ struct template *tplAddLine(rsconf_t *conf, char* pName, uchar** ppRestOfConfLin
 			pTpl->optFormatEscape = SQL_ESCAPE;
 		} else if(!strcmp(optBuf, "nosql")) {
 			pTpl->optFormatEscape = NO_ESCAPE;
+		} else if(!strcmp(optBuf, "casesensitive")) {
+			pTpl->optCaseSensitive = 1;
 		} else {
 			dbgprintf("Invalid option '%s' ignored.\n", optBuf);
 		}
 	}
 
 	*ppRestOfConfLine = p;
+	apply_case_sensitivity(pTpl);
 
 	return(pTpl);
 }
@@ -1398,7 +1459,7 @@ static rsRetVal
 createPropertyTpe(struct template *pTpl, struct cnfobj *o)
 {
 	struct templateEntry *pTpe;
-	cstr_t *name = NULL;
+	uchar *name = NULL;
 	uchar *outname = NULL;
 	int i;
 	int droplastlf = 0;
@@ -1408,10 +1469,13 @@ createPropertyTpe(struct template *pTpl, struct cnfobj *o)
 	int topos = -1;
 	int fieldnum = -1;
 	int fielddelim = 9; /* default is HT (USACSII 9) */
+	int fixedwidth = 0;
 	int re_matchToUse = 0;
 	int re_submatchToUse = 0;
 	int bComplexProcessing = 0;
 	int bPosRelativeToEnd = 0;
+	int bDateInUTC = 0;
+	int bCompressSP = 0;
 	char *re_expr = NULL;
 	struct cnfparamvals *pvals = NULL;
 	enum {F_NONE, F_CSV, F_JSON, F_JSONF, F_JSONR, F_JSONFR} formatType = F_NONE;
@@ -1431,12 +1495,12 @@ createPropertyTpe(struct template *pTpl, struct cnfobj *o)
 		if(!pvals[i].bUsed)
 			continue;
 		if(!strcmp(pblkProperty.descr[i].name, "name")) {
-			uchar *tmpstr = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-			rsCStrConstructFromszStr(&name, tmpstr);
-			cstrFinalize(name);
-			free(tmpstr);
+			name = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
 		} else if(!strcmp(pblkProperty.descr[i].name, "droplastlf")) {
 			droplastlf = pvals[i].val.d.n;
+			bComplexProcessing = 1;
+		} else if(!strcmp(pblkProperty.descr[i].name, "fixedwidth")) {
+			fixedwidth = pvals[i].val.d.n;
 			bComplexProcessing = 1;
 		} else if(!strcmp(pblkProperty.descr[i].name, "mandatory")) {
 			mandatory = pvals[i].val.d.n;
@@ -1558,6 +1622,11 @@ createPropertyTpe(struct template *pTpl, struct cnfobj *o)
 				free(typeStr);
 				ABORT_FINALIZE(RS_RET_ERR);
 			}
+		} else if(!strcmp(pblkProperty.descr[i].name, "compressspace")) {
+			bComplexProcessing = 1;
+			bCompressSP = pvals[i].val.d.n;
+		} else if(!strcmp(pblkProperty.descr[i].name, "date.inutc")) {
+			bDateInUTC = pvals[i].val.d.n;
 		} else if(!strcmp(pblkProperty.descr[i].name, "dateformat")) {
 			if(!es_strbufcmp(pvals[i].val.d.estr, (uchar*)"mysql", sizeof("mysql")-1)) {
 				datefmt = tplFmtMySQLDate;
@@ -1611,13 +1680,15 @@ createPropertyTpe(struct template *pTpl, struct cnfobj *o)
 			  "param '%s'\n", pblkProperty.descr[i].name);
 		}
 	}
+	if (name == NULL) {
+		CHKmalloc(name = (uchar*)strdup(""));
+	}
 	if(outname == NULL) {
-		uchar *psz = cstrGetSzStrNoNULL(name);
 		/* we need to drop "$!" prefix, if present */
-		if(!strncmp((char*)psz, "$!", 2))
-			outname = ustrdup(psz + 2);
+		if(ustrlen(name) >= 2 && !strncmp((char*)name, "$!", 2))
+			outname = ustrdup(name + 2);
 		else
-			outname = ustrdup(psz);
+			outname = ustrdup(name);
 	}
 
 	/* sanity check */
@@ -1647,11 +1718,11 @@ createPropertyTpe(struct template *pTpl, struct cnfobj *o)
 	/* apply */
 	CHKmalloc(pTpe = tpeConstruct(pTpl));
 	pTpe->eEntryType = FIELD;
-	CHKiRet(msgPropDescrFill(&pTpe->data.field.msgProp, cstrGetSzStrNoNULL(name),
-		cstrLen(name)));
+	CHKiRet(msgPropDescrFill(&pTpe->data.field.msgProp, name, strlen((char*)name)));
 	pTpe->data.field.options.bDropLastLF = droplastlf;
 	pTpe->data.field.options.bSPIffNo1stSP = spifno1stsp;
 	pTpe->data.field.options.bMandatory = mandatory;
+	pTpe->data.field.options.bFixedWidth = fixedwidth;
 	pTpe->data.field.eCaseConv = caseconv;
 	switch(formatType) {
 	case F_NONE:
@@ -1701,8 +1772,11 @@ createPropertyTpe(struct template *pTpl, struct cnfobj *o)
 	pTpe->fieldName = outname;
 	if(outname != NULL)
 		pTpe->lenFieldName = ustrlen(outname);
+	outname = NULL;
 	pTpe->bComplexProcessing = bComplexProcessing;
 	pTpe->data.field.eDateFormat = datefmt;
+	pTpe->data.field.options.bDateInUTC = bDateInUTC;
+	pTpe->data.field.options.bCompressSP = bCompressSP;
 	if(fieldnum != -1) {
 		pTpe->data.field.has_fields = 1;
 		pTpe->data.field.iFieldNr = fieldnum;
@@ -1743,8 +1817,8 @@ createPropertyTpe(struct template *pTpl, struct cnfobj *o)
 finalize_it:
 	if(pvals != NULL)
 		cnfparamvalsDestruct(pvals, &pblkProperty);
-	if(name != NULL)
-		rsCStrDestruct(&name);
+	free(name);
+	free(outname);
 	RETiRet;
 }
 
@@ -1792,7 +1866,7 @@ tplProcessCnf(struct cnfobj *o)
 	enum { T_STRING, T_PLUGIN, T_LIST, T_SUBTREE }
 		tplType = T_STRING; /* init just to keep compiler happy: mandatory parameter */
 	int i;
-	int o_sql=0, o_stdsql=0, o_json=0; /* options */
+	int o_sql=0, o_stdsql=0, o_json=0, o_casesensitive=0; /* options */
 	int numopts;
 	rsRetVal localRet;
 	DEFiRet;
@@ -1849,10 +1923,21 @@ tplProcessCnf(struct cnfobj *o)
 			o_sql = pvals[i].val.d.n;
 		} else if(!strcmp(pblk.descr[i].name, "option.json")) {
 			o_json = pvals[i].val.d.n;
+		} else if(!strcmp(pblk.descr[i].name, "option.casesensitive")) {
+			o_casesensitive = pvals[i].val.d.n;
 		} else {
 			dbgprintf("template: program error, non-handled "
 			  "param '%s'\n", pblk.descr[i].name);
 		}
+	}
+
+	/* the following check is just for clang static anaylzer: this condition
+	 * cannot occur if all is setup well, because "name" is a required parameter
+	 * inside the param block and so the code should err out above.
+	 */
+	if(name == NULL) {
+		DBGPRINTF("template/tplProcessConf: logic error name == NULL - pblk wrong?\n");
+		ABORT_FINALIZE(RS_RET_ERR);
 	}
 
 	/* do config sanity checks */
@@ -1912,6 +1997,7 @@ tplProcessCnf(struct cnfobj *o)
 	if(o_sql) ++numopts;
 	if(o_stdsql) ++numopts;
 	if(o_json) ++numopts;
+	if(o_casesensitive) ++numopts;
 	if(numopts > 1) {
 		errmsg.LogError(0, RS_RET_ERR, "template '%s' has multiple incompatible "
 			"options of sql, stdsql or json specified", name);
@@ -1965,8 +2051,12 @@ tplProcessCnf(struct cnfobj *o)
 	else if(o_json)
 		pTpl->optFormatEscape = JSON_ESCAPE;
 
+	if(o_casesensitive)
+		pTpl->optCaseSensitive = 1;
+	apply_case_sensitivity(pTpl);
 finalize_it:
 	free(tplStr);
+	free(plugin);
 	if(pvals != NULL)
 		cnfparamvalsDestruct(pvals, &pblk);
 	if(iRet != RS_RET_OK) {
@@ -1985,7 +2075,7 @@ finalize_it:
 
 
 /* Find a template object based on name. Search
- * currently is case-senstive (should we change?).
+ * currently is case-sensitive (should we change?).
  * returns pointer to template object if found and
  * NULL otherwise.
  * rgerhards 2004-11-17
@@ -2144,6 +2234,8 @@ void tplPrintList(rsconf_t *conf)
 			dbgprintf("[JSON-Escaped Format] ");
 		else if(pTpl->optFormatEscape == STDSQL_ESCAPE)
 			dbgprintf("[SQL-Format (standard SQL)] ");
+		if(pTpl->optCaseSensitive)
+			dbgprintf("[Case Sensitive Vars] ");
 		dbgprintf("\n");
 		pTpe = pTpl->pEntryRoot;
 		while(pTpe != NULL) {
@@ -2267,7 +2359,7 @@ int tplGetEntryCount(struct template *pTpl)
 	return(pTpl->tpenElements);
 }
 
-rsRetVal templateInit()
+rsRetVal templateInit(void)
 {
 	DEFiRet;
 	CHKiRet(objGetObjInterface(&obj));

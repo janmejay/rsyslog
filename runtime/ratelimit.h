@@ -1,6 +1,6 @@
 /* header for ratelimit.c
  *
- * Copyright 2012 Adiscon GmbH.
+ * Copyright 2012-2016 Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
@@ -33,20 +33,20 @@ struct ratelimit_s {
 	/* support for "last message repeated n times */
 	int bReduceRepeatMsgs; /**< shall we do "last message repeated n times" processing? */
 	unsigned nsupp;		/**< nbr of msgs suppressed */
-	msg_t *pMsg;
+	smsg_t *pMsg;
 	sbool bThreadSafe;	/**< do we need to operate in Thread-Safe mode? */
 	sbool bNoTimeCache;	/**< if we shall not used cached reception time */
 	pthread_mutex_t mut;	/**< mutex if thread-safe operation desired */
 };
 
 /* prototypes */
-rsRetVal ratelimitNew(ratelimit_t **ppThis, char *modname, char *dynname);
+rsRetVal ratelimitNew(ratelimit_t **ppThis, const char *modname, const char *dynname);
 void ratelimitSetThreadSafe(ratelimit_t *ratelimit);
 void ratelimitSetLinuxLike(ratelimit_t *ratelimit, unsigned short interval, unsigned short burst);
 void ratelimitSetNoTimeCache(ratelimit_t *ratelimit);
 void ratelimitSetSeverity(ratelimit_t *ratelimit, intTiny severity);
-rsRetVal ratelimitMsg(ratelimit_t *ratelimit, msg_t *pMsg, msg_t **ppRep);
-rsRetVal ratelimitAddMsg(ratelimit_t *ratelimit, multi_submit_t *pMultiSub, msg_t *pMsg);
+rsRetVal ratelimitMsg(ratelimit_t *ratelimit, smsg_t *pMsg, smsg_t **ppRep);
+rsRetVal ratelimitAddMsg(ratelimit_t *ratelimit, multi_submit_t *pMultiSub, smsg_t *pMsg);
 void ratelimitDestruct(ratelimit_t *pThis);
 int ratelimitChecked(ratelimit_t *ratelimit);
 rsRetVal ratelimitModInit(void);

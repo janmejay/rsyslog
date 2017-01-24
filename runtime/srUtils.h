@@ -5,7 +5,7 @@
  * \date    2003-09-09
  *          Coding begun.
  *
- * Copyright 2003-2012 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2003-2016 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
@@ -26,6 +26,8 @@
 #ifndef __SRUTILS_H_INCLUDED__
 #define __SRUTILS_H_INCLUDED__ 1
 
+#include <stdlib.h>
+#include <stdint.h>
 
 /* syslog names */
 #ifndef LOG_MAKEPRI
@@ -37,7 +39,7 @@
 #define	LOG_MARK	LOG_MAKEPRI(LOG_NFACILITIES, 0) /* mark "facility" */
 
 typedef struct syslogName_s {
-	char	*c_name;
+	const char	*c_name;
 	int	c_val;
 } syslogName_t;
 
@@ -77,11 +79,12 @@ unsigned char *srUtilStrDup(unsigned char *pOld, size_t len);
  * for it.
  * added 2007-07-17 by rgerhards
  */
-int makeFileParentDirs(const uchar *const szFile, size_t lenFile, mode_t mode, uid_t uid, gid_t gid, int bFailOnChown);
+int makeFileParentDirs(const uchar *const szFile, size_t lenFile, mode_t mode, uid_t uid, gid_t gid,
+int bFailOnChown);
 int execProg(uchar *program, int bWait, uchar *arg);
 void skipWhiteSpace(uchar **pp);
 rsRetVal genFileName(uchar **ppName, uchar *pDirName, size_t lenDirName, uchar *pFName,
-		     size_t lenFName, long lNum, int lNumDigits);
+		     size_t lenFName, int64_t lNum, int lNumDigits);
 int getNumberDigits(long lNum);
 rsRetVal timeoutComp(struct timespec *pt, long iTimeout);
 long timeoutVal(struct timespec *pt);
@@ -92,6 +95,10 @@ int decodeSyslogName(uchar *name, syslogName_t *codetab);
 int getSubString(uchar **ppSrc,  char *pDst, size_t DstSize, char cSep);
 rsRetVal getFileSize(uchar *pszName, off_t *pSize);
 int containsGlobWildcard(char *str);
+void seedRandomNumber(void);
+#define MAX_RANDOM_NUMBER RAND_MAX
+long int randomNumber(void);
+long long currentTimeMills(void);
 
 /* mutex operations */
 /* some useful constants */

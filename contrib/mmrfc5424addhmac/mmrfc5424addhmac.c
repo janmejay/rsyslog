@@ -218,7 +218,7 @@ ENDtryResume
 /* turn the binary data in bin of length len into a
  * printable hex string. "print" must be 2*len+1 (for \0)
  */
-static inline void
+static void
 hexify(uchar *bin, int len, uchar *print)
 {
 	static const char hexchars[16] =
@@ -238,7 +238,7 @@ hexify(uchar *bin, int len, uchar *print)
  * also reduce performance. So we consider the current implementation
  * to be superior.
  */
-static inline void
+static void
 skipSDID(uchar *sdbuf, int sdlen, int *rootIdx)
 {
 	int i;
@@ -257,7 +257,7 @@ skipSDID(uchar *sdbuf, int sdlen, int *rootIdx)
 	*rootIdx = i;
 }
 
-static inline void
+static void
 getSDID(uchar *sdbuf, int sdlen, int *rootIdx, uchar *sdid)
 {
 	int i, j;
@@ -280,8 +280,8 @@ done:
 }
 
 /* check if "our" hmac is already present */
-static inline sbool
-isHmacPresent(instanceData *pData, msg_t *pMsg)
+static sbool
+isHmacPresent(instanceData *pData, smsg_t *pMsg)
 {
 	uchar *sdbuf;
 	rs_size_t sdlen;
@@ -309,8 +309,8 @@ done:
 	return found;
 }
 
-static inline rsRetVal
-hashMsg(instanceData *pData, msg_t *pMsg)
+static rsRetVal
+hashMsg(instanceData *pData, smsg_t *pMsg)
 {
 	uchar *pRawMsg;
 	int lenRawMsg;
@@ -337,9 +337,9 @@ hashMsg(instanceData *pData, msg_t *pMsg)
 
 BEGINdoAction
 	instanceData *pData = pWrkrData->pData;
-	msg_t *pMsg;
+	smsg_t *pMsg;
 CODESTARTdoAction
-	pMsg = (msg_t*) ppString[0];
+	pMsg = (smsg_t*) ppString[0];
 	if(   msgGetProtocolVersion(pMsg) == MSG_RFC5424_PROTOCOL
 	   && !isHmacPresent(pData, pMsg)) {
 		hashMsg(pData, pMsg);

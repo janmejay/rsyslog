@@ -42,7 +42,8 @@
 /* Initialize an existing linkedList_t structure
  * pKey destructor may be zero to take care of non-keyed lists.
  */
-rsRetVal llInit(linkedList_t *pThis, rsRetVal (*pEltDestructor)(), rsRetVal (*pKeyDestructor)(void*), int (*pCmpOp)())
+rsRetVal llInit(linkedList_t *pThis, rsRetVal (*pEltDestructor)(void*), rsRetVal (*pKeyDestructor)(void*),
+int (*pCmpOp)(void*,void*))
 {
 	assert(pThis != NULL);
 	assert(pEltDestructor != NULL);
@@ -90,22 +91,24 @@ rsRetVal llDestroy(linkedList_t *pThis)
 {
 	DEFiRet;
 	llElt_t *pElt;
-	llElt_t *pEltPrev;
 
 	assert(pThis != NULL);
 
 	pElt = pThis->pRoot;
 	while(pElt != NULL) {
-		pEltPrev = pElt;
-		pElt = pElt->pNext;
+		/* keep the list structure in a consistent state as
+		 * the destructor bellow may reference it again
+		 */
+		pThis->pRoot = pElt->pNext;
+		if(pElt->pNext == NULL)
+			pThis->pLast = NULL;
+
 		/* we ignore errors during destruction, as we need to try
 		 * finish the linked list in any case.
 		 */
-		llDestroyElt(pThis, pEltPrev);
+		llDestroyElt(pThis, pElt);
+		pElt = pThis->pRoot;
 	}
-	/* now clean up the pointers */
-	pThis->pRoot = NULL;
-	pThis->pLast = NULL;
 
 	RETiRet;
 }

@@ -8,7 +8,7 @@
  * (and in the web doc set on http://www.rsyslog.com/doc). Be sure to read it
  * if you are getting aquainted to the object.
  *
- * Copyright 2008-2013 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2008-2016 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
@@ -40,7 +40,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <atomic.h>
-#if HAVE_SYS_PRCTL_H
+#ifdef HAVE_SYS_PRCTL_H
 #  include <sys/prctl.h>
 #endif
 
@@ -69,7 +69,7 @@ DEFobjCurrIf(glbl)
 /* get the header for debug messages
  * The caller must NOT free or otherwise modify the returned string!
  */
-static inline uchar *
+static uchar *
 wtpGetDbgHdr(wtp_t *pThis)
 {
 	ISOBJ_TYPE_assert(pThis, wtp);
@@ -83,11 +83,12 @@ wtpGetDbgHdr(wtp_t *pThis)
 
 
 /* Not implemented dummy function for constructor */
-static rsRetVal NotImplementedDummy() { return RS_RET_NOT_IMPLEMENTED; }
+static rsRetVal NotImplementedDummy(void) { return RS_RET_NOT_IMPLEMENTED; }
 /* Standard-Constructor for the wtp object
  */
 BEGINobjConstruct(wtp) /* be sure to specify the object type also in END macro! */
 	pthread_mutex_init(&pThis->mutWtp, NULL);
+	pthread_cond_init(&pThis->condThrdInitDone, NULL);
 	pthread_cond_init(&pThis->condThrdTrm, NULL);
 	pthread_attr_init(&pThis->attrThrd);
 	/* Set thread scheduling policy to default */
@@ -98,10 +99,10 @@ BEGINobjConstruct(wtp) /* be sure to specify the object type also in END macro! 
 #endif
 	pthread_attr_setdetachstate(&pThis->attrThrd, PTHREAD_CREATE_DETACHED);
 	/* set all function pointers to "not implemented" dummy so that we can safely call them */
-	pThis->pfChkStopWrkr = NotImplementedDummy;
-	pThis->pfGetDeqBatchSize = NotImplementedDummy;
-	pThis->pfDoWork = NotImplementedDummy;
-	pThis->pfObjProcessed = NotImplementedDummy;
+	pThis->pfChkStopWrkr = (rsRetVal (*)(void*,int))NotImplementedDummy;
+	pThis->pfGetDeqBatchSize = (rsRetVal (*)(void*,int*))NotImplementedDummy;
+	pThis->pfDoWork = (rsRetVal (*)(void*,void*))NotImplementedDummy;
+	pThis->pfObjProcessed = (rsRetVal (*)(void*,wti_t*))NotImplementedDummy;
 	INIT_ATOMIC_HELPER_MUT(pThis->mutCurNumWrkThrd);
 	INIT_ATOMIC_HELPER_MUT(pThis->mutWtpState);
 ENDobjConstruct(wtp)
@@ -156,6 +157,7 @@ CODESTARTobjDestruct(wtp)
 
 	/* actual destruction */
 	pthread_cond_destroy(&pThis->condThrdTrm);
+	pthread_cond_destroy(&pThis->condThrdInitDone);
 	pthread_mutex_destroy(&pThis->mutWtp);
 	pthread_attr_destroy(&pThis->attrThrd);
 	DESTROY_ATOMIC_HELPER_MUT(pThis->mutCurNumWrkThrd);
@@ -215,7 +217,9 @@ finalize_it:
 }
 
 
+#if !defined(_AIX)
 #pragma GCC diagnostic ignored "-Wempty-body"
+#endif
 /* Send a shutdown command to all workers and see if they terminate.
  * A timeout may be specified. This function may also be called with
  * the current number of workers being 0, in which case it does not
@@ -268,7 +272,9 @@ wtpShutdownAll(wtp_t *pThis, wtpState_t tShutdownCmd, struct timespec *ptTimeout
 	
 	RETiRet;
 }
+#if !defined(_AIX)
 #pragma GCC diagnostic warning "-Wempty-body"
+#endif
 
 
 /* Unconditionally cancel all running worker threads.
@@ -296,7 +302,7 @@ wtpCancelAll(wtp_t *pThis)
  * as this introduces a race in the debug system (RETiRet system).
  * rgerhards, 2009-10-26
  */
-static inline void
+static void
 wtpWrkrExecCleanup(wti_t *pWti)
 {
 	wtp_t *pThis;
@@ -349,14 +355,16 @@ wtpWrkrExecCancelCleanup(void *arg)
  * wti worker.
  * rgerhards, 2008-01-21
  */
+#if !defined(_AIX)
 #pragma GCC diagnostic ignored "-Wempty-body"
+#endif 
 static void *
 wtpWorker(void *arg) /* the arg is actually a wti object, even though we are in wtp! */
 {
 	wti_t *pWti = (wti_t*) arg;
 	wtp_t *pThis;
 	sigset_t sigSet;
-#	if HAVE_PRCTL && defined PR_SET_NAME
+#	if defined(HAVE_PRCTL) && defined(PR_SET_NAME)
 	uchar *pszDbgHdr;
 	uchar thrdName[32] = "rs:";
 #	endif
@@ -375,7 +383,14 @@ wtpWorker(void *arg) /* the arg is actually a wti object, even though we are in 
 	sigaddset(&sigSet, SIGTTIN);
 	pthread_sigmask(SIG_UNBLOCK, &sigSet, NULL);
 
-#	if HAVE_PRCTL && defined PR_SET_NAME
+#ifdef _AIX /*AIXPORT unblock SIGSEGV so that the process core dumps on segmentation fault */
+	sigemptyset(&sigSet);
+	sigaddset(&sigSet, SIGSEGV);
+	pthread_sigmask(SIG_UNBLOCK, &sigSet, NULL);
+#endif /*AIXPORT*/
+
+
+#	if defined(HAVE_PRCTL) && defined(PR_SET_NAME)
 	/* set thread name - we ignore if the call fails, has no harsh consequences... */
 	pszDbgHdr = wtpGetDbgHdr(pThis);
 	ustrncpy(thrdName+3, pszDbgHdr, 20);
@@ -386,6 +401,12 @@ wtpWorker(void *arg) /* the arg is actually a wti object, even though we are in 
 #	endif
 
 	pthread_cleanup_push(wtpWrkrExecCancelCleanup, pWti);
+
+        /* let the parent know we're done with initialization */
+        d_pthread_mutex_lock(&pThis->mutWtp);
+        pthread_cond_broadcast(&pThis->condThrdInitDone);
+        d_pthread_mutex_unlock(&pThis->mutWtp);
+
 	wtiWorker(pWti);
 	pthread_cleanup_pop(0);
 	wtpWrkrExecCleanup(pWti);
@@ -398,7 +419,9 @@ wtpWorker(void *arg) /* the arg is actually a wti object, even though we are in 
 	pthread_cond_broadcast(&pThis->condThrdTrm); /* activate anyone waiting on thread shutdown */
 	pthread_exit(0);
 }
+#if !defined(_AIX)
 #pragma GCC diagnostic warning "-Wempty-body"
+#endif
 
 
 /* start a new worker */
@@ -436,6 +459,11 @@ wtpStartWrkr(wtp_t *pThis)
 	DBGPRINTF("%s: started with state %d, num workers now %d\n",
 		  wtpGetDbgHdr(pThis), iState,
 		  ATOMIC_FETCH_32BIT(&pThis->iCurNumWrkThrd, &pThis->mutCurNumWrkThrd));
+
+        /* wait for the new thread to initialize its signal mask and
+         * cancelation cleanup handler before proceeding
+         */
+        d_pthread_cond_wait(&pThis->condThrdInitDone, &pThis->mutWtp);
 
 finalize_it:
 	d_pthread_mutex_unlock(&pThis->mutWtp);
@@ -525,7 +553,7 @@ wtpSetDbgHdr(wtp_t *pThis, uchar *pszMsg, size_t lenMsg)
 		pThis->pszDbgHdr = NULL;
 	}
 
-	if((pThis->pszDbgHdr = MALLOC(sizeof(uchar) * lenMsg + 1)) == NULL)
+	if((pThis->pszDbgHdr = MALLOC(lenMsg + 1)) == NULL)
 		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
 
 	memcpy(pThis->pszDbgHdr, pszMsg, lenMsg + 1); /* always think about the \0! */
@@ -535,7 +563,7 @@ finalize_it:
 }
 
 /* dummy */
-rsRetVal wtpQueryInterface(void) { return RS_RET_NOT_IMPLEMENTED; }
+static rsRetVal wtpQueryInterface(void) { return RS_RET_NOT_IMPLEMENTED; }
 
 /* exit our class
  */

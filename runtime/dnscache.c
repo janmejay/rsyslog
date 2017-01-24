@@ -7,7 +7,7 @@
  * In any case, even the initial implementaton is far faster than what we had
  * before. -- rgerhards, 2011-06-06
  *
- * Copyright 2011-2014 by Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2011-2016 by Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
@@ -76,7 +76,7 @@ static prop_t *staticErrValue;
 /* Our hash function.
  * TODO: check how well it performs on socket addresses!
  */
-unsigned int
+static unsigned int
 hash_from_key_fn(void *k) 
 {
     int len;
@@ -165,7 +165,7 @@ findEntry(struct sockaddr_storage *addr)
  * when being cancelled, at least if the module was dlloaded.
  * rgerhards, 2008-09-30
  */
-static inline int
+static int
 mygetnameinfo(const struct sockaddr *sa, socklen_t salen,
                        char *host, size_t hostlen,
                        char *serv, size_t servlen, int flags)
@@ -181,7 +181,7 @@ mygetnameinfo(const struct sockaddr *sa, socklen_t salen,
 
 
 /* get only the local part of the hostname and set it in cache entry */
-static inline void
+static void
 setLocalHostName(dnscache_entry_t *etry)
 {
 	uchar *fqdnLower;
@@ -305,7 +305,7 @@ resolveAddr(struct sockaddr_storage *addr, dnscache_entry_t *etry)
 				 * is OK in any way. We do also log the error message. rgerhards, 2007-07-16
 		 		 */
 		 		if(glbl.GetDropMalPTRMsgs() == 1) {
-					snprintf((char*)szErrMsg, sizeof(szErrMsg) / sizeof(uchar),
+					snprintf((char*)szErrMsg, sizeof(szErrMsg),
 						 "Malicious PTR record, message dropped "
 						 "IP = \"%s\" HOST = \"%s\"",
 						 szIP, fqdnBuf);
@@ -320,7 +320,7 @@ resolveAddr(struct sockaddr_storage *addr, dnscache_entry_t *etry)
 				 * (OK, I admit this is more or less impossible, but I am paranoid...)
 				 * rgerhards, 2007-07-16
 				 */
-				snprintf((char*)szErrMsg, sizeof(szErrMsg) / sizeof(uchar),
+				snprintf((char*)szErrMsg, sizeof(szErrMsg),
 					 "Malicious PTR record (message accepted, but used IP "
 					 "instead of PTR name: IP = \"%s\" HOST = \"%s\"",
 					 szIP, fqdnBuf);
@@ -362,7 +362,7 @@ finalize_it:
 }
 
 
-static inline rsRetVal
+static rsRetVal
 addEntry(struct sockaddr_storage *addr, dnscache_entry_t **pEtry)
 {
 	int r;

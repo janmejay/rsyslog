@@ -28,7 +28,9 @@
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-
+#if defined(__FreeBSD__)
+#include <netinet/in.h>
+#endif 
 
 static char *targetIP = "127.0.0.1";
 static int targetPort = 13500;
@@ -130,6 +132,9 @@ doProcessing()
 		sendCmd(fd, line, len);
 		waitRsp(fd, line, sizeof(line));
 		printf("imdiag[%d]: %s", targetPort, line);
+		if (strstr(line, "imdiag::error") != NULL) {
+			exit(1);
+		}
 	}
 }
 

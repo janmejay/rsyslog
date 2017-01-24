@@ -2,7 +2,7 @@
  * support for rate-limiting sources, including "last message
  * repeated n times" processing.
  *
- * Copyright 2012 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2012-2016 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
@@ -45,10 +45,10 @@ DEFobjCurrIf(parser)
 /* static data */
 
 /* generate a "repeated n times" message */
-static inline msg_t *
+static smsg_t *
 ratelimitGenRepMsg(ratelimit_t *ratelimit)
 {
-	msg_t *repMsg;
+	smsg_t *repMsg;
 	size_t lenRepMsg;
 	uchar szRepMsg[1024];
 
@@ -69,8 +69,8 @@ ratelimitGenRepMsg(ratelimit_t *ratelimit)
 done:	return repMsg;
 }
 
-static inline rsRetVal
-doLastMessageRepeatedNTimes(ratelimit_t *ratelimit, msg_t *pMsg, msg_t **ppRepMsg)
+static rsRetVal
+doLastMessageRepeatedNTimes(ratelimit_t *ratelimit, smsg_t *pMsg, smsg_t **ppRepMsg)
 {
 	int bNeedUnlockMutex = 0;
 	DEFiRet;
@@ -112,7 +112,7 @@ finalize_it:
 
 
 /* helper: tell how many messages we lost due to linux-like ratelimiting */
-static inline void
+static void
 tellLostCnt(ratelimit_t *ratelimit)
 {
 	uchar msgbuf[1024];
@@ -131,7 +131,7 @@ tellLostCnt(ratelimit_t *ratelimit)
  * This implementation is NOT THREAD-SAFE and must not 
  * be called concurrently.
  */
-static inline int
+static int
 withinRatelimit(ratelimit_t *ratelimit, time_t tt)
 {
 	int ret;
@@ -156,8 +156,8 @@ withinRatelimit(ratelimit_t *ratelimit, time_t tt)
 	if(ratelimit->begin == 0)
 		ratelimit->begin = tt;
 
-	/* resume if we go out of time window */
-	if(tt > ratelimit->begin + ratelimit->interval) {
+	/* resume if we go out of time window or if time has gone backwards */
+	if((tt > ratelimit->begin + ratelimit->interval) || (tt < ratelimit->begin) ) {
 		ratelimit->begin = 0;
 		ratelimit->done = 0;
 		tellLostCnt(ratelimit);
@@ -198,7 +198,7 @@ finalize_it:
  * message before the original message.
  */
 rsRetVal
-ratelimitMsg(ratelimit_t *ratelimit, msg_t *pMsg, msg_t **ppRepMsg)
+ratelimitMsg(ratelimit_t *ratelimit, smsg_t *pMsg, smsg_t **ppRepMsg)
 {
 	DEFiRet;
 	rsRetVal localRet;
@@ -245,10 +245,10 @@ ratelimitChecked(ratelimit_t *ratelimit)
  * if pMultiSub == NULL, a single-message enqueue happens (under reconsideration)
  */
 rsRetVal
-ratelimitAddMsg(ratelimit_t *ratelimit, multi_submit_t *pMultiSub, msg_t *pMsg)
+ratelimitAddMsg(ratelimit_t *ratelimit, multi_submit_t *pMultiSub, smsg_t *pMsg)
 {
 	rsRetVal localRet;
-	msg_t *repMsg;
+	smsg_t *repMsg;
 	DEFiRet;
 
 	if(pMultiSub == NULL) {
@@ -282,7 +282,7 @@ finalize_it:
  * Both values should be kept brief.
  */
 rsRetVal
-ratelimitNew(ratelimit_t **ppThis, char *modname, char *dynname)
+ratelimitNew(ratelimit_t **ppThis, const char *modname, const char *dynname)
 {
 	ratelimit_t *pThis;
 	char namebuf[256];
@@ -353,7 +353,7 @@ ratelimitSetSeverity(ratelimit_t *ratelimit, intTiny severity)
 void
 ratelimitDestruct(ratelimit_t *ratelimit)
 {
-	msg_t *pMsg;
+	smsg_t *pMsg;
 	if(ratelimit->pMsg != NULL) {
 		if(ratelimit->nsupp > 0) {
 			pMsg = ratelimitGenRepMsg(ratelimit);

@@ -2,7 +2,35 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ(2.61)
-AC_INIT([rsyslog],[8.9.0.master],[rsyslog@lists.adiscon.com])
+AC_INIT([rsyslog],[8.25.0.master],[rsyslog@lists.adiscon.com])
+
+# AIXPORT START: Detect the underlying OS
+unamestr=$(uname)
+AM_CONDITIONAL([AIX], [test x$unamestr = xAIX])
+# AIXPORT END
+
+# AIXPORT START : Set the required variables for AIX config script
+if test "$unamestr" = "AIX"; then
+	export PKG_CONFIG_PATH="$PKG_CONFIG_PATH:/usr/lib/pkgconfig"
+	LIBS="-lbsd -lsrc"
+	CPPFLAGS="-D_THREAD_SAFE -D_BSD43 -D_AIX"
+	CFLAGS="-D_AIX"
+	LDFLAGS="-qcpluscmt -brtl -bexpall -bE:strippedsymbols.exp "
+	LIBESTR_LIBS="-L/usr/lib/ -lestr"
+	LIBESTR_CFLAGS="-I/usr/include"
+	LIBLOGGING_STDLOG_LIBS="-L/usr/lib/ -llogging-stdlog"
+	LIBLOGGING_STDLOG_CFLAGS="-I/usr/include"
+	GNUTLS_LIBS="-L/usr/lib/ -lgnutls"
+	GNUTLS_CFLAGS="-I/usr/include"
+	RELP_LIBS="-L/usr/lib/ -lrelp"
+	RELP_CFLAGS="-I/usr/include"
+	CC="xlc_r"
+	AC_PREFIX_DEFAULT(/usr)
+	export  ac_cv_func_malloc_0_nonnull=yes
+	export ac_cv_func_realloc_0_nonnull=yes
+fi
+# AIXPORT END
+
 AM_INIT_AUTOMAKE([subdir-objects])
 
 m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
@@ -13,44 +41,43 @@ AC_CONFIG_HEADERS([config.h])
 
 AC_USE_SYSTEM_EXTENSIONS
 
-# check if valgrind is present
-AC_CHECK_PROG(have_valgrind, [valgrind], [yes])
-AM_CONDITIONAL(HAVE_VALGRIND, test x$have_valgrind = xyes)
-
 # Checks for programs.
 AC_PROG_LEX
 AC_PROG_YACC
 AC_PROG_CC
 AC_PROG_CC_C99
 AC_DISABLE_STATIC
+# AIXPORT START: enable dlopen
+if test "$unamestr" = "AIX"; then
+	AC_LIBTOOL_DLOPEN
+fi
+# AIXPORT end
 AC_PROG_LIBTOOL
 AC_CANONICAL_HOST
+
+m4_ifdef([AX_IS_RELEASE], [
+	AX_IS_RELEASE([git-directory])
+	m4_ifdef([AX_COMPILER_FLAGS], [
+		AX_COMPILER_FLAGS()
+	], [
+		if test "$GCC" = "yes"
+		then CFLAGS="$CFLAGS -W -Wall -Wformat-security -Wshadow -Wcast-align -Wpointer-arith -Wmissing-format-attribute -g"
+		fi
+		AC_MSG_WARN([missing AX_COMPILER_FLAGS macro, not using it])
+	])
+], [
+	if test "$GCC" = "yes"
+	then CFLAGS="$CFLAGS -W -Wall -Wformat-security -Wshadow -Wcast-align -Wpointer-arith -Wmissing-format-attribute -g"
+	fi
+	AC_MSG_WARN([missing AX_IS_RELEASE macro, not using AX_COMPILER_FLAGS macro because of this])
+])
+
 
 PKG_PROG_PKG_CONFIG
 
 # modules we require
 PKG_CHECK_MODULES(LIBESTR, libestr >= 0.1.9)
-PKG_CHECK_MODULES([JSON_C], [json],, [
-	PKG_CHECK_MODULES([JSON_C], [json-c],,)
-])
-
-save_CFLAGS="$CFLAGS"
-save_LIBS="$LIBS"
-
-CFLAGS="$CFLAGS $JSON_C_CFLAGS"
-LIBS="$LIBS $JSON_C_LIBS"
-
-# if int64 is supported, use it
-AC_CHECK_LIB(json-c, json_object_new_object,,)
-AC_CHECK_FUNCS(json_object_new_int64,,)
-
-# look for newer API
-AC_CHECK_FUNCS(json_tokener_error_desc,,)
-AC_CHECK_FUNCS(json_object_object_get_ex,,)
-AC_CHECK_TYPES([json_bool],,,[[#include <json_object.h>]])
-
-CFLAGS="$save_CFLAGS"
-LIBS="$save_LIBS"
+PKG_CHECK_MODULES([JSON_C], [libfastjson >= 0.99.3],,)
 
 AC_DEFINE_UNQUOTED([PLATFORM_ID], ["${host}"], [platform id for display purposes])
 # we don't mind if we don't have the lsb_release utility. But if we have, it's
@@ -83,7 +110,19 @@ case "${host}" in
     LIBUUID_LIBS=${LIBUUID_LIBS:=-luuid}
     AC_SUBST(SOL_LIBS)
   ;;
+# AIXPORT START
+  *-*-aix*)
+    os_type="aix"
+    AC_DEFINE([OS_AIX], [1], [Indicator for a AIX OS])
+  ;;
+# AIXPORT END
 esac
+
+# Running from git source?
+in_git_src=no
+AS_IF([test -d "$srcdir"/.git && ! test -f  "$srcdir"/.tarball-version], [in_git_src=yes])
+
+AM_CONDITIONAL(OS_LINUX, test x$os_type == xlinux)
 
 AC_DEFINE_UNQUOTED([HOSTENV], "$host", [the host environment, can be queried via a system variable])
 
@@ -134,8 +173,6 @@ AC_CHECK_MEMBERS([struct sockaddr.sa_len],,,[$sa_includes])
 AC_FUNC_CHOWN
 AC_FUNC_FORK
 AC_PROG_GCC_TRADITIONAL
-AC_FUNC_MALLOC
-AC_FUNC_REALLOC
 AC_FUNC_SELECT_ARGTYPES
 AC_TYPE_SIGNAL
 AC_FUNC_STAT
@@ -161,6 +198,7 @@ AC_CHECK_DECL([GLOB_NOMAGIC], [AC_DEFINE(HAVE_GLOB_NOMAGIC, [1], [set define])],
 AC_MSG_CHECKING(for MAXHOSTNAMELEN)
 AC_TRY_COMPILE([
 	#include <sys/param.h>
+	#include <netdb.h>
 	], [
 	return MAXHOSTNAMELEN;
 	]
@@ -260,12 +298,18 @@ AC_ARG_ENABLE(gssapi_krb5,
          esac],
 	[enable_gssapi_krb5=no]
 )
+
+case "${os_type}" in
+solaris) GSSLIB=gss ;;
+*)       GSSLIB=gssapi_krb5 ;;
+esac
+  
 if test $enable_gssapi_krb5 = yes; then
-	AC_CHECK_LIB(gssapi_krb5, gss_acquire_cred, [
+	AC_CHECK_LIB($GSSLIB, gss_acquire_cred, [
 		AC_CHECK_HEADER(gssapi/gssapi.h, [
 			AC_DEFINE(USE_GSSAPI,,
 				  Define if you want to use GSSAPI)
-			GSS_LIBS="-lgssapi_krb5"
+			GSS_LIBS="-l$GSSLIB"
 			AC_SUBST(GSS_LIBS)
 		])
 	])
@@ -283,10 +327,14 @@ AC_CHECK_HEADERS(
         [
           AC_DEFINE([USE_PTHREADS], [1], [Multithreading support enabled.])
           PTHREADS_LIBS="-lpthread"
- 	  case "${os_type}" in
- 	  solaris) PTHREADS_CFLAGS="-pthreads" ;;
- 	  *)       PTHREADS_CFLAGS="-pthread" ;;
- 	  esac
+          if test "$unamestr" = "AIX"; then
+                  PTHREADS_CFLAGS="-lpthreads" 
+          else
+                  case "${os_type}" in
+                  solaris) PTHREADS_CFLAGS="-pthreads" ;;
+                  *)       PTHREADS_CFLAGS="-pthread" ;;
+                  esac
+          fi
           AC_SUBST(PTHREADS_LIBS)
           AC_SUBST(PTHREADS_CFLAGS)
         ],
@@ -297,10 +345,30 @@ AC_CHECK_HEADERS(
     [AC_MSG_FAILURE([pthread is missing])]
 )
 
-AC_CHECK_FUNCS(
+AC_CHECK_LIB(
+  [pthread],
+	[pthread_rwlockattr_setkind_np],
+	[AC_DEFINE(
+	   [HAVE_PTHREAD_RWLOCKATTR_SETKIND_NP],
+		 [1],
+		 [Set-kind available for rwlock attr.])])
+
+AC_CHECK_LIB(
+  [pthread],
+	[pthread_setname_np],
+	[AC_DEFINE(
+	   [HAVE_PTHREAD_SETNAME_NP],
+		 [1],
+		 [Can set thread-name.])])
+
+AC_SEARCH_LIBS(
     [pthread_setschedparam],
+    [pthread],
     [
       rsyslog_have_pthread_setschedparam=yes
+      AC_DEFINE([HAVE_PTHREAD_SETSCHEDPARAM],
+	[1],
+	[Can set thread scheduling parameters])
     ],
     [
       rsyslog_have_pthread_setschedparam=no
@@ -438,20 +506,41 @@ AM_CONDITIONAL(HAVE_SYSTEMD, [test -n "$with_systemdsystemunitdir" -a "x$with_sy
 
 # debug
 AC_ARG_ENABLE(debug,
-        [AS_HELP_STRING([--enable-debug],[Enable debug mode @<:@default=no@:>@])],
+        [AS_HELP_STRING([--enable-debug],[Enable debug mode @<:@default=auto@:>@])],
         [case "${enableval}" in
-         yes) enable_debug="yes" ;;
-          no) enable_debug="no" ;;
+          yes) enable_debug="yes" ;;
+           no) enable_debug="no" ;;
+         auto) enable_debug="auto" ;;
            *) AC_MSG_ERROR(bad value ${enableval} for --enable-debug) ;;
          esac],
-        [enable_debug="no"]
+        [enable_debug="auto"]
 )
+if test "$enable_debug" = "auto"; then
+	if test "x$in_git_src" = "xyes"; then
+		enable_debug="yes"
+	else
+		enable_debug="no"
+	fi
+	AC_MSG_NOTICE([enable-debug in auto mode, enable-debug is set to ${enable_debug}])
+fi
 if test "$enable_debug" = "yes"; then
         AC_DEFINE(DEBUG, 1, [Defined if debug mode is enabled (its easier to check).])
 fi
 if test "$enable_debug" = "no"; then
         AC_DEFINE(NDEBUG, 1, [Defined if debug mode is disabled.])
 fi
+
+
+# debug-symbols
+AC_ARG_ENABLE(debug_symbols,
+        [AS_HELP_STRING([--disable-debug-symbols],[Disable debugging symbols @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_debug_symbols="yes" ;;
+          no) enable_debug_symbols="no" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --disable-debug-symbols) ;;
+         esac],
+        [enable_debug_symbols="yes"]
+)
 
 
 # runtime instrumentation
@@ -487,7 +576,7 @@ fi
 
 # valgrind
 AC_ARG_ENABLE(valgrind,
-        [AS_HELP_STRING([--enable-valgrind],[Enable valgrind support settings @<:@default=no@:>@])],
+        [AS_HELP_STRING([--enable-valgrind],[Enable somes special code that rsyslog core developers consider useful for testing. Do NOT use if you don't exactly know what you are doing, except if told so by rsyslog developers. NOT to be used by distro maintainers for building regular packages. @<:@default=no@:>@])],
         [case "${enableval}" in
          yes) enable_valgrind="yes" ;;
           no) enable_valgrind="no" ;;
@@ -754,7 +843,13 @@ AC_ARG_ENABLE(gnutls,
 if test "x$enable_gnutls" = "xyes"; then
 	PKG_CHECK_MODULES(GNUTLS, gnutls >= 1.4.0)
 	AC_DEFINE([ENABLE_GNUTLS], [1], [Indicator that GnuTLS is present])
+	save_libs=$LIBS
+	LIBS="$LIBS $GNUTLS_LIBS"
+	AC_CHECK_FUNCS(gnutls_certificate_set_retrieve_function,,)
+	AC_CHECK_FUNCS(gnutls_certificate_type_set_priority,,)
+	LIBS=$save_libs
 fi
+
 AM_CONDITIONAL(ENABLE_GNUTLS, test x$enable_gnutls = xyes)
 
 # libgcrypt support
@@ -804,9 +899,19 @@ if test "x$enable_rsyslogrt" = "xyes"; then
 fi
 AM_CONDITIONAL(ENABLE_RSYSLOGRT, test x$enable_rsyslogrt = xyes)
 RSRT_CFLAGS="\$(RSRT_CFLAGS1) \$(LIBESTR_CFLAGS) \$(JSON_C_CFLAGS)"
-if test "$GCC" = "yes"
-then RSRT_CFLAGS="$RSRT_CFLAGS -W -Wall -Wformat-security -Wshadow -Wcast-align -Wpointer-arith -Wmissing-format-attribute -Werror=implicit-function-declaration -g"
+if test "$GCC" = "yes"; then
+  RSRT_CFLAGS="$RSRT_CFLAGS -W -Wall -Wformat-security -Wshadow -Wcast-align -Wpointer-arith -Wmissing-format-attribute"
+  if $CC -Werror=implicit-function-declaration -x c -c /dev/null -o /dev/null 2>/dev/null; then
+    RSRT_CFLAGS="$RSRT_CFLAGS -Werror=implicit-function-declaration"
+  elif $CC -Werror-implicit-function-declaration -x c -c /dev/null -o /dev/null 2>/dev/null; then
+    RSRT_CFLAGS="$RSRT_CFLAGS -Werror-implicit-function-declaration"
+  fi
+
+  if test "x$enable_debug_symbols" = "xyes"; then
+    RSRT_CFLAGS="$RSRT_CFLAGS -g"
+  fi
 fi
+RSRT_CFLAGS="$RSRT_CFLAGS $WARN_CFLAGS"
 RSRT_LIBS="\$(RSRT_LIBS1) \$(LIBESTR_LIBS) \$(JSON_C_LIBS)"
 AC_SUBST(RSRT_CFLAGS1)
 AC_SUBST(RSRT_LIBS1)
@@ -861,6 +966,23 @@ AC_ARG_ENABLE(mysql_tests,
 AM_CONDITIONAL(ENABLE_MYSQL_TESTS, test x$enable_mysql_tests = xyes)
 
 
+# capability to enable PostgreSQL testbench tests. This requries that a Syslog database
+# with the default schema (see plugins/ompgsql/createDB.sql) has been created on the
+# local (127.0.0.1) PostgreSQL server and a user "rsyslog" with password "testbench"
+# exists, is able to login with default parameters and has sufficient (read: all)
+# privileges on that database
+AC_ARG_ENABLE(pgsql_tests,
+        [AS_HELP_STRING([--enable-pgsql-tests],[enable PostgreSQL specific tests in testbench @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_pgsql_tests="yes" ;;
+          no) enable_pgsql_tests="no" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-pgsql-tests) ;;
+         esac],
+        [enable_pgsql_tests=no]
+)
+AM_CONDITIONAL(ENABLE_PGSQL_TESTS, test x$enable_pgsql_tests = xyes)
+
+
 # Mail support (so far we do not need a library, but we need to turn this on and off)
 AC_ARG_ENABLE(mail,
         [AS_HELP_STRING([--enable-mail],[Enable mail support @<:@default=no@:>@])],
@@ -903,7 +1025,7 @@ AC_ARG_ENABLE(mmnormalize,
         [enable_mmnormalize=no]
 )
 if test "x$enable_mmnormalize" = "xyes"; then
-	PKG_CHECK_MODULES(LIBLOGNORM, lognorm >= 1.0.2)
+	PKG_CHECK_MODULES(LIBLOGNORM, lognorm >= 1.1.2)
 
 	save_CFLAGS="$CFLAGS"
 	save_LIBS="$LIBS"
@@ -931,6 +1053,24 @@ AC_ARG_ENABLE(mmjsonparse,
 )
 AM_CONDITIONAL(ENABLE_MMJSONPARSE, test x$enable_mmjsonparse = xyes)
 
+# mmgrok
+AC_ARG_ENABLE(mmgrok,
+        [AS_HELP_STRING([--enable-mmgrok],[Enable building mmgrok support @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_mmgrok="yes" ;;
+          no) enable_mmgrok="no" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-mmgrok) ;;
+        esac],
+        [enable_mmgrok=no]
+)
+if test "x$enable_mmgrok" = "xyes"; then
+	GLIB_CFLAGS="$(pkg-config --cflags glib-2.0)"
+	GLIB_LIBS="$(pkg-config --libs glib-2.0)"
+fi
+AM_CONDITIONAL(ENABLE_MMGROK, test x$enable_mmgrok = xyes)
+AC_SUBST(GLIB_CFLAGS)
+AC_SUBST(GLIB_LIBS)
+
 # mmaudit
 AC_ARG_ENABLE(mmaudit,
         [AS_HELP_STRING([--enable-mmaudit],[Enable building mmaudit support @<:@default=no@:>@])],
@@ -955,6 +1095,19 @@ AC_ARG_ENABLE(mmanon,
         [enable_mmanon=no]
 )
 AM_CONDITIONAL(ENABLE_MMANON, test x$enable_mmanon = xyes)
+
+
+# mmrm1stspace
+AC_ARG_ENABLE(mmrm1stspace,
+        [AS_HELP_STRING([--enable-mmrm1stspace],[Enable building mmrm1stspace support @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_mmrm1stspace="yes" ;;
+          no) enable_mmrm1stspace="no" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-mmrm1stspace) ;;
+         esac],
+        [enable_mmrm1stspace=no]
+)
+AM_CONDITIONAL(ENABLE_MMRM1STSPACE, test x$enable_mmrm1stspace = xyes)
 
 
 # mmutf8fix
@@ -994,6 +1147,25 @@ AC_ARG_ENABLE(mmsequence,
         [enable_mmsequence=no]
 )
 AM_CONDITIONAL(ENABLE_MMSEQUENCE, test x$enable_mmsequence = xyes)
+
+
+
+# mmdblookup
+AC_ARG_ENABLE(mmdblookup,
+        [AS_HELP_STRING([--enable-mmdblookup],[Enable mmdb lookup helper @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_mmdblookup="yes" ;;
+          no) enable_mmdblookup="no" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-mmdblookup) ;;
+         esac],
+        [enable_mmdblookup=no]
+)
+if test "x$enable_mmdblookup"; then
+        #PKG_CHECK_MODULES(LIBMAXMINDDB, libmaxminddb)
+        AC_CHECK_HEADERS([maxminddb.h])
+fi
+AM_CONDITIONAL(ENABLE_MMDBLOOKUP, test x$enable_mmdblookup = xyes)
+
 
 
 # mmfields
@@ -1051,9 +1223,17 @@ AC_ARG_ENABLE(relp,
         [enable_relp=no]
 )
 if test "x$enable_relp" = "xyes"; then
-	PKG_CHECK_MODULES(RELP, relp >= 1.2.5)
+	PKG_CHECK_MODULES(RELP, relp >= 1.2.12)
+	AC_DEFINE([ENABLE_RELP], [1], [Indicator that RELP is present])
 fi
 AM_CONDITIONAL(ENABLE_RELP, test x$enable_relp = xyes)
+
+# RELP default port
+AC_ARG_ENABLE(omrelp-default-port,
+        [AS_HELP_STRING([--enable-omrelp-default-port],[set omrelp default port @<:@default=514@:>@])],
+	[ AC_DEFINE_UNQUOTED(RELP_DFLT_PT, "${enableval}", [default port for omrelp]) ],
+	[ AC_DEFINE(RELP_DFLT_PT, "514", [default port for omrelp]) ]
+)
 
 
 # GuardTime support
@@ -1070,6 +1250,23 @@ if test "x$enable_guardtime" = "xyes"; then
 	PKG_CHECK_MODULES(GUARDTIME, libgt >= 0.3.1)
 fi
 AM_CONDITIONAL(ENABLE_GUARDTIME, test x$enable_guardtime = xyes)
+
+
+# GuardTime KSI support
+AC_ARG_ENABLE(gt-ksi,
+        [AS_HELP_STRING([--enable-gt-ksi],[Enable log file signing support via GuardTime KSI @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_gt_ksi="yes" ;;
+          no) enable_gt_ksi="no" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-gt-ksi) ;;
+         esac],
+        [enable_gt_ksi=no]
+)
+if test "x$enable_gt_ksi" = "xyes"; then
+	PKG_CHECK_MODULES(GT_KSI, libksi >= 3.4.0.2)
+	PKG_CHECK_MODULES(GT_KSI, libksi < 3.5.0.0)
+fi
+AM_CONDITIONAL(ENABLE_GT_KSI, test x$enable_gt_ksi = xyes)
 
 
 # liblogging-stdlog support
@@ -1123,6 +1320,29 @@ if test "x$enable_testbench" = "xyes"; then
 		AC_MSG_ERROR("--enable-testbench requires --enable-imdiag")
 	fi
 fi
+
+
+# valgrind-testbench
+AC_ARG_WITH([valgrind_testbench],
+        [AS_HELP_STRING([--without-valgrind-testbench], [Don't use valgrind in testbench])]
+)
+
+if test "x$with_valgrind_testbench" != "xno"; then
+        AC_CHECK_PROG(VALGRIND, [valgrind], [valgrind], [no])
+
+        if test "x$enable_testbench" = "xyes" && test "x$VALGRIND" = "xno"; then
+                if test "x$with_valgrind_testbench" = "xyes"; then
+                        AC_MSG_ERROR([valgrind is missing but forced with --with-valgrind-testbench. Either install valgrind or remove the option!])
+                else
+                        AC_MSG_WARN([valgrind is missing -- testbench won't use valgrind!])
+                fi
+        else
+                AC_MSG_NOTICE([testbench will use valgrind])
+        fi
+else
+	AC_MSG_NOTICE([testbench won't use valgrind due to set --without-valgrind-testbench option])
+fi
+AM_CONDITIONAL([HAVE_VALGRIND], [test "x$with_valgrind_testbench" != "xno" && test "x$VALGRIND" != "xno"])
 
 
 # settings for the file input module
@@ -1288,6 +1508,19 @@ AC_ARG_ENABLE(pmciscoios,
 AM_CONDITIONAL(ENABLE_PMCISCOIOS, test x$enable_pmciscoios = xyes)
 
 
+# settings for pmnull
+AC_ARG_ENABLE(pmnull,
+        [AS_HELP_STRING([--enable-pmnull],[Compiles null parser module @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_pmnull="yes" ;;
+          no) enable_pmnull="no" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-pmnull) ;;
+         esac],
+        [enable_pmnull=no]
+)
+AM_CONDITIONAL(ENABLE_PMNULL, test x$enable_pmnull = xyes)
+
+
 # settings for pmaixforwardedfrom
 AC_ARG_ENABLE(pmaixforwardedfrom,
         [AS_HELP_STRING([--enable-pmaixforwardedfrom],[Compiles aixforwardedfrom parser module @<:@default=no@:>@])],
@@ -1312,6 +1545,19 @@ AC_ARG_ENABLE(pmsnare,
         [enable_pmsnare=no]
 )
 AM_CONDITIONAL(ENABLE_PMSNARE, test x$enable_pmsnare = xyes)
+
+
+# settings for pmpanngfw
+AC_ARG_ENABLE(pmpanngfw,
+        [AS_HELP_STRING([--enable-pmpanngfw],[Compiles Palo Alto Networks parser module @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_pmpanngfw="yes" ;;
+          no) enable_pmpanngfw="no" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-pmpanngfw) ;;
+         esac],
+        [enable_pmpanngfw=no]
+)
+AM_CONDITIONAL(ENABLE_PMPANNGFW, test x$enable_pmpanngfw = xyes)
 
 
 # settings for omruleset
@@ -1379,12 +1625,45 @@ AC_ARG_ENABLE(omkafka,
          esac],
         [enable_omkafka=no]
 )
-if test "x$enable_omkafka"; then
-	#PKG_CHECK_MODULES(LIBRDKAFKA, librdkafka)
+AC_ARG_ENABLE(kafka_tests,
+        [AS_HELP_STRING([--enable-kafka-tests],[Enable Kafka tests, needs Java @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_kafka_tests="yes" ;;
+          no) enable_kafka_tests="no" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-kafka-tests) ;;
+         esac],
+        [enable_kafka_tests=no]
+)
+AM_CONDITIONAL(ENABLE_KAFKA_TESTS, test x$enable_kafka_tests = xyes)
+
+if test "x$enable_omkafka" = "xyes"; then
+	if test "x$enable_kafka_tests" = "xyes"; then
+		AX_PROG_JAVAC #we don't need javac, but macro documentation says JAVAC *must* be checked before JAVA
+		AX_PROG_JAVA
+		AC_CHECK_PROG(WGET, [wget], [yes], [no])
+		if test "x${WGET}" = "xno"; then
+			AC_MSG_FAILURE([wget, which is a kafka-tests dependency, not found])
+		fi
+		AC_CHECK_PROG(READLINK, [readlink], [yes], [no])
+		if test "x${READLINK}" = "xno"; then
+			AC_MSG_FAILURE([readlink, which is a kafka-tests dependency, not found])
+		fi
+	fi
+	PKG_CHECK_MODULES([LIBRDKAFKA], [librdkafka],, [
+		AC_CHECK_LIB([rdkafka], [rd_kafka_produce], [
+			AC_MSG_WARN([librdkafka is missing but library present, using -lrdkafka])
+			LIBRDKAFKA_LIBS=-lrdkafka
+		], [
+			AC_MSG_ERROR([could not find rdkafka library])
+		])
+	])
 	AC_CHECK_HEADERS([librdkafka/rdkafka.h])
+else
+	if test "x$enable_kafka_tests" = "xyes"; then
+		AC_MSG_ERROR([kafka-tests can not be enabled while omkafka is disabled])
+	fi
 fi
 AM_CONDITIONAL(ENABLE_OMKAFKA, test x$enable_omkafka = xyes)
-
 
 #MONGODB SUPPORT
 
@@ -1505,55 +1784,155 @@ AC_ARG_ENABLE(omhiredis,
 )
 #
 if test "x$enable_omhiredis" = "xyes"; then
-	PKG_CHECK_MODULES(HIREDIS, hiredis >= 0.10.1)
+    PKG_CHECK_MODULES(HIREDIS, hiredis >= 0.10.1, [],
+        [AC_SEARCH_LIBS(redisConnectWithTimeout, hiredis,
+            [AC_COMPILE_IFELSE(
+                [AC_LANG_PROGRAM(
+                    [[ #include <hiredis/hiredis.h> ]],
+                    [[ #define major 0
+                       #define minor 10
+                       #define patch 1
+                       #if (( HIREDIS_MAJOR > major ) || \
+                         (( HIREDIS_MAJOR == major ) && ( HIREDIS_MINOR > minor )) || \
+                         (( HIREDIS_MAJOR == major ) && ( HIREDIS_MINOR == minor ) && ( HIREDIS_PATCH >= patch ))) \
+                       /* OK */
+                       #else
+                       # error Hiredis version must be >= major.minor.path
+                       #endif
+                    ]]
+                )],
+                [],
+                [AC_MSG_ERROR([hiredis version must be >= 0.10.1])]
+            )],
+            [AC_MSG_ERROR([hiredis not found])]
+        )]
+    )
 fi
 AM_CONDITIONAL(ENABLE_OMHIREDIS, test x$enable_omhiredis = xyes)
 
 # END HIREDIS SUPPORT
 
 
+# HTTPFS SUPPORT
+
+AC_ARG_ENABLE(omhttpfs,
+        [AS_HELP_STRING([--enable-omhttpfs],[Compiles omhttpfs template module @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_omhttpfs="yes" ;;
+          no) enable_omhttpfs="no" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-omhttpfs) ;;
+         esac],
+        [enable_omhttpfs=no]
+)
+
+if test "x$enable_omhttpfs" = "xyes"; then
+	AC_CHECK_HEADERS([curl/curl.h])
+	PKG_CHECK_MODULES([CURL], [libcurl])
+	LT_LIB_M
+	#PKG_CHECK_MODULES(HTTPFS, curl >= 7.0.0)
+fi
+AM_CONDITIONAL(ENABLE_OMHTTPFS, test x$enable_omhttpfs = xyes)
+
+# END HTTPFS SUPPORT
+
+# AMQP 1.0 PROTOCOL SUPPORT
+# uses the Proton protocol library
+
+AC_ARG_ENABLE(omamqp1,
+        [AS_HELP_STRING([--enable-omamqp1],[Compiles omamqp1 output module @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_omamqp1="yes" ;;
+          no) enable_omamqp1="no" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-omamqp1) ;;
+         esac],
+        [enable_omamqp1=no]
+)
+if test "x$enable_omamqp1" = "xyes"; then
+        PKG_CHECK_MODULES(PROTON, libqpid-proton >= 0.9)
+        AC_SUBST(PROTON_CFLAGS)
+        AC_SUBST(PROTON_LIBS)
+fi
+AM_CONDITIONAL(ENABLE_OMAMQP1, test x$enable_omamqp1 = xyes)
+
+# END AMQP 1.0 PROTOCOL SUPPORT
+
+# TCL SUPPORT
+
+AC_ARG_ENABLE(omtcl,
+        [AS_HELP_STRING([--enable-omtcl],[Compiles omtcl output module @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_omtcl="yes" ;;
+          no) enable_omtcl="no" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-omtcl) ;;
+         esac],
+        [enable_omtcl=no]
+)
+
+if test "x$enable_omtcl" = "xyes"; then
+	SC_PATH_TCLCONFIG
+	SC_LOAD_TCLCONFIG
+	AC_SUBST(TCL_INCLUDE_SPEC)
+fi
+AM_CONDITIONAL(ENABLE_OMTCL, test x$enable_omtcl = xyes)
+
+# END TCL SUPPORT
+
+# man pages
 AC_CHECKING([if required man pages already exist])
 have_to_generate_man_pages="no"
-
-# man pages for libgcrypt module
-if test "x$enable_usertools" = "xyes" && test "x$enable_libgcrypt" = "xyes"; then
-    AC_CHECK_FILES(["tools/rscryutil.1" "tools/rsgtutil.1"],
-        [],
-        [have_to_generate_man_pages="yes"]
-    )
-fi
-
-# man pages for GuardTime module
-if test "x$enable_usertools" = "xyes" && test "x$enable_guardtime" = "xyes"; then
-    AC_CHECK_FILES(["tools/rscryutil.1" "tools/rsgtutil.1"],
-        [],
-        [have_to_generate_man_pages="yes"]
-    )
-fi
-
 AC_ARG_ENABLE(generate-man-pages,
-        [AS_HELP_STRING([--enable-generate-man-pages],[Generate man pages from source @<:@default=yes@:>@])],
+        [AS_HELP_STRING([--enable-generate-man-pages],[Generate man pages from source @<:@default=no@:>@])],
         [case "${enableval}" in
          yes) have_to_generate_man_pages="yes" ;;
           no) have_to_generate_man_pages="no" ;;
            *) AC_MSG_ERROR(bad value ${enableval} for --enable-generate-man-pages) ;;
          esac],
-        [have_to_generate_man_pages=yes]
+        [have_to_generate_man_pages=no]
 )
 
-if test "x$have_to_generate_man_pages" = "xyes"; then
-    AC_MSG_RESULT([Some man pages are missing or --enable-generate-man-pages given. We need rst2man to generate man pages from source...])
+
+# This provides a work-around to use "make distcheck" by disabling
+# some tests that do have problems with the distcheck environment.
+AC_ARG_ENABLE(distcheck-workaround,
+        [AS_HELP_STRING([--enable-distcheck-workaround],[enable to use make distcheck by disabling some tests that do not support the distcheck environment @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_distcheck_workaround="yes" ;;
+          no) enable_distcheck_workaround="no" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-distcheck_workaround) ;;
+         esac],
+        [enable_distcheck_workaround="no"]
+)
+AM_CONDITIONAL(ENABLE_DISTCHECK_WORKAROUND, test x$enable_distcheck_workaround = xyes)
+
+
+if test "x$in_git_src" = "xyes"; then
+        AC_MSG_NOTICE([Running from git source])
+
+        have_to_generate_man_pages=yes
+
+        if test "x$LEX" != "xflex"; then
+                AC_MSG_ERROR([flex program is needed to build rsyslog, please install flex.])
+        fi
+
+        if test "x$YACC" = "xyacc"; then
+                # AC_PROG_YACC only checks for yacc replacements, not for yacc itself
+                AC_CHECK_PROG([YACC_FOUND], [yacc], [yes], [no])
+                if test "x$YACC_FOUND" = "xno"; then
+                        AC_MSG_ERROR([A yacc program is needed to build rsyslog, please install bison.])
+                fi
+        fi
 else
-    AC_MSG_RESULT([All required man pages found. We don't need rst2man!])
+        AC_MSG_NOTICE([Not running from git source])
 fi
 
-if test "x$have_to_generate_man_pages" = "xyes"; then
-    # We need rst2man to generate our man pages
-    AC_CHECK_PROGS([RST2MAN], [rst2man rst2man.py], [])
-    if test -z "$RST2MAN"; then
-        AC_MSG_ERROR([rst2man is required to build man pages. You can use the release tarball with pregenerated man pages to avoid this depedency. Use the --disable-generate-man-pages configure option in that case.])
-    fi
+AM_CONDITIONAL(ENABLE_GENERATE_MAN_PAGES, test x$have_to_generate_man_pages = xyes)
+
+# rst2man
+AC_CHECK_PROGS([RST2MAN], [rst2man rst2man.py], [false])
+if test "x$have_to_generate_man_pages" = "xyes" && test "x$RST2MAN" = "xfalse"; then
+        AC_MSG_ERROR([rst2man is required when building from git source or --enable-generate-man-pages option was set, please install python-docutils.])
 fi
+
 
 AC_CONFIG_FILES([Makefile \
 		runtime/Makefile \
@@ -1575,6 +1954,7 @@ AC_CONFIG_FILES([Makefile \
 		plugins/omstdout/Makefile \
 		plugins/omjournal/Makefile \
 		plugins/pmciscoios/Makefile \
+		plugins/pmnull/Makefile \
 		plugins/omruleset/Makefile \
 		plugins/omuxsock/Makefile \
 		plugins/imfile/Makefile \
@@ -1597,6 +1977,7 @@ AC_CONFIG_FILES([Makefile \
 		plugins/mmjsonparse/Makefile \
 		plugins/mmaudit/Makefile \
 		plugins/mmanon/Makefile \
+		plugins/mmrm1stspace/Makefile \
 		plugins/mmutf8fix/Makefile \
 		plugins/mmfields/Makefile \
 		plugins/mmpstrucdata/Makefile \
@@ -1604,18 +1985,24 @@ AC_CONFIG_FILES([Makefile \
 		plugins/mmsnmptrapd/Makefile \
 		plugins/pmlastmsg/Makefile \
 		contrib/pmsnare/Makefile \
+		contrib/pmpanngfw/Makefile \
 		contrib/pmaixforwardedfrom/Makefile \
 		contrib/omhiredis/Makefile \
 		contrib/omrabbitmq/Makefile \
 		contrib/imkmsg/Makefile \
+		contrib/mmgrok/Makefile \
 		contrib/mmcount/Makefile \
 		contrib/omzmq3/Makefile \
 		contrib/omczmq/Makefile \
 		contrib/imzmq3/Makefile \
 		contrib/imczmq/Makefile \
 		contrib/mmsequence/Makefile \
+		contrib/mmdblookup/Makefile \
 		contrib/mmrfc5424addhmac/Makefile \
 		contrib/pmcisconames/Makefile \
+		contrib/omhttpfs/Makefile \
+		contrib/omamqp1/Makefile \
+		contrib/omtcl/Makefile \
 		tests/Makefile])
 AC_OUTPUT
 
@@ -1631,8 +2018,10 @@ echo "    have to generate man pages:               $have_to_generate_man_pages"
 echo "    Unlimited select() support enabled:       $enable_unlimited_select"
 echo "    uuid support enabled:                     $enable_uuid"
 echo "    Log file signing support:                 $enable_guardtime"
+echo "    Log file signing support via KSI:         $enable_gt_ksi"
 echo "    Log file encryption support:              $enable_libgcrypt"
 echo "    anonymization support enabled:            $enable_mmanon"
+echo "    mmrm1stspace module enabled:              $enable_mmrm1stspace"
 echo "    message counting support enabled:         $enable_mmcount"
 echo "    mmfields enabled:                         $enable_mmfields"
 echo "    liblogging-stdlog support enabled:        $enable_liblogging_stdlog"
@@ -1663,23 +2052,30 @@ echo "    omuxsock module will be compiled:         $enable_omuxsock"
 echo "    omzmq3 module will be compiled:           $enable_omzmq3"
 echo "    omczmq module will be compiled:           $enable_omczmq"
 echo "    omrabbitmq module will be compiled:       $enable_omrabbitmq"
+echo "    omhttpfs module will be compiled:         $enable_omhttpfs"
+echo "    omamqp1 module will be compiled:          $enable_omamqp1"
+echo "    omtcl module will be compiled:            $enable_omtcl"
 echo
 echo "---{ parser modules }---"
 echo "    pmlastmsg module will be compiled:        $enable_pmlastmsg"
 echo "    pmcisconames module will be compiled:     $enable_pmcisconames"
 echo "    pmciscoios module will be compiled:       $enable_pmciscoios"
+echo "    pmnull module will be compiled:           $enable_pmnull"
 echo "    pmaixforwardedfrom module w.be compiled:  $enable_pmaixforwardedfrom"
 echo "    pmsnare module will be compiled:          $enable_pmsnare"
+echo "    pmpanngfw module will be compiled:        $enable_pmpanngfw"
 echo
 echo "---{ message modification modules }---"
 echo "    mmnormalize module will be compiled:      $enable_mmnormalize"
 echo "    mmjsonparse module will be compiled:      $enable_mmjsonparse"
+echo "    mmgrok module will be compiled:           $enable_mmgrok"
 echo "    mmjaduit module will be compiled:         $enable_mmaudit"
 echo "    mmsnmptrapd module will be compiled:      $enable_mmsnmptrapd"
 echo "    mmutf8fix enabled:                        $enable_mmutf8fix"
 echo "    mmrfc5424addhmac enabled:                 $enable_mmrfc5424addhmac"
 echo "    mmpstrucdata enabled:                     $enable_mmpstrucdata"
 echo "    mmsequence enabled:                       $enable_mmsequence"
+echo "    mmdblookup enabled:                       $enable_mmdblookup"
 echo
 echo "---{ database support }---"
 echo "    MySql support enabled:                    $enable_mysql"
@@ -1698,6 +2094,8 @@ echo "---{ debugging support }---"
 echo "    Testbench enabled:                        $enable_testbench"
 echo "    Extended Testbench enabled:               $enable_extended_tests"
 echo "    MySQL Tests enabled:                      $enable_mysql_tests"
+echo "    PostgreSQL Tests enabled:                 $enable_pgsql_tests"
+echo "    Kafka Tests enabled:                      $enable_kafka_tests"
 echo "    Debug mode enabled:                       $enable_debug"
 echo "    Runtime Instrumentation enabled:          $enable_rtinst"
 echo "    (total) debugless mode enabled:           $enable_debugless"

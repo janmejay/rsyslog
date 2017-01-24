@@ -1,6 +1,6 @@
 /* Definitions for network-related stuff.
  *
- * Copyright 2007-2013 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2007-2016 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
@@ -24,6 +24,7 @@
 #ifndef INCLUDED_NET_H
 #define INCLUDED_NET_H
 
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h> /* this is needed on HP UX -- rgerhards, 2008-03-04 */
 
@@ -32,12 +33,21 @@ typedef enum _TCPFRAMINGMODE {
 		TCP_FRAMING_OCTET_COUNTING = 1  /* -transport-tls like octet count */
 	} TCPFRAMINGMODE;
 
-#define   F_SET(where, flag) (where)|=(flag)
-#define F_ISSET(where, flag) ((where)&(flag))==(flag)
-#define F_UNSET(where, flag) (where)&=~(flag)
+#define   F_SET(where, flag) ((where)|=(flag))
+#define F_ISSET(where, flag) (((where)&(flag))==(flag))
+#define F_UNSET(where, flag) ((where)&=~(flag))
 
 #define ADDR_NAME 0x01 /* address is hostname wildcard) */
 #define ADDR_PRI6 0x02 /* use IPv6 address prior to IPv4 when resolving */
+
+/* portability: incase IP_FREEBIND is not defined */
+#ifndef IP_FREEBIND
+#define IP_FREEBIND 0
+#endif
+/* defines for IP_FREEBIND, currently being used in imudp */
+#define IPFREEBIND_DISABLED 0x00 /* don't enable IP_FREEBIND in  sock option */
+#define IPFREEBIND_ENABLED_NO_LOG 0x01 /* enable IP_FREEBIND but no warn on success */
+#define IPFREEBIND_ENABLED_WITH_LOG 0x02 /* enable IP_FREEBIND and warn on success */
 
 #ifdef OS_BSD
 #	ifndef _KERNEL
@@ -75,7 +85,8 @@ struct NetAddr {
 #ifdef HAVE_STRUCT_SOCKADDR_SA_LEN
 #define SALEN(sa) ((sa)->sa_len)
 #else
-static inline size_t SALEN(struct sockaddr *sa) {
+static inline size_t __attribute__((unused))
+SALEN(struct sockaddr *sa) {
 	switch (sa->sa_family) {
 	case AF_INET:  return (sizeof (struct sockaddr_in));
 	case AF_INET6: return (sizeof (struct sockaddr_in6));
@@ -137,7 +148,7 @@ BEGINinterface(net) /* name must also be changed in ENDinterface macro! */
 	void (*PrintAllowedSenders)(int iListToPrint);
 	void (*clearAllowedSenders)(uchar*);
 	void (*debugListenInfo)(int fd, char *type);
-	int *(*create_udp_socket)(uchar *hostname, uchar *LogPort, int bIsServer, int rcvbuf);
+	int *(*create_udp_socket)(uchar *hostname, uchar *LogPort, int bIsServer, int rcvbuf, int ipfreebind, char *device);
 	void (*closeUDPListenSockets)(int *finet);
 	int (*isAllowedSender)(uchar *pszType, struct sockaddr *pFrom, const char *pszFromHost); /* deprecated! */
 	rsRetVal (*getLocalHostname)(uchar**);
@@ -157,8 +168,9 @@ BEGINinterface(net) /* name must also be changed in ENDinterface macro! */
 	int    *pACLAddHostnameOnFail; /* add hostname to acl when DNS resolving has failed */
 	int    *pACLDontResolve;       /* add hostname to acl instead of resolving it to IP(s) */
 	/* v8 cvthname() signature change -- rgerhards, 2013-01-18 */
+	/* v9 create_udp_socket() signature change -- dsahern, 2016-11-11 */
 ENDinterface(net)
-#define netCURR_IF_VERSION 8 /* increment whenever you change the interface structure! */
+#define netCURR_IF_VERSION 9 /* increment whenever you change the interface structure! */
 
 /* prototypes */
 PROTOTYPEObj(net);

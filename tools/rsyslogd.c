@@ -3,18 +3,18 @@
  * because it was either written from scratch by me (rgerhards) or
  * contributors who agreed to ASL 2.0.
  *
- * Copyright 2004-2015 Rainer Gerhards and Adiscon
+ * Copyright 2004-2016 Rainer Gerhards and Adiscon
  *
  * This file is part of rsyslog.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
+ *
  *       http://www.apache.org/licenses/LICENSE-2.0
  *       -or-
  *       see COPYING.ASL20 in the source distribution
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -25,9 +25,13 @@
 #include "rsyslog.h"
 
 #include <signal.h>
+#include <stdlib.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 #ifdef HAVE_LIBLOGGING_STDLOG
 #  include <liblogging/stdlog.h>
+#else
+#  include <syslog.h>
 #endif
 #ifdef OS_SOLARIS
 #	include <errno.h>
@@ -59,6 +63,59 @@
 #include "dirty.h"
 #include "janitor.h"
 
+#if defined(_AIX)
+/* AIXPORT : start
+ * The following includes and declarations are for support of the System
+ * Resource Controller (SRC) .
+ */
+static void deinitAll(void);
+#include <spc.h>
+static  struct srcreq srcpacket;
+int     cont;
+struct  srchdr *srchdr;
+char    progname[128];
+
+
+/* Normally defined as locals in main
+ * But here since the functionality is split
+ * across multiple functions, we make it global
+ */
+static int rc;
+static socklen_t addrsz;
+static struct sockaddr srcaddr;
+static int ch;
+extern int optind;
+extern char *optarg;
+static  struct filed *f;
+int src_exists =  TRUE;
+/* src end */
+
+/*
+ * SRC packet processing - .
+ */
+#define SRCMIN(a, b)  (a < b) ? a : b
+void
+dosrcpacket(msgno, txt, len)
+	int msgno;
+	char *txt;
+	int len;
+{
+	struct srcrep reply;
+
+	reply.svrreply.rtncode = msgno;
+/* AIXPORT :  srv was corrected to syslogd */
+	strcpy(reply.svrreply.objname, "syslogd");
+	snprintf(reply.svrreply.rtnmsg,
+		SRCMIN(sizeof(reply.svrreply.rtnmsg)-1, strlen(txt)), "%s", txt);
+	srchdr = srcrrqs((char *)&srcpacket);
+	srcsrpy(srchdr, (char *)&reply, len, cont);
+}
+
+#endif
+
+/* AIXPORT : end  */
+
+
 DEFobjCurrIf(obj)
 DEFobjCurrIf(prop)
 DEFobjCurrIf(parser)
@@ -86,7 +143,11 @@ void rsyslogdDoDie(int sig);
 
 
 #ifndef PATH_PIDFILE
+#if defined(_AIX)  /* AIXPORT : Add _AIX */
+#	define PATH_PIDFILE "/etc/rsyslogd.pid"
+#else
 #	define PATH_PIDFILE "/var/run/rsyslogd.pid"
+#endif /*_AIX*/
 #endif
 
 /* global data items */
@@ -97,7 +158,7 @@ int bFinished = 0;	/* used by termination signal handler, read-only except there
 			 * is either 0 or the number of the signal that requested the
  			 * termination.
 			 */
-uchar *PidFile = (uchar*) PATH_PIDFILE;
+const char *PidFile = PATH_PIDFILE;
 int iConfigVerify = 0;	/* is this just a config verify run? */
 rsconf_t *ourConf = NULL;	/* our config object */
 int MarkInterval = 20 * 60;	/* interval between marks in seconds - read-only after startup */
@@ -118,7 +179,7 @@ static struct queuefilenames_s {
 } *queuefilenames = NULL;
 
 
-void
+static __attribute__((noreturn)) void
 rsyslogd_usage(void)
 {
 	fprintf(stderr, "usage: rsyslogd [options]\n"
@@ -140,11 +201,11 @@ setsid(void)
 #endif
 
 
-rsRetVal // TODO: make static
+static rsRetVal
 queryLocalHostname(void)
 {
-	uchar *LocalHostName;
-	uchar *LocalDomain;
+	uchar *LocalHostName = NULL;
+	uchar *LocalDomain = NULL;
 	uchar *LocalFQDNName;
 	DEFiRet;
 
@@ -163,25 +224,64 @@ queryLocalHostname(void)
 	glbl.SetLocalHostName(LocalHostName);
 	glbl.SetLocalDomain(LocalDomain);
 	glbl.GenerateLocalHostNameProperty();
+	LocalHostName = NULL; /* handed over */
+	LocalDomain = NULL; /* handed over */
 
 finalize_it:
+	free(LocalHostName);
+	free(LocalDomain);
 	RETiRet;
 }
 
-rsRetVal writePidFile(void)
+static rsRetVal
+writePidFile(void)
 {
 	FILE *fp;
 	DEFiRet;
-	
-	DBGPRINTF("rsyslogd: writing pidfile '%s'.\n", PidFile);
-	if((fp = fopen((char*) PidFile, "w")) == NULL) {
-		fprintf(stderr, "rsyslogd: error writing pid file\n");
+
+	const char *tmpPidFile;
+#if defined(_AIX)
+	int  pidfile_namelen = 0;
+#endif
+
+#ifndef _AIX
+	if(asprintf((char **)&tmpPidFile, "%s.tmp", PidFile) == -1) {
+		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+	}
+	if(tmpPidFile == NULL)
+		tmpPidFile = PidFile;
+#else
+	/* Since above code uses format as  "%s.tmp"
+	* pidfile_namelen will be
+	* length of string "PidFile" + 1 + length of string ".tmp"
+	*/
+	pidfile_namelen = strlen(PidFile)+ strlen(".tmp") + 1;
+	tmpPidFile=(char *)malloc(sizeof(char)*pidfile_namelen);
+	if(tmpPidFile == NULL)
+		tmpPidFile = PidFile;
+	else
+	{
+		memset((void *)tmpPidFile,NULL,pidfile_namelen);
+		if(snprintf((char* restrict)tmpPidFile, pidfile_namelen, "%s.tmp", PidFile) >= pidfile_namelen)
+				ABORT_FINALIZE(RS_RET_ERR);
+	}
+
+#endif
+	DBGPRINTF("rsyslogd: writing pidfile '%s'.\n", tmpPidFile);
+	if((fp = fopen((char*) tmpPidFile, "w")) == NULL) {
+		perror("rsyslogd: error writing pid file (creation stage)\n");
 		ABORT_FINALIZE(RS_RET_ERR);
 	}
 	if(fprintf(fp, "%d", (int) glblGetOurPid()) < 0) {
 		errmsg.LogError(errno, iRet, "rsyslog: error writing pid file");
 	}
 	fclose(fp);
+	if(tmpPidFile != PidFile) {
+		if(rename(tmpPidFile, PidFile) != 0) {
+			perror("rsyslogd: error writing pid file (rename stage)");
+		}
+		free((void*)tmpPidFile);
+	}
 finalize_it:
 	RETiRet;
 }
@@ -189,7 +289,8 @@ finalize_it:
 /* duplicate startup protection: check, based on pid file, if our instance
  * is already running. This MUST be called before we write our own pid file.
  */
-rsRetVal checkStartupOK(void)
+static rsRetVal
+checkStartupOK(void)
 {
 	FILE *fp = NULL;
 	DEFiRet;
@@ -211,7 +312,7 @@ rsRetVal checkStartupOK(void)
 			"If you want to run multiple instances of rsyslog, you need "
 			"to specify\n"
 			"different pid files for them (-i option).\n",
-			PidFile, getpid());
+			PidFile, (int) getpid());
 		ABORT_FINALIZE(RS_RET_ERR);
 	}
 
@@ -252,7 +353,7 @@ prepareBackground(const int parentPipeFD)
 			const int lstnPidI = atoi(lstnPid);
 			snprintf(szBuf, sizeof(szBuf), "%d", lstnPidI);
 			if(!strcmp(szBuf, lstnPid) && lstnPidI == getppid()) {
-				snprintf(szBuf, sizeof(szBuf), "%d", getpid());
+				snprintf(szBuf, sizeof(szBuf), "%d", (int) getpid());
 				setenv("LISTEN_PID", szBuf, 1);
 				/* ensure we do not close what systemd provided */
 				const int nFds = sd_listen_fds(0);
@@ -268,7 +369,17 @@ prepareBackground(const int parentPipeFD)
 	close(0);
 	for(int i = beginClose ; i <= endClose ; ++i) {
 		if((i != dbgGetDbglogFd()) && (i != parentPipeFD)) {
-			close(i);
+/* AIXPORT : src support start */
+#if defined(_AIX)
+			if(src_exists)
+			{
+				if(i != SRC_FD)
+					(void)close(i);
+			}
+			else
+#endif
+/* AIXPORT : src support end */
+				close(i);
 		}
 	}
 }
@@ -280,7 +391,7 @@ prepareBackground(const int parentPipeFD)
  * return: file descriptor to which the child needs to write an "OK" or error
  * message.
  */
-int
+static int
 forkRsyslog(void)
 {
 	int pipefd[2];
@@ -293,12 +404,22 @@ forkRsyslog(void)
 		perror("error creating rsyslog \"fork pipe\" - terminating");
 		exit(1);
 	}
-
+	/* AIXPORT : src support start */
+#if defined(_AIX)
+	if(!src_exists)
+	{
+#endif
+	/* AIXPORT : src support end */
 	cpid = fork();
 	if(cpid == -1) {
 		perror("error forking rsyslogd process - terminating");
 		exit(1);
 	}
+	/* AIXPORT : src support start */
+#if defined(_AIX)
+	}
+#endif
+	/* AIXPORT : src support end */
 
 	if(cpid == 0) {    
 		prepareBackground(pipefd[1]);
@@ -358,7 +479,7 @@ forkRsyslog(void)
  * and the parent may terminate.
  */
 static void
-tellChildReady(int pipefd, char *const msg)
+tellChildReady(const int pipefd, const char *const msg)
 {
 	dbgprintf("rsyslogd: child signaling OK\n");
 	const int nWritten = write(pipefd, msg, strlen(msg));
@@ -415,15 +536,14 @@ printVersion(void)
 #else
 	printf("\tuuid support:\t\t\t\tNo\n");
 #endif
-#ifdef HAVE_JSON_OBJECT_NEW_INT64
+	/* we keep the following message to so that users don't need
+	 * to wonder.
+	 */
 	printf("\tNumber of Bits in RainerScript integers: 64\n");
-#else
-	printf("\tNumber of Bits in RainerScript integers: 32 (due to too-old json-c lib)\n");
-#endif
 	printf("\nSee http://www.rsyslog.com for more information.\n");
 }
 
-rsRetVal
+static rsRetVal
 rsyslogd_InitStdRatelimiters(void)
 {
 	DEFiRet;
@@ -441,11 +561,11 @@ finalize_it:
  * rgerhards, 2008-01-04
  * rgerhards, 2008-04-16: the actual initialization is now carried out by the runtime
  */
-rsRetVal
+static rsRetVal
 rsyslogd_InitGlobalClasses(void)
 {
 	DEFiRet;
-	char *pErrObj; /* tells us which object failed if that happens (useful for troubleshooting!) */
+	const char *pErrObj; /* tells us which object failed if that happens (useful for troubleshooting!) */
 
 	/* Intialize the runtime system */
 	pErrObj = "rsyslog runtime"; /* set in case the runtime errors before setting an object */
@@ -511,7 +631,7 @@ finalize_it:
  * it helps us keep up the overall concurrency level.
  * rgerhards, 2010-06-09
  */
-static inline rsRetVal
+static rsRetVal
 preprocessBatch(batch_t *pBatch, int *pbShutdownImmediate) {
 	prop_t *ip;
 	prop_t *fqdn;
@@ -519,7 +639,7 @@ preprocessBatch(batch_t *pBatch, int *pbShutdownImmediate) {
 	prop_t *propFromHost = NULL;
 	prop_t *propFromHostIP = NULL;
 	int bIsPermitted;
-	msg_t *pMsg;
+	smsg_t *pMsg;
 	int i;
 	rsRetVal localRet;
 	DEFiRet;
@@ -597,7 +717,8 @@ rsRetVal createMainQueue(qqueue_t **ppQueue, uchar *pszQueueName, struct nvlst *
 	DEFiRet;
 
 	/* create message queue */
-	CHKiRet_Hdlr(qqueueConstruct(ppQueue, ourConf->globals.mainQ.MainMsgQueType, ourConf->globals.mainQ.iMainMsgQueueNumWorkers, ourConf->globals.mainQ.iMainMsgQueueSize, msgConsumer)) {
+	CHKiRet_Hdlr(qqueueConstruct(ppQueue, ourConf->globals.mainQ.MainMsgQueType,
+	ourConf->globals.mainQ.iMainMsgQueueNumWorkers, ourConf->globals.mainQ.iMainMsgQueueSize, msgConsumer)) {
 		/* no queue is fatal, we need to give up in that case... */
 		errmsg.LogError(0, iRet, "could not create (ruleset) main message queue"); \
 	}
@@ -637,25 +758,42 @@ rsRetVal createMainQueue(qqueue_t **ppQueue, uchar *pszQueueName, struct nvlst *
 			queuefilenames = qfn;
 		}
 
-		setQPROP(qqueueSetMaxFileSize, "$MainMsgQueueFileSize", ourConf->globals.mainQ.iMainMsgQueMaxFileSize);
-		setQPROP(qqueueSetsizeOnDiskMax, "$MainMsgQueueMaxDiskSpace", ourConf->globals.mainQ.iMainMsgQueMaxDiskSpace);
-		setQPROP(qqueueSetiDeqBatchSize, "$MainMsgQueueDequeueBatchSize", ourConf->globals.mainQ.iMainMsgQueDeqBatchSize);
+		setQPROP(qqueueSetMaxFileSize, "$MainMsgQueueFileSize",
+			ourConf->globals.mainQ.iMainMsgQueMaxFileSize);
+		setQPROP(qqueueSetsizeOnDiskMax, "$MainMsgQueueMaxDiskSpace",
+			ourConf->globals.mainQ.iMainMsgQueMaxDiskSpace);
+		setQPROP(qqueueSetiDeqBatchSize, "$MainMsgQueueDequeueBatchSize",
+			ourConf->globals.mainQ.iMainMsgQueDeqBatchSize);
 		setQPROPstr(qqueueSetFilePrefix, "$MainMsgQueueFileName", qfname);
-		setQPROP(qqueueSetiPersistUpdCnt, "$MainMsgQueueCheckpointInterval", ourConf->globals.mainQ.iMainMsgQPersistUpdCnt);
-		setQPROP(qqueueSetbSyncQueueFiles, "$MainMsgQueueSyncQueueFiles", ourConf->globals.mainQ.bMainMsgQSyncQeueFiles);
-		setQPROP(qqueueSettoQShutdown, "$MainMsgQueueTimeoutShutdown", ourConf->globals.mainQ.iMainMsgQtoQShutdown );
-		setQPROP(qqueueSettoActShutdown, "$MainMsgQueueTimeoutActionCompletion", ourConf->globals.mainQ.iMainMsgQtoActShutdown);
-		setQPROP(qqueueSettoWrkShutdown, "$MainMsgQueueWorkerTimeoutThreadShutdown", ourConf->globals.mainQ.iMainMsgQtoWrkShutdown);
+		setQPROP(qqueueSetiPersistUpdCnt, "$MainMsgQueueCheckpointInterval",
+			ourConf->globals.mainQ.iMainMsgQPersistUpdCnt);
+		setQPROP(qqueueSetbSyncQueueFiles, "$MainMsgQueueSyncQueueFiles",
+			ourConf->globals.mainQ.bMainMsgQSyncQeueFiles);
+		setQPROP(qqueueSettoQShutdown, "$MainMsgQueueTimeoutShutdown",
+			ourConf->globals.mainQ.iMainMsgQtoQShutdown );
+		setQPROP(qqueueSettoActShutdown, "$MainMsgQueueTimeoutActionCompletion",
+			ourConf->globals.mainQ.iMainMsgQtoActShutdown);
+		setQPROP(qqueueSettoWrkShutdown, "$MainMsgQueueWorkerTimeoutThreadShutdown",
+			ourConf->globals.mainQ.iMainMsgQtoWrkShutdown);
 		setQPROP(qqueueSettoEnq, "$MainMsgQueueTimeoutEnqueue", ourConf->globals.mainQ.iMainMsgQtoEnq);
-		setQPROP(qqueueSetiHighWtrMrk, "$MainMsgQueueHighWaterMark", ourConf->globals.mainQ.iMainMsgQHighWtrMark);
-		setQPROP(qqueueSetiLowWtrMrk, "$MainMsgQueueLowWaterMark", ourConf->globals.mainQ.iMainMsgQLowWtrMark);
-		setQPROP(qqueueSetiDiscardMrk, "$MainMsgQueueDiscardMark", ourConf->globals.mainQ.iMainMsgQDiscardMark);
-		setQPROP(qqueueSetiDiscardSeverity, "$MainMsgQueueDiscardSeverity", ourConf->globals.mainQ.iMainMsgQDiscardSeverity);
-		setQPROP(qqueueSetiMinMsgsPerWrkr, "$MainMsgQueueWorkerThreadMinimumMessages", ourConf->globals.mainQ.iMainMsgQWrkMinMsgs);
-		setQPROP(qqueueSetbSaveOnShutdown, "$MainMsgQueueSaveOnShutdown", ourConf->globals.mainQ.bMainMsgQSaveOnShutdown);
-		setQPROP(qqueueSetiDeqSlowdown, "$MainMsgQueueDequeueSlowdown", ourConf->globals.mainQ.iMainMsgQDeqSlowdown);
-		setQPROP(qqueueSetiDeqtWinFromHr,  "$MainMsgQueueDequeueTimeBegin", ourConf->globals.mainQ.iMainMsgQueueDeqtWinFromHr);
-		setQPROP(qqueueSetiDeqtWinToHr,    "$MainMsgQueueDequeueTimeEnd", ourConf->globals.mainQ.iMainMsgQueueDeqtWinToHr);
+		setQPROP(qqueueSetiHighWtrMrk, "$MainMsgQueueHighWaterMark",
+			ourConf->globals.mainQ.iMainMsgQHighWtrMark);
+		setQPROP(qqueueSetiLowWtrMrk, "$MainMsgQueueLowWaterMark",
+			ourConf->globals.mainQ.iMainMsgQLowWtrMark);
+		setQPROP(qqueueSetiDiscardMrk, "$MainMsgQueueDiscardMark",
+			ourConf->globals.mainQ.iMainMsgQDiscardMark);
+		setQPROP(qqueueSetiDiscardSeverity, "$MainMsgQueueDiscardSeverity",
+			ourConf->globals.mainQ.iMainMsgQDiscardSeverity);
+		setQPROP(qqueueSetiMinMsgsPerWrkr, "$MainMsgQueueWorkerThreadMinimumMessages",
+			ourConf->globals.mainQ.iMainMsgQWrkMinMsgs);
+		setQPROP(qqueueSetbSaveOnShutdown, "$MainMsgQueueSaveOnShutdown",
+			ourConf->globals.mainQ.bMainMsgQSaveOnShutdown);
+		setQPROP(qqueueSetiDeqSlowdown, "$MainMsgQueueDequeueSlowdown",
+			ourConf->globals.mainQ.iMainMsgQDeqSlowdown);
+		setQPROP(qqueueSetiDeqtWinFromHr,  "$MainMsgQueueDequeueTimeBegin",
+			ourConf->globals.mainQ.iMainMsgQueueDeqtWinFromHr);
+		setQPROP(qqueueSetiDeqtWinToHr,    "$MainMsgQueueDequeueTimeEnd",
+			ourConf->globals.mainQ.iMainMsgQueueDeqtWinToHr);
 
 	#	undef setQPROP
 	#	undef setQPROPstr
@@ -685,26 +823,45 @@ startMainQueue(qqueue_t *pQueue)
 void
 rsyslogd_submitErrMsg(const int severity, const int iErr, const uchar *msg)
 {
-	logmsgInternal(iErr, LOG_SYSLOG|(severity & 0x07), msg, 0);
+	if (glbl.GetGlobalInputTermState() == 1) {
+		dfltErrLogger(severity, iErr, msg);
+	} else {
+		logmsgInternal(iErr, LOG_SYSLOG|(severity & 0x07), msg, 0);
+	}
 }
 
 static inline rsRetVal
-submitMsgWithDfltRatelimiter(msg_t *pMsg)
+submitMsgWithDfltRatelimiter(smsg_t *pMsg)
 {
 	return ratelimitAddMsg(dflt_ratelimiter, NULL, pMsg);
 }
 
 
-/* This function logs a message to rsyslog itself, using its own
- * internal structures. This means external programs (like the
- * system journal) will never see this message.
+static void
+logmsgInternal_doWrite(smsg_t *const __restrict__ pMsg)
+{
+	if(bProcessInternalMessages) {
+		ratelimitAddMsg(internalMsg_ratelimiter, NULL, pMsg);
+	} else {
+		const int pri = getPRIi(pMsg);
+		uchar *const msg = getMSG(pMsg);
+#		ifdef HAVE_LIBLOGGING_STDLOG
+		stdlog_log(stdlog_hdl, pri2sev(pri), "%s", (char*)msg);
+#		else
+		syslog(pri, "%s", msg);
+#		endif
+	}
+}
+
+/* This function creates a log message object out of the provided
+ * message text and forwards it for logging.
  */
 static rsRetVal
-logmsgInternalSelf(const int iErr, const syslog_pri_t pri, const size_t lenMsg,
+logmsgInternalSubmit(const int iErr, const syslog_pri_t pri, const size_t lenMsg,
 	const char *__restrict__ const msg, int flags)
 {
 	uchar pszTag[33];
-	msg_t *pMsg;
+	smsg_t *pMsg;
 	DEFiRet;
 
 	CHKiRet(msgConstruct(&pMsg));
@@ -731,10 +888,7 @@ logmsgInternalSelf(const int iErr, const syslog_pri_t pri, const size_t lenMsg,
 	if(bHaveMainQueue == 0) { /* not yet in queued mode */
 		iminternalAddMsg(pMsg);
 	} else {
-               /* we have the queue, so we can simply provide the
-		 * message to the queue engine.
-		 */
-		ratelimitAddMsg(internalMsg_ratelimiter, NULL, pMsg);
+		logmsgInternal_doWrite(pMsg);
 	}
 finalize_it:
 	RETiRet;
@@ -767,16 +921,9 @@ logmsgInternal(int iErr, const syslog_pri_t pri, const uchar *const msg, int fla
 		}
 	}
 
-	if(bProcessInternalMessages) {
-		CHKiRet(logmsgInternalSelf(iErr, pri, lenMsg,
-					   (bufModMsg == NULL) ? (char*)msg : bufModMsg,
-					   flags));
-#ifdef HAVE_LIBLOGGING_STDLOG
-	} else {
-		stdlog_log(stdlog_hdl, pri2sev(pri), "%s",
-			   (bufModMsg == NULL) ? (char*)msg : bufModMsg);
-#endif
-	}
+	CHKiRet(logmsgInternalSubmit(iErr, pri, lenMsg,
+				   (bufModMsg == NULL) ? (char*)msg : bufModMsg,
+				   flags));
 
 	/* we now check if we should print internal messages out to stderr. This was
 	 * suggested by HKS as a way to help people troubleshoot rsyslog configuration
@@ -797,7 +944,7 @@ finalize_it:
 }
 
 rsRetVal
-submitMsg(msg_t *pMsg)
+submitMsg(smsg_t *pMsg)
 {
 	return submitMsgWithDfltRatelimiter(pMsg);
 }
@@ -807,7 +954,7 @@ submitMsg(msg_t *pMsg)
  * rgerhards, 2008-02-13
  */
 rsRetVal
-submitMsg2(msg_t *pMsg)
+submitMsg2(smsg_t *pMsg)
 {
 	qqueue_t *pQueue;
 	ruleset_t *pRuleset;
@@ -948,7 +1095,7 @@ finalize_it:
 
 
 static void
-hdlr_sigttin()
+hdlr_sigttin(void)
 {
 	/* this is just a dummy to care for our sigttin input
 	 * module cancel interface. The important point is that
@@ -957,29 +1104,29 @@ hdlr_sigttin()
 }
 
 static void
-hdlr_enable(int signal, void (*hdlr)())
+hdlr_enable(int sig, void (*hdlr)())
 {
 	struct sigaction sigAct;
 	memset(&sigAct, 0, sizeof (sigAct));
 	sigemptyset(&sigAct.sa_mask);
 	sigAct.sa_handler = hdlr;
-	sigaction(signal, &sigAct, NULL);
+	sigaction(sig, &sigAct, NULL);
 }
 
 static void
-hdlr_sighup()
+hdlr_sighup(void)
 {
 	bHadHUP = 1;
 }
 
 static void
-hdlr_sigchld()
+hdlr_sigchld(void)
 {
 	bChildDied = 1;
 }
 
-void
-rsyslogdDebugSwitch()
+static void
+rsyslogdDebugSwitch(void)
 {
 	time_t tTime;
 	struct tm tp;
@@ -1016,13 +1163,11 @@ rsyslogdDebugSwitch()
  * of a break-in is very low in the startup phase, we decide it is more important
  * to emit error messages.
  */
-void
+static void
 initAll(int argc, char **argv)
 {
 	rsRetVal localRet;
 	int ch;
-	extern int optind;
-	extern char *optarg;
 	int iHelperUOpt;
 	int bChDirRoot = 1; /* change the current working directory to "/"? */
 	char *arg;	/* for command line option processing */
@@ -1041,7 +1186,11 @@ initAll(int argc, char **argv)
 	 * of other options, we do this during the inital option processing.
 	 * rgerhards, 2008-04-04
 	 */
+#if defined(_AIX)
+	while((ch = getopt(argc, argv, "46a:Ac:dDef:g:hi:l:m:M:nN:op:qQr::s:S:t:T:u:CvwxR")) != EOF) {
+#else
 	while((ch = getopt(argc, argv, "46a:Ac:dDef:g:hi:l:m:M:nN:op:qQr::s:S:t:T:u:Cvwx")) != EOF) {
+#endif
 		switch((char)ch) {
                 case '4':
                 case '6':
@@ -1062,6 +1211,10 @@ initAll(int argc, char **argv)
 		case 'x': /* disable dns for remote messages */
 			CHKiRet(bufOptAdd(ch, optarg));
 			break;
+#if defined(_AIX)
+		case 'R':  /* This option is a no-op for AIX */
+			break;   
+#endif
 		case 'd': /* debug - must be handled now, so that debug is active during init! */
 			debugging_on = 1;
 			Debug = 1;
@@ -1128,13 +1281,13 @@ initAll(int argc, char **argv)
                 case 'A':
 			fprintf (stderr, "rsyslogd: the -A command line option will go away "
 				 "soon.\n"
-				 "Please use the omfwd paramter \"upd.sendToAll\" instead.\n");
+				 "Please use the omfwd parameter \"upd.sendToAll\" instead.\n");
                         send_to_all++;
                         break;
 		case 'S':		/* Source IP for local client to be used on multihomed host */
 			fprintf (stderr, "rsyslogd: the -S command line option will go away "
 				 "soon.\n"
-				 "Please use the omrelp paramter \"localClientIP\" instead.\n");
+				 "Please use the omrelp parameter \"localClientIP\" instead.\n");
 			if(glbl.GetSourceIPofLocalClient() != NULL) {
 				fprintf (stderr, "rsyslogd: Only one -S argument allowed, the first one is taken.\n");
 			} else {
@@ -1145,7 +1298,7 @@ initAll(int argc, char **argv)
 			ConfFile = (uchar*) arg;
 			break;
 		case 'i':		/* pid file name */
-			PidFile = (uchar*)arg;
+			PidFile = arg;
 			break;
 		case 'l':
 			fprintf (stderr, "rsyslogd: the -l command line option will go away "
@@ -1161,7 +1314,7 @@ initAll(int argc, char **argv)
 			doFork = 0;
 			break;
 		case 'N':		/* enable config verify mode */
-			iConfigVerify = atoi(arg);
+			iConfigVerify = (arg == NULL) ? 0 : atoi(arg);
 			break;
 		case 'q':               /* add hostname if DNS resolving has failed */
 			fprintf (stderr, "rsyslogd: the -q command line option will go away "
@@ -1186,18 +1339,25 @@ initAll(int argc, char **argv)
 			}
 			break;
 		case 'T':/* chroot() immediately at program startup, but only for testing, NOT security yet */
+			if(arg == NULL) {
+				/* note this case should already be handled by getopt,
+				 * but we want to keep the static analyzer happy.
+				 */
+				fprintf(stderr, "-T options needs a parameter\n");
+				exit(1);
+			}
 			if(chroot(arg) != 0) {
 				perror("chroot");
 				exit(1);
 			}
 			break;
 		case 'u':		/* misc user settings */
-			iHelperUOpt = atoi(arg);
+			iHelperUOpt = (arg == NULL) ? 0 : atoi(arg);
 			if(iHelperUOpt & 0x01) {
 				fprintf (stderr, "rsyslogd: the -u command line option will go away "
 					 "soon.\n"
 					 "For the 0x01 bit, please use the "
-					 "global(net.parseHostnamdAndTag=\"off\") "
+					 "global(parser.parseHostnameAndTag=\"off\") "
 					 "configuration parameter instead.\n");
 				glbl.SetParseHOSTNAMEandTAG(0);
 			}
@@ -1300,7 +1460,7 @@ initAll(int argc, char **argv)
 
 	if(ourConf->globals.bLogStatusMsgs) {
 		char bufStartUpMsg[512];
-		snprintf(bufStartUpMsg, sizeof(bufStartUpMsg)/sizeof(char),
+		snprintf(bufStartUpMsg, sizeof(bufStartUpMsg),
 			 " [origin software=\"rsyslogd\" " "swVersion=\"" VERSION \
 			 "\" x-pid=\"%d\" x-info=\"http://www.rsyslog.com\"] start",
 			 (int) glblGetOurPid());
@@ -1342,12 +1502,13 @@ finalize_it:
  * really help us. TODO: add error messages?
  * rgerhards, 2007-08-03
  */
-static inline void processImInternal(void)
+static void
+processImInternal(void)
 {
-	msg_t *pMsg;
+	smsg_t *pMsg;
 
 	while(iminternalRemoveMsg(&pMsg) == RS_RET_OK) {
-		submitMsgWithDfltRatelimiter(pMsg);
+		logmsgInternal_doWrite(pMsg);
 	}
 }
 
@@ -1363,7 +1524,7 @@ parseAndSubmitMessage(uchar *hname, uchar *hnameIP, uchar *msg, int len, int fla
 	prop_t *pInputName, struct syslogTime *stTime, time_t ttGenTime, ruleset_t *pRuleset)
 {
 	prop_t *pProp = NULL;
-	msg_t *pMsg;
+	smsg_t *pMsg;
 	DEFiRet;
 
 	/* we now create our own message object and submit it to the queue */
@@ -1413,13 +1574,13 @@ DEFFUNC_llExecFunc(doHUPActions)
  * but the sync would require some extra CPU for *each* message processed.
  * rgerhards, 2012-04-11
  */
-static inline void
+static void
 doHUP(void)
 {
 	char buf[512];
 
 	if(ourConf->globals.bLogStatusMsgs) {
-		snprintf(buf, sizeof(buf) / sizeof(char),
+		snprintf(buf, sizeof(buf),
 			 " [origin software=\"rsyslogd\" " "swVersion=\"" VERSION
 			 "\" x-pid=\"%d\" x-info=\"http://www.rsyslog.com\"] rsyslogd was HUPed",
 			 (int) glblGetOurPid());
@@ -1483,21 +1644,87 @@ static void
 mainloop(void)
 {
 	struct timeval tvSelectTimeout;
+	time_t tTime;
+	/* AIXPORT :  SRC support start */
+#if defined(_AIX)
+	char buf[256];
+	fd_set rfds;
+#endif
+	/* AIXPORT : src end */
 
 	BEGINfunc
 	/* first check if we have any internal messages queued and spit them out. */
 	processImInternal();
 
 	while(!bFinished){
+		/* AIXPORT :  SRC support start */
+#if defined(_AIX)
+		if(src_exists)
+		{
+			FD_ZERO(&rfds);
+			FD_SET(SRC_FD, &rfds);
+		}
+#endif
+		/* AIXPORT : src end */
 		tvSelectTimeout.tv_sec = janitorInterval * 60; /* interval is in minutes! */
 		tvSelectTimeout.tv_usec = 0;
+#ifndef _AIX
 		select(1, NULL, NULL, NULL, &tvSelectTimeout);
+#else
+		/* AIXPORT :  SRC support start */
+		if(!src_exists)
+			select(1, NULL, NULL, NULL, &tvSelectTimeout);
+		else if(select(SRC_FD + 1, (fd_set *)&rfds, NULL, NULL, &tvSelectTimeout))
+		{
+			if(FD_ISSET(SRC_FD, &rfds))
+			{
+				rc = recvfrom(SRC_FD, &srcpacket, SRCMSG, 0, &srcaddr, &addrsz);
+				if(rc < 0)
+				if (errno != EINTR)
+				{
+					fprintf(stderr,"%s: ERROR: '%d' recvfrom\n", progname,errno);
+					exit(1);
+				} else  /* punt on short read */
+					continue;
+
+				switch(srcpacket.subreq.action)
+				{
+					case START:
+						dosrcpacket(SRC_SUBMSG,"ERROR: rsyslogd does not support this option.\n",sizeof(struct srcrep));
+					break;
+					case STOP:
+						if (srcpacket.subreq.object == SUBSYSTEM) {
+							dosrcpacket(SRC_OK,NULL,sizeof(struct srcrep));
+							(void) snprintf(buf, sizeof(buf) / sizeof(char), " [origin software=\"rsyslogd\" " "swVersion=\"" VERSION \
+								"\" x-pid=\"%d\" x-info=\"http://www.rsyslog.com\"]" " exiting due to stopsrc.",
+								(int) glblGetOurPid());
+							errno = 0;
+							logmsgInternal(NO_ERRCODE, LOG_SYSLOG|LOG_INFO, (uchar*)buf, 0);
+							return ;
+						} else
+							dosrcpacket(SRC_SUBMSG,"ERROR: rsyslogd does not support this option.\n",sizeof(struct srcrep));
+					break;
+					case REFRESH:
+						dosrcpacket(SRC_SUBMSG,"ERROR: rsyslogd does not support this option.\n", sizeof(struct srcrep));
+                        		break;
+					default:
+						dosrcpacket(SRC_SUBICMD,NULL,sizeof(struct srcrep));
+					break;
+
+				}
+			}
+		}
+#endif
+	/* AIXPORT : SRC end */		
 
 		if(bChildDied) {
-			int child;
+			pid_t child;
 			do {
 				child = waitpid(-1, NULL, WNOHANG);
-				DBGPRINTF("rsyslogd: child %d has terminated\n", child);
+				DBGPRINTF("rsyslogd: mainloop waitpid (with-no-hang) returned %d\n", child);
+				if (child != -1 && child != 0) {
+					errmsg.LogError(0, RS_RET_OK, "Child %d has terminated, reaped by main-loop.", child);
+				}
 			} while(child > 0);
 			bChildDied = 0;
 		}
@@ -1506,6 +1733,9 @@ mainloop(void)
 			break;	/* exit as quickly as possible */
 
 		janitorRun();
+
+		datetime.GetTime(&tTime);
+		checkGoneAwaySenders(tTime);
 
 		if(bHadHUP) {
 			doHUP();
@@ -1518,7 +1748,7 @@ mainloop(void)
 
 /* Finalize and destruct all actions.
  */
-void
+static void
 rsyslogd_destructAllActions(void)
 {
 	ruleset.DestructAllActions(runConf);
@@ -1549,11 +1779,12 @@ deinitAll(void)
 	/* close the inputs */
 	DBGPRINTF("Terminating input threads...\n");
 	glbl.SetGlobalInputTermination();
+	
 	thrdTerminateAll();
 
 	/* and THEN send the termination log message (see long comment above) */
 	if(bFinished && runConf->globals.bLogStatusMsgs) {
-		(void) snprintf(buf, sizeof(buf) / sizeof(char),
+		(void) snprintf(buf, sizeof(buf),
 		 " [origin software=\"rsyslogd\" " "swVersion=\"" VERSION \
 		 "\" x-pid=\"%d\" x-info=\"http://www.rsyslog.com\"]" " exiting on signal %d.",
 		 (int) glblGetOurPid(), bFinished);
@@ -1599,6 +1830,7 @@ deinitAll(void)
 	ratelimitModExit();
 	dnscacheDeinit();
 	thrdExit();
+	objRelease(net, LM_NET_FILENAME);
 
 	module.UnloadAndDestructAll(eMOD_LINK_ALL);
 
@@ -1609,7 +1841,7 @@ deinitAll(void)
 	dbgClassExit();
 
 	/* NO CODE HERE - dbgClassExit() must be the last thing before exit()! */
-	unlink((char*)PidFile);
+	unlink(PidFile);
 }
 
 /* This is the main entry point into rsyslogd. This must be a function in its own
@@ -1620,6 +1852,33 @@ deinitAll(void)
 int
 main(int argc, char **argv)
 {
+#if defined(_AIX)
+	/* AIXPORT : start
+	* SRC support : fd 0 (stdin) must be the SRC socket
+	* startup.  fd 0 is duped to a new descriptor so that stdin can be used
+	* internally by rsyslogd.
+	*/
+
+	strncpy(progname,argv[0], sizeof(progname)-1);
+	addrsz = sizeof(srcaddr);
+	if ((rc = getsockname(0, &srcaddr, &addrsz)) < 0) {
+		fprintf(stderr, "%s: continuing without SRC support\n", progname);
+		src_exists = FALSE;
+	}
+	if (src_exists) 
+		if(dup2(0, SRC_FD) == -1)
+		{
+			fprintf(stderr, "%s: dup2 failed exiting now...\n", progname);
+			/* In the unlikely event of dup2 failing we exit */
+			exit(-1);
+		}
+#endif
+	/* AIXPORT : src end */
+	/* use faster hash function inside json lib */
+	json_global_set_string_hash(JSON_C_STR_HASH_PERLLIKE);
+	const char *const log_dflt = getenv("RSYSLOG_DFLT_LOG_INTERNAL");
+	if(log_dflt != NULL && !strcmp(log_dflt, "1"))
+		bProcessInternalMessages = 1;
 	dbgClassInit();
 	initAll(argc, argv);
 	sd_notify(0, "READY=1");

@@ -39,6 +39,7 @@
 #include <signal.h>
 #include <errno.h>
 #include <time.h>
+#include <netdb.h>
 #include <libpq-fe.h>
 #include "conf.h"
 #include "syslogd-types.h"
@@ -49,7 +50,6 @@
 
 MODULE_TYPE_OUTPUT
 MODULE_TYPE_NOKEEP
-MODULE_CNFNAME("ompgsql")
 
 /* internal structures
  */
@@ -63,6 +63,7 @@ typedef struct _instanceData {
 	char	f_dbuid[_DB_MAXUNAMELEN+1];	/* DB user */
 	char	f_dbpwd[_DB_MAXPWDLEN+1];	/* DB user's password */
 	ConnStatusType	eLastPgSQLStatus; 	/* last status from postgres */
+        uchar   *tplName;                       /* format template to use */
 } instanceData;
 
 typedef struct wrkrInstanceData {
@@ -115,6 +116,7 @@ static void closePgSQL(instanceData *pData)
 BEGINfreeInstance
 CODESTARTfreeInstance
 	closePgSQL(pData);
+        free(pData->tplName);
 ENDfreeInstance
 
 BEGINfreeWrkrInstance
@@ -145,7 +147,7 @@ static void reportDBError(instanceData *pData, int bSilent)
 		errmsg.LogError(0, NO_ERRCODE, "unknown DB error occured - could not obtain PgSQL handle");
 	} else { /* we can ask pgsql for the error description... */
 		ePgSQLStatus = PQstatus(pData->f_hpgsql);
-		snprintf(errMsg, sizeof(errMsg)/sizeof(char), "db error (%d): %s\n", ePgSQLStatus,
+		snprintf(errMsg, sizeof(errMsg), "db error (%d): %s\n", ePgSQLStatus,
 				PQerrorMessage(pData->f_hpgsql));
 		if(bSilent || ePgSQLStatus == pData->eLastPgSQLStatus)
 			dbgprintf("pgsql, DBError(silent): %s\n", errMsg);
@@ -192,7 +194,7 @@ static rsRetVal initPgSQL(instanceData *pData, int bSilent)
  * (1 = had error, 0=ok). We do not use the standard IRET calling convention
  * rgerhards, 2009-04-17
  */
-static inline int
+static int
 tryExec(uchar *pszCmd, instanceData *pData)
 {
 	PGresult *pgRet;
@@ -233,6 +235,7 @@ writePgSQL(uchar *psz, instanceData *pData)
 	bHadError = tryExec(psz, pData); /* try insert */
 
 	if(bHadError || (PQstatus(pData->f_hpgsql) != CONNECTION_OK)) {
+#if 0		/* re-enable once we have transaction support */
 		/* error occured, try to re-init connection and retry */
 		int inTransaction = 0;
 		if(pData->f_hpgsql != NULL) {
@@ -241,7 +244,9 @@ writePgSQL(uchar *psz, instanceData *pData)
 				inTransaction = 1;
 			}
 		}
-		if ( inTransaction == 0 ) {
+		if ( inTransaction == 0 )
+#endif
+		{
 			closePgSQL(pData); /* close the current handle */
 			CHKiRet(initPgSQL(pData, 0)); /* try to re-open */
 			bHadError = tryExec(psz, pData); /* retry */
@@ -281,6 +286,7 @@ CODESTARTtryResume
 ENDtryResume
 
 
+#if 0 /* re-enable when TX support is added again */
 BEGINbeginTransaction
 CODESTARTbeginTransaction
 	dbgprintf("ompgsql: beginTransaction\n");
@@ -288,6 +294,7 @@ CODESTARTbeginTransaction
 	       initPgSQL(pWrkrData->pData, 0);
 	iRet = writePgSQL((uchar*) "begin", pWrkrData->pData); /* TODO: make user-configurable */
 ENDbeginTransaction
+#endif
 
 
 BEGINdoAction
@@ -302,11 +309,12 @@ finalize_it:
 ENDdoAction
 
 
+#if 0 /* re-enable when TX support is added again */
 BEGINendTransaction
 CODESTARTendTransaction
 	iRet = writePgSQL((uchar*) "commit;", pWrkrData->pData); /* TODO: make user-configurable */
-dbgprintf("ompgsql: endTransaction\n");
 ENDendTransaction
+#endif
 
 
 BEGINparseSelectorAct
@@ -357,12 +365,15 @@ CODE_STD_STRING_REQUESTparseSelectorAct(1)
 	 * We specify that the SQL option must be present in the template.
 	 * This is for your own protection (prevent sql injection).
 	 */
-	if(*(p-1) == ';')
+	if(*(p-1) == ';') {
 		--p;	/* TODO: the whole parsing of the MySQL module needs to be re-thought - but this here
 			 *       is clean enough for the time being -- rgerhards, 2007-07-30
 			 *       kept it for pgsql -- sur5r, 2007-10-19
 			 */
-	CHKiRet(cflineParseTemplateName(&p, *ppOMSR, 0, OMSR_RQD_TPL_OPT_SQL, (uchar*) " StdPgSQLFmt"));
+		CHKiRet(cflineParseTemplateName(&p, *ppOMSR, 0, OMSR_RQD_TPL_OPT_SQL, (uchar*) pData->tplName));
+	}
+	else
+		CHKiRet(cflineParseTemplateName(&p, *ppOMSR, 0, OMSR_RQD_TPL_OPT_SQL, (uchar*)" StdPgSQLFmt"));
 	
 	/* If we detect invalid properties, we disable logging, 
 	 * because right properties are vital at this place.  
@@ -385,7 +396,7 @@ BEGINqueryEtryPt
 CODESTARTqueryEtryPt
 CODEqueryEtryPt_STD_OMOD_QUERIES
 CODEqueryEtryPt_STD_OMOD8_QUERIES
-CODEqueryEtryPt_TXIF_OMOD_QUERIES /* we support the transactional interface! */
+/* CODEqueryEtryPt_TXIF_OMOD_QUERIES currently no TX support! */ /* we support the transactional interface! */
 ENDqueryEtryPt
 
 
@@ -397,7 +408,7 @@ CODEmodInit_QueryRegCFSLineHdlr
 	CHKiRet(objUse(errmsg, CORE_COMPONENT));
 	INITChkCoreFeature(bCoreSupportsBatching, CORE_FEATURE_BATCHING);
 
-#	warning: transaction support missing for v8
+	/* TODO: transaction support missing for v8 */
 	bCoreSupportsBatching= 0;
 	DBGPRINTF("ompgsql: transactions are not yet supported on v8\n");
 

@@ -41,7 +41,7 @@
  * deflateInit2(zstrmptr, 6, Z_DEFLATED, 31, 9, Z_DEFAULT_STRATEGY);
  * --------------------------------------------------------------------------
  * 
- * Copyright 2008-2013 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2008-2016 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
@@ -65,8 +65,10 @@
 #ifndef STREAM_H_INCLUDED
 #define STREAM_H_INCLUDED
 
+#include <regex.h> // TODO: fix via own module
 #include <pthread.h>
 #include <stdint.h>
+#include <time.h>
 #include "obj-types.h"
 #include "glbl.h"
 #include "stream.h"
@@ -95,25 +97,30 @@ typedef struct strm_s {
 	BEGINobjInstance;	/* Data to implement generic object - MUST be the first data element! */
 	strmType_t sType;
 	/* descriptive properties */
-	int iCurrFNum;/* current file number (NOT descriptor, but the number in the file name!) */
+	unsigned int iCurrFNum;/* current file number (NOT descriptor, but the number in the file name!) */
 	uchar *pszFName; /* prefix for generated filenames */
 	int lenFName;
 	strmMode_t tOperationsMode;
 	mode_t tOpenMode;
 	int64 iMaxFileSize;/* maximum size a file may grow to */
-	int iMaxFiles;	/* maximum number of files if a circular mode is in use */
+	unsigned int iMaxFiles;	/* maximum number of files if a circular mode is in use */
 	int iFileNumDigits;/* min number of digits to use in file number (only in circular mode) */
 	sbool bDeleteOnClose; /* set to 1 to auto-delete on close -- be careful with that setting! */
 	int64 iCurrOffs;/* current offset */
-	int64 *pUsrWCntr; /* NULL or a user-provided counter that receives the nbr of bytes written since the last CntrSet() */
+	int64 *pUsrWCntr; /* NULL or a user-provided counter that receives the nbr of bytes written since
+	the last CntrSet() */
+	sbool bPrevWasNL; /* used for readLine() when reading multi-line messages */
 	/* dynamic properties, valid only during file open, not to be persistet */
 	sbool bDisabled; /* should file no longer be written to? (currently set only if omfile file size limit fails) */
 	sbool bSync;	/* sync this file after every write? */
+	sbool bReopenOnTruncate;
 	size_t sIOBufSize;/* size of IO buffer */
 	uchar *pszDir; /* Directory */
 	int lenDir;
 	int fd;		/* the file descriptor, -1 if closed */
 	int fdDir;	/* the directory's descriptor, in case bSync is requested (-1 if closed) */
+	int readTimeout;/* 0: do not timeout */
+	time_t lastRead;/* for timeout processing */
 	ino_t inode;	/* current inode for files being monitored (undefined else) */
 	uchar *pszCurrFName; /* name of current file (if open) */
 	uchar *pIOBuf;	/* the iobuffer currently in use to gather data */
@@ -127,7 +134,8 @@ typedef struct strm_s {
 	sbool bAsyncWrite;	/* do asynchronous writes (always if a flush interval is given) */
 	sbool bStopWriter;	/* shall writer thread terminate? */
 	sbool bDoTimedWait;	/* instruct writer thread to do a times wait to support flush timeouts */
-	sbool bzInitDone; /* did we do an init of zstrm already? */
+	sbool bzInitDone;	/* did we do an init of zstrm already? */
+	sbool bFlushNow;	/* shall we flush with the next async write? */
 	sbool bVeryReliableZip; /* shall we write interim headers to create a very reliable ZIP file? */
 	int iFlushInterval; /* flush in which interval - 0, no flushing */
 	pthread_mutex_t mut;/* mutex for flush in async mode */
@@ -150,7 +158,8 @@ typedef struct strm_s {
 	off_t	iSizeLimit;	/* file size limit, 0 = no limit */
 	uchar	*pszSizeLimitCmd;	/* command to carry out when size limit is reached */
 	sbool	bIsTTY;		/* is this a tty file? */
-	cstr_t *prevLineSegment; /* for ReadLine, previous, unwritten part of file */
+	cstr_t *prevLineSegment; /* for ReadLine, previous, unprocessed part of file */
+	cstr_t *prevMsgSegment; /* for ReadMultiLine, previous, yet unprocessed part of msg */
 } strm_t;
 
 
@@ -184,12 +193,13 @@ BEGINinterface(strm) /* name must also be changed in ENDinterface macro! */
 	INTERFACEpropSetMeth(strm, sType, strmType_t);
 	INTERFACEpropSetMeth(strm, iZipLevel, int);
 	INTERFACEpropSetMeth(strm, bSync, int);
+	INTERFACEpropSetMeth(strm, bReopenOnTruncate, int);
 	INTERFACEpropSetMeth(strm, sIOBufSize, size_t);
 	INTERFACEpropSetMeth(strm, iSizeLimit, off_t);
 	INTERFACEpropSetMeth(strm, iFlushInterval, int);
 	INTERFACEpropSetMeth(strm, pszSizeLimitCmd, uchar*);
 	/* v6 added */
-	rsRetVal (*ReadLine)(strm_t *pThis, cstr_t **ppCStr, uint8_t mode, sbool bEscapeLF);
+	rsRetVal (*ReadLine)(strm_t *pThis, cstr_t **ppCStr, uint8_t mode, sbool bEscapeLF, uint32_t trimLineOverBytes);
 	/* v7 added  2012-09-14 */
 	INTERFACEpropSetMeth(strm, bVeryReliableZip, int);
 	/* v8 added  2013-03-21 */
@@ -198,16 +208,19 @@ BEGINinterface(strm) /* name must also be changed in ENDinterface macro! */
 	INTERFACEpropSetMeth(strm, cryprov, cryprov_if_t*);
 	INTERFACEpropSetMeth(strm, cryprovData, void*);
 ENDinterface(strm)
-#define strmCURR_IF_VERSION 10 /* increment whenever you change the interface structure! */
+#define strmCURR_IF_VERSION 12 /* increment whenever you change the interface structure! */
 /* V10, 2013-09-10: added new parameter bEscapeLF, changed mode to uint8_t (rgerhards) */
+/* V11, 2015-12-03: added new parameter bReopenOnTruncate */
+/* V12, 2015-12-11: added new parameter trimLineOverBytes, changed mode to uint32_t */
 
-static inline int
-strmGetCurrFileNum(strm_t *pStrm) {
-	return pStrm->iCurrFNum;
-}
+#define strmGetCurrFileNum(pStrm) ((pStrm)->iCurrFNum)
 
 /* prototypes */
 PROTOTYPEObjClassInit(strm);
-rsRetVal strmMultiFileSeek(strm_t *pThis, int fileNum, off64_t offs, off64_t *bytesDel);
+rsRetVal strmMultiFileSeek(strm_t *pThis, unsigned int fileNum, off64_t offs, off64_t *bytesDel);
+rsRetVal strmReadMultiLine(strm_t *pThis, cstr_t **ppCStr, regex_t *preg, sbool bEscapeLF);
+int strmReadMultiLine_isTimedOut(const strm_t *const __restrict__ pThis);
+void strmDebugOutBuf(const strm_t *const pThis);
+void strmSetReadTimeout(strm_t *const __restrict__ pThis, const int val);
 
 #endif /* #ifndef STREAM_H_INCLUDED */

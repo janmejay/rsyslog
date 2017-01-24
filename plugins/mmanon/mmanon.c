@@ -284,7 +284,7 @@ writeOctet(uchar *msg, int idx, int *nxtidx, uint8_t octet)
 }
 
 /* currently works for IPv4 only! */
-void
+static void
 anonip(instanceData *pData, uchar *msg, int *pLenMsg, int *idx)
 {
 	int i = *idx;
@@ -361,13 +361,13 @@ done:	*idx = i;
 }
 
 
-BEGINdoAction
-	msg_t *pMsg;
+BEGINdoAction_NoStrings
+	smsg_t **ppMsg = (smsg_t **) pMsgData;
+	smsg_t *pMsg = ppMsg[0];
 	uchar *msg;
 	int lenMsg;
 	int i;
 CODESTARTdoAction
-	pMsg = (msg_t*) ppString[0];
 	lenMsg = getMSGLen(pMsg);
 	msg = getMSG(pMsg);
 	for(i = 0 ; i < lenMsg ; ++i) {

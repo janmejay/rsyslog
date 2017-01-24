@@ -25,7 +25,7 @@
  * Rainer Gerhards <rgerhards@hq.adiscon.com>.
  *
  * rsyslog - An Enhanced syslogd Replacement.
- * Copyright 2003-2014 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2003-2016 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of rsyslog.
  *
@@ -75,17 +75,17 @@
 #include <sys/resource.h>
 #include <grp.h>
 
-#if HAVE_SYS_TIMESPEC_H
+#ifdef HAVE_SYS_TIMESPEC_H
 # include <sys/timespec.h>
 #endif
 
-#if HAVE_SYS_STAT_H
+#ifdef HAVE_SYS_STAT_H
 #	include <sys/stat.h>
 #endif
 
 #include <signal.h>
 
-#if HAVE_PATHS_H
+#ifdef HAVE_PATHS_H
 #include <paths.h>
 #endif
 
@@ -106,7 +106,6 @@
 #include "ratelimit.h"
 
 /* forward defintions from rsyslogd.c (ASL 2.0 code) */
-extern rsRetVal queryLocalHostname(void);
 extern ratelimit_t *internalMsg_ratelimiter;
 extern uchar *ConfFile;
 extern ratelimit_t *dflt_ratelimiter;
@@ -135,6 +134,7 @@ void rsyslogdDoDie(int sig);
  * and permits us to move to ASL 2.0 (but we need to check the fine details). 
  * Probably it is best just to rewrite this code.
  */
+char **syslogd_crunch_list(char *list);
 char **syslogd_crunch_list(char *list)
 {
 	int count, i;
@@ -145,12 +145,10 @@ char **syslogd_crunch_list(char *list)
 
 	/* strip off trailing delimiters */
 	while (p[strlen(p)-1] == LIST_DELIMITER) {
-		count--;
 		p[strlen(p)-1] = '\0';
 	}
 	/* cut off leading delimiters */
 	while (p[0] == LIST_DELIMITER) {
-		count--;
                p++;
 	}
 
@@ -170,7 +168,7 @@ char **syslogd_crunch_list(char *list)
 	 */
 	count = 0;
 	while ((q=strchr(p, LIST_DELIMITER))) {
-		result[count] = (char *) MALLOC((q - p + 1) * sizeof(char));
+		result[count] = (char *) MALLOC(q - p + 1);
 		if (result[count] == NULL) {
 			printf ("Sorry, can't get enough memory, exiting.\n");
 			exit(0); /* safe exit, because only called during startup */
@@ -181,7 +179,7 @@ char **syslogd_crunch_list(char *list)
 		count++;
 	}
 	if ((result[count] = \
-	     (char *)MALLOC(sizeof(char) * strlen(p) + 1)) == NULL) {
+	     (char *)MALLOC(strlen(p) + 1)) == NULL) {
 		printf ("Sorry, can't get enough memory, exiting.\n");
 		exit(0); /* safe exit, because only called during startup */
 	}

@@ -2,7 +2,7 @@
  *
  * An implementation of the nsd epoll() interface for plain tcp sockets.
  * 
- * Copyright 2009 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2009-2016 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
@@ -30,7 +30,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <string.h>
-#if HAVE_SYS_EPOLL_H
+#ifdef HAVE_SYS_EPOLL_H
 #	include <sys/epoll.h>
 #endif
 
@@ -61,7 +61,7 @@ DEFobjCurrIf(glbl)
  * been proven OK in practice.
  * rgerhards, 2009-11-18
  */
-static inline rsRetVal
+static rsRetVal
 addEvent(nsdpoll_ptcp_t *pThis, int id, void *pUsr, int mode, nsd_ptcp_t *pSock, nsdpoll_epollevt_lst_t **pEvtLst) {
 	nsdpoll_epollevt_lst_t *pNew;
 	DEFiRet;
@@ -91,7 +91,7 @@ finalize_it:
 /* find and unlink the entry identified by id/pUsr from the list.
  * rgerhards, 2009-11-23
  */
-static inline rsRetVal
+static rsRetVal
 unlinkEvent(nsdpoll_ptcp_t *pThis, int id, void *pUsr, nsdpoll_epollevt_lst_t **ppEvtLst) {
 	nsdpoll_epollevt_lst_t *pEvtLst;
 	nsdpoll_epollevt_lst_t *pPrev = NULL;
@@ -123,7 +123,7 @@ finalize_it:
 /* destruct the provided element. It must already be unlinked from the list.
  * rgerhards, 2009-11-23
  */
-static inline rsRetVal
+static rsRetVal
 delEvent(nsdpoll_epollevt_lst_t **ppEvtLst) {
 	DEFiRet;
 	free(*ppEvtLst);
@@ -252,12 +252,11 @@ Wait(nsdpoll_t *pNsdpoll, int timeout, int *numEntries, nsd_epworkset_t workset[
 	}
 
 	/* we got valid events, so tell the caller... */
-dbgprintf("epoll returned %d entries\n", nfds);
+	DBGPRINTF("epoll returned %d entries\n", nfds);
 	for(i = 0 ; i < nfds ; ++i) {
 		pOurEvt = (nsdpoll_epollevt_lst_t*) event[i].data.ptr;
 		workset[i].id = pOurEvt->id;
 		workset[i].pUsr = pOurEvt->pUsr;
-dbgprintf("epoll push ppusr[%d]: %p\n", i, pOurEvt->pUsr);
 	}
 	*numEntries = nfds;
 

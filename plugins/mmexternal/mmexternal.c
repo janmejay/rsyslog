@@ -2,7 +2,7 @@
  * This core plugin is an interface module to message modification
  * modules written in languages other than C.
  *
- * Copyright 2014 by Rainer Gerhards
+ * Copyright 2014-2016 by Rainer Gerhards
  *
  * This file is part of rsyslog.
  *
@@ -31,7 +31,14 @@
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#if defined(_AIX) || defined(__FreeBSD__) 
+#include <sys/wait.h>
+#else
 #include <wait.h>
+#endif
+#ifdef _AIX /* AIXPORT */
+#include <errno.h>
+#endif /* AIXPORT */
 #include <sys/uio.h>
 #include "conf.h"
 #include "syslogd-types.h"
@@ -40,6 +47,7 @@
 #include "msg.h"
 #include "errmsg.h"
 #include "cfsysline.h"
+
 
 MODULE_TYPE_OUTPUT
 MODULE_TYPE_NOKEEP
@@ -139,7 +147,7 @@ CODESTARTfreeInstance
 		for (i = 0; i < pData->iParams; i++) {
 			free(pData->aParams[i]);
 		}
-		free(pData->aParams); 
+		free(pData->aParams);
 	}
 ENDfreeInstance
 
@@ -205,7 +213,7 @@ done:	return;
  * not handle those border-cases that are describe to cannot exist!
  */
 static void
-processProgramReply(wrkrInstanceData_t *__restrict__ const pWrkrData, msg_t *const pMsg)
+processProgramReply(wrkrInstanceData_t *__restrict__ const pWrkrData, smsg_t *const pMsg)
 {
 	rsRetVal iRet;
 	char errStr[1024];
@@ -213,7 +221,6 @@ processProgramReply(wrkrInstanceData_t *__restrict__ const pWrkrData, msg_t *con
 	int numCharsRead;
 	char *newptr;
 
-dbgprintf("mmexternal: checking prog output, fd %d\n", pWrkrData->fdPipeIn);
 	numCharsRead = 0;
 	do {
 		if(pWrkrData->maxLenRespBuf < numCharsRead + 256) { /* 256 to permit at least a decent read */
@@ -238,7 +245,6 @@ dbgprintf("mmexternal: checking prog output, fd %d\n", pWrkrData->fdPipeIn);
 			strcpy(pWrkrData->respBuf, "{}\n");
 			numCharsRead = 3;
 		}
-dbgprintf("mmexternal: read state %lld, data '%s'\n", (long long) r, pWrkrData->respBuf);
 		if(Debug && r == -1) {
 			DBGPRINTF("mmexternal: error reading from external program: %s\n",
 				   rs_strerror_r(errno, errStr, sizeof(errStr)));
@@ -262,7 +268,7 @@ dbgprintf("mmexternal: read state %lld, data '%s'\n", (long long) r, pWrkrData->
 /* execute the child process (must be called in child context
  * after fork).
  */
-static void
+static void __attribute__((noreturn))
 execBinary(wrkrInstanceData_t *pWrkrData, int fdStdin, int fdStdOutErr)
 {
 	int i, iRet;
@@ -318,7 +324,7 @@ execBinary(wrkrInstanceData_t *pWrkrData, int fdStdin, int fdStdOutErr)
 		 */
 		rs_strerror_r(errno, errStr, sizeof(errStr));
 		DBGPRINTF("mmexternal: failed to execute binary '%s': %s\n",
-			  pWrkrData->pData->szBinary, errStr); 
+			  pWrkrData->pData->szBinary, errStr);
 	}
 	
 	/* we should never reach this point, but if we do, we terminate */
@@ -377,7 +383,7 @@ finalize_it:
 
 /* clean up after a terminated child
  */
-static inline rsRetVal
+static rsRetVal
 cleanup(wrkrInstanceData_t *pWrkrData)
 {
 	int status;
@@ -424,7 +430,7 @@ cleanup(wrkrInstanceData_t *pWrkrData)
 
 /* try to restart the binary when it has stopped.
  */
-static inline rsRetVal
+static rsRetVal
 tryRestart(wrkrInstanceData_t *pWrkrData)
 {
 	DEFiRet;
@@ -440,7 +446,7 @@ tryRestart(wrkrInstanceData_t *pWrkrData)
  * own action queue.
  */
 static rsRetVal
-callExtProg(wrkrInstanceData_t *__restrict__ const pWrkrData, msg_t *__restrict__ const pMsg)
+callExtProg(wrkrInstanceData_t *__restrict__ const pWrkrData, smsg_t *__restrict__ const pMsg)
 {
 	int lenWritten;
 	int lenWrite;
@@ -471,7 +477,7 @@ callExtProg(wrkrInstanceData_t *__restrict__ const pWrkrData, msg_t *__restrict_
 			iov[0].iov_len = lenWrite - writeOffset;
 			++i_iov;
 		}
-		iov[i_iov].iov_base = "\n";
+		iov[i_iov].iov_base = (void*)"\n";
 		iov[i_iov].iov_len = 1;
 		lenWritten = writev(pWrkrData->fdPipeOut, iov, i_iov+1);
 		if(lenWritten == -1) {
@@ -506,10 +512,11 @@ finalize_it:
 }
 
 
-BEGINdoAction
+BEGINdoAction_NoStrings
+	smsg_t **ppMsg = (smsg_t **) pMsgData;
+	smsg_t *pMsg = ppMsg[0];
 	instanceData *pData;
 CODESTARTdoAction
-dbgprintf("DDDD:mmexternal processing message\n");
 	pData = pWrkrData->pData;
 	if(pData->bForceSingleInst)
 		pthread_mutex_lock(&pData->mut);
@@ -517,17 +524,16 @@ dbgprintf("DDDD:mmexternal processing message\n");
 		openPipe(pWrkrData);
 	}
 	
-	iRet = callExtProg(pWrkrData, (msg_t*)ppString[0]);
+	iRet = callExtProg(pWrkrData, pMsg);
 
 	if(iRet != RS_RET_OK)
 		iRet = RS_RET_SUSPENDED;
 	if(pData->bForceSingleInst)
 		pthread_mutex_unlock(&pData->mut);
-dbgprintf("DDDD:mmexternal DONE processing message\n");
 ENDdoAction
 
 
-static inline void
+static void
 setInstParamDefaults(instanceData *pData)
 {
 	pData->szBinary = NULL;
@@ -562,8 +568,8 @@ CODESTARTnewActInst
 		if(!pvals[i].bUsed)
 			continue;
 		if(!strcmp(actpblk.descr[i].name, "binary")) {
-			estrBinary = pvals[i].val.d.estr; 
-			estrParams = NULL; 
+			estrBinary = pvals[i].val.d.estr;
+			estrParams = NULL;
 
 			/* Search for space */
 			c = es_getBufAddr(pvals[i].val.d.estr);
@@ -571,18 +577,22 @@ CODESTARTnewActInst
 			while(iCnt < es_strlen(pvals[i].val.d.estr) ) {
 				if (c[iCnt] == ' ') {
 					/* Split binary name from parameters */
-					estrBinary = es_newStrFromSubStr ( pvals[i].val.d.estr, 0, iCnt ); 
-					estrParams = es_newStrFromSubStr ( pvals[i].val.d.estr, iCnt+1, es_strlen(pvals[i].val.d.estr)); 
+					estrBinary = es_newStrFromSubStr ( pvals[i].val.d.estr, 0, iCnt );
+					estrParams = es_newStrFromSubStr ( pvals[i].val.d.estr, iCnt+1, es_strlen(pvals[i].val.d.estr));
 					break;
 				}
 				iCnt++;
 			}	
 			/* Assign binary and params */
 			pData->szBinary = (uchar*)es_str2cstr(estrBinary, NULL);
-			dbgprintf("mmexternal: szBinary = '%s'\n", pData->szBinary); 
+			DBGPRINTF("mmexternal: szBinary = '%s'\n", pData->szBinary);
 			/* Check for Params! */
 			if (estrParams != NULL) {
-				dbgprintf("mmexternal: szParams = '%s'\n", es_str2cstr(estrParams, NULL) ); 
+				if(Debug) {
+					char *params = es_str2cstr(estrParams, NULL);
+					DBGPRINTF("mmexternal: szParams = '%s'\n", params);
+					free(params);
+				}
 				
 				/* Count parameters if set */
 				c = es_getBufAddr(estrParams); /* Reset to beginning */
@@ -590,10 +600,10 @@ CODESTARTnewActInst
 				iCnt = 0;
 				while(iCnt < es_strlen(estrParams) ) {
 					if (c[iCnt] == ' ' && c[iCnt-1] != '\\')
-						 pData->iParams++; 
+						 pData->iParams++;
 					iCnt++;
 				}
-				dbgprintf("mmexternal: iParams = '%d'\n", pData->iParams); 
+				DBGPRINTF("mmexternal: iParams = '%d'\n", pData->iParams);
 
 				/* Create argv Array */
 				CHKmalloc(pData->aParams = malloc( (pData->iParams+1) * sizeof(char*))); /* One more for first param */ 
@@ -601,32 +611,32 @@ CODESTARTnewActInst
 				/* Second Loop, create parameter array*/
 				c = es_getBufAddr(estrParams); /* Reset to beginning */
 				iCnt = iStr = iPrm = 0;
-				estrTmp = NULL; 
-				bInQuotes = FALSE; 
+				estrTmp = NULL;
+				bInQuotes = FALSE;
 				/* Set first parameter to binary */
-				pData->aParams[iPrm] = strdup((char*)pData->szBinary); 
-				dbgprintf("mmexternal: Param (%d): '%s'\n", iPrm, pData->aParams[iPrm]);
-				iPrm++; 
+				pData->aParams[iPrm] = strdup((char*)pData->szBinary);
+				DBGPRINTF("mmexternal: Param (%d): '%s'\n", iPrm, pData->aParams[iPrm]);
+				iPrm++;
 				while(iCnt < es_strlen(estrParams) ) {
 					if ( c[iCnt] == ' ' && !bInQuotes ) {
 						/* Copy into Param Array! */
-						estrTmp = es_newStrFromSubStr( estrParams, iStr, iCnt-iStr); 
+						estrTmp = es_newStrFromSubStr( estrParams, iStr, iCnt-iStr);
 					}
 					else if ( iCnt+1 >= es_strlen(estrParams) ) {
 						/* Copy rest of string into Param Array! */
-						estrTmp = es_newStrFromSubStr( estrParams, iStr, iCnt-iStr+1); 
+						estrTmp = es_newStrFromSubStr( estrParams, iStr, iCnt-iStr+1);
 					}
 					else if (c[iCnt] == '"') {
 						/* switch inQuotes Mode */
-						bInQuotes = !bInQuotes; 
+						bInQuotes = !bInQuotes;
 					}
 
 					if ( estrTmp != NULL ) {
-						pData->aParams[iPrm] = es_str2cstr(estrTmp, NULL); 
+						pData->aParams[iPrm] = es_str2cstr(estrTmp, NULL);
 						iStr = iCnt+1; /* Set new start */
-						dbgprintf("mmexternal: Param (%d): '%s'\n", iPrm, pData->aParams[iPrm]);
+						DBGPRINTF("mmexternal: Param (%d): '%s'\n", iPrm, pData->aParams[iPrm]);
 						es_deleteStr( estrTmp );
-						estrTmp = NULL; 
+						estrTmp = NULL;
 						iPrm++;
 					}
 
@@ -634,7 +644,7 @@ CODESTARTnewActInst
 					iCnt++;
 				}
 				/* NULL last parameter! */
-				pData->aParams[iPrm] = NULL; 
+				pData->aParams[iPrm] = NULL;
 
 			}
 		} else if(!strcmp(actpblk.descr[i].name, "output")) {
@@ -656,7 +666,7 @@ CODESTARTnewActInst
 				ABORT_FINALIZE(RS_RET_INVLD_INTERFACE_INPUT);
 			}
 		} else {
-			dbgprintf("mmexternal: program error, non-handled param '%s'\n", actpblk.descr[i].name);
+			DBGPRINTF("mmexternal: program error, non-handled param '%s'\n", actpblk.descr[i].name);
 		}
 	}
 

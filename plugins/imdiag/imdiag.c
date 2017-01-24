@@ -36,6 +36,8 @@
 #include <netdb.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <pthread.h>
+#include <semaphore.h>
 #if HAVE_FCNTL_H
 #include <fcntl.h>
 #endif
@@ -53,7 +55,10 @@
 #include "datetime.h"
 #include "ratelimit.h"
 #include "queue.h"
+#include "lookup.h"
 #include "net.h" /* for permittedPeers, may be removed when this is removed */
+#include "statsobj.h"
+
 
 MODULE_TYPE_INPUT
 MODULE_TYPE_NOKEEP
@@ -67,6 +72,7 @@ DEFobjCurrIf(netstrm)
 DEFobjCurrIf(errmsg)
 DEFobjCurrIf(datetime)
 DEFobjCurrIf(prop)
+DEFobjCurrIf(statsobj)
 
 /* Module static data */
 static tcpsrv_t *pOurTcpsrv = NULL;  /* our TCP server(listener) TODO: change for multiple instances */
@@ -75,6 +81,18 @@ static prop_t *pInputName = NULL;	/* there is only one global inputName for all 
 static prop_t *pRcvDummy = NULL;
 static prop_t *pRcvIPDummy = NULL;
 
+statsobj_t *diagStats;
+STATSCOUNTER_DEF(potentialArtificialDelayMs, mutPotentialArtificialDelayMs)
+STATSCOUNTER_DEF(actualArtificialDelayMs, mutActualArtificialDelayMs)
+STATSCOUNTER_DEF(delayInvocationCount, mutDelayInvocationCount)
+
+static sem_t statsReportingBlocker;
+static long long statsReportingBlockStartTimeMs = 0;
+static int allowOnlyOnce = 0;
+DEF_ATOMIC_HELPER_MUT(mutAllowOnlyOnce);
+pthread_mutex_t mutStatsReporterWatch;
+pthread_cond_t statsReporterWatch;
+int statsReported = 0;
 
 /* config settings */
 struct modConfData_s {
@@ -179,7 +197,7 @@ getFirstWord(uchar **ppszSrc, uchar *pszBuf, size_t lenBuf, int options)
  * rgerhards, 2009-05-27
  */
 static rsRetVal __attribute__((format(printf, 2, 3)))
-sendResponse(tcps_sess_t *pSess, char *fmt, ...)
+sendResponse(tcps_sess_t *pSess, const char *const __restrict__ fmt, ...)
 {
 	va_list ap;
 	ssize_t len;
@@ -195,22 +213,17 @@ finalize_it:
 	RETiRet;
 }
 
-
-/* actually submit a message to the rsyslog core
+/* submit a generated numeric-suffix message to the rsyslog core
  */
 static rsRetVal
-doInjectMsg(int iNum, ratelimit_t *ratelimiter)
+doInjectMsg(uchar *szMsg, ratelimit_t *ratelimiter)
 {
-	uchar szMsg[1024];
-	msg_t *pMsg;
+	smsg_t *pMsg;
 	struct syslogTime stTime;
 	time_t ttGenTime;
 	DEFiRet;
 
-	snprintf((char*)szMsg, sizeof(szMsg)/sizeof(uchar),
-		 "<167>Mar  1 01:00:00 172.20.245.8 tag msgnum:%8.8d:", iNum);
-
-	datetime.getCurrTime(&stTime, &ttGenTime);
+	datetime.getCurrTime(&stTime, &ttGenTime, TIME_IN_LOCALTIME);
 	/* we now create our own message object and submit it to the queue */
 	CHKiRet(msgConstructWithTime(&pMsg, &stTime, ttGenTime));
 	MsgSetRawMsg(pMsg, (char*) szMsg, ustrlen(szMsg));
@@ -225,6 +238,19 @@ finalize_it:
 	RETiRet;
 }
 
+/* submit a generated numeric-suffix message to the rsyslog core
+ */
+static rsRetVal
+doInjectNumericSuffixMsg(int iNum, ratelimit_t *ratelimiter)
+{
+	uchar szMsg[1024];
+	DEFiRet;
+	snprintf((char*)szMsg, sizeof(szMsg)/sizeof(uchar),
+             "<167>Mar  1 01:00:00 172.20.245.8 tag msgnum:%8.8d:", iNum);
+	CHKiRet(doInjectMsg(szMsg, ratelimiter));
+finalize_it:
+	RETiRet;
+}
 
 /* This function injects messages. Command format:
  * injectmsg <fromnbr> <number-of-messages>
@@ -234,36 +260,48 @@ static rsRetVal
 injectMsg(uchar *pszCmd, tcps_sess_t *pSess)
 {
 	uchar wordBuf[1024];
-	int iFrom;
-	int nMsgs;
+	int iFrom, nMsgs;
+	uchar *litteralMsg;
 	int i;
 	ratelimit_t *ratelimit = NULL;
 	DEFiRet;
 
-	/* we do not check errors here! */
-	getFirstWord(&pszCmd, wordBuf, sizeof(wordBuf)/sizeof(uchar), TO_LOWERCASE);
-	iFrom = atoi((char*)wordBuf);
-	getFirstWord(&pszCmd, wordBuf, sizeof(wordBuf)/sizeof(uchar), TO_LOWERCASE);
-	nMsgs = atoi((char*)wordBuf);
+	litteralMsg = NULL;
+
 	CHKiRet(ratelimitNew(&ratelimit, "imdiag", "injectmsg"));
-
-	for(i = 0 ; i < nMsgs ; ++i) {
-		doInjectMsg(i + iFrom, ratelimit);
+	/* we do not check errors here! */
+	getFirstWord(&pszCmd, wordBuf, sizeof(wordBuf), TO_LOWERCASE);
+	if (ustrcmp(UCHAR_CONSTANT("litteral"), wordBuf) == 0) {
+		/* user has provided content for a message */
+		++pszCmd; /* ignore following space */
+		CHKiRet(doInjectMsg(pszCmd, ratelimit));
+		nMsgs = 1;
+	} else { /* assume 2 args, (from_idx, count) */
+		iFrom = atoi((char*)wordBuf);
+		getFirstWord(&pszCmd, wordBuf, sizeof(wordBuf), TO_LOWERCASE);
+		nMsgs = atoi((char*)wordBuf);
+		for(i = 0 ; i < nMsgs ; ++i) {
+			CHKiRet(doInjectNumericSuffixMsg(i + iFrom, ratelimit));
+		}
 	}
-
 	CHKiRet(sendResponse(pSess, "%d messages injected\n", nMsgs));
+	
 	DBGPRINTF("imdiag: %d messages injected\n", nMsgs);
 
 finalize_it:
 	if(ratelimit != NULL)
 		ratelimitDestruct(ratelimit);
+    free(litteralMsg);
 	RETiRet;
 }
 
 
 /* This function waits until all queues are drained (size = 0)
- * To make sure it really is drained, we check three times. Otherwise we
- * may just see races.
+ * To make sure it really is drained, we check multiple times. Otherwise we
+ * may just see races. Note: it is important to ensure that the size
+ * is zero multiple times in succession. Otherwise, we may just accidently
+ * hit a situation where the queue isn't filled for a while (we have seen
+ * this in practice, see https://github.com/rsyslog/rsyslog/issues/688).
  * Note: until 2014--07-13, this checked just the main queue. However,
  * the testbench was the sole user and checking all queues makes much more
  * sense. So we change function semantics instead of carrying the old
@@ -273,27 +311,136 @@ static rsRetVal
 waitMainQEmpty(tcps_sess_t *pSess)
 {
 	int iPrint = 0;
+	int nempty = 0;
 	DEFiRet;
 
 	while(1) {
-		if(iOverallQueueSize == 0) {
-			/* verify that queue is still empty (else it could just be a race!) */
-			srSleep(0,250000);/* wait a little bit */
-			if(iOverallQueueSize == 0) {
-				srSleep(0,500000);/* wait a little bit */
-			}
-		}
 		if(iOverallQueueSize == 0)
+			++nempty;
+		else
+			nempty = 0;
+		if(nempty > 10)
 			break;
-		if(iPrint++ % 500 == 0) 
-			dbgprintf("imdiag sleeping, wait queues drain, curr size %d\n", iOverallQueueSize);
-		srSleep(0,200000);/* wait a little bit */
+		if(iPrint++ % 500 == 0)
+			DBGPRINTF("imdiag sleeping, wait queues drain, "
+				"curr size %d, nempty %d\n",
+				iOverallQueueSize, nempty);
+		srSleep(0,100000);/* wait a little bit */
 	}
 
 	CHKiRet(sendResponse(pSess, "mainqueue empty\n"));
 	DBGPRINTF("imdiag: mainqueue empty\n");
 
 finalize_it:
+	RETiRet;
+}
+
+static rsRetVal
+awaitLookupTableReload(tcps_sess_t *pSess)
+{
+	DEFiRet;
+
+	while(1) {
+		if(lookupPendingReloadCount() == 0) {
+			break;
+		}
+		srSleep(0,500000);
+	}
+
+	CHKiRet(sendResponse(pSess, "no pending lookup-table reloads found\n"));
+	DBGPRINTF("imdiag: no pending lookup-table reloads found\n");
+
+finalize_it:
+	RETiRet;
+}
+
+static void
+imdiag_statsReadCallback(statsobj_t __attribute__((unused)) *ignore_stats,
+						   void __attribute__((unused)) *ignore_ctx) {
+	long long waitStartTimeMs = currentTimeMills();
+	sem_wait(&statsReportingBlocker);
+	long delta = currentTimeMills() - waitStartTimeMs;
+	if (ATOMIC_DEC_AND_FETCH(&allowOnlyOnce, &mutAllowOnlyOnce) < 0) {
+		sem_post(&statsReportingBlocker);
+	} else {
+		errmsg.LogError(0, RS_RET_OK, "imdiag(stats-read-callback): current stats-reporting "
+						"cycle will proceed now, next reporting cycle will again be blocked");
+	}
+
+	if (pthread_mutex_lock(&mutStatsReporterWatch) == 0) {
+		statsReported = 1;
+		pthread_cond_signal(&statsReporterWatch);
+		pthread_mutex_unlock(&mutStatsReporterWatch);
+	}
+	
+	if (delta > 0) {
+		STATSCOUNTER_ADD(actualArtificialDelayMs, mutActualArtificialDelayMs, delta);
+	}
+}
+
+static rsRetVal
+blockStatsReporting(tcps_sess_t *pSess) {
+	DEFiRet;
+
+	sem_wait(&statsReportingBlocker);
+	CHKiConcCtrl(pthread_mutex_lock(&mutStatsReporterWatch));
+	statsReported = 0;
+	CHKiConcCtrl(pthread_mutex_unlock(&mutStatsReporterWatch));
+	ATOMIC_STORE_0_TO_INT(&allowOnlyOnce, &mutAllowOnlyOnce);
+	statsReportingBlockStartTimeMs = currentTimeMills();
+	errmsg.LogError(0, RS_RET_OK, "imdiag: blocked stats reporting");
+	CHKiRet(sendResponse(pSess, "next stats reporting call will be blocked\n"));
+
+finalize_it:
+	if (iRet != RS_RET_OK) {
+		errmsg.LogError(0, iRet, "imdiag: block-stats-reporting wasn't successful");
+		CHKiRet(sendResponse(pSess, "imdiag::error something went wrong\n"));
+	}
+	RETiRet;
+}
+
+static rsRetVal
+awaitStatsReport(uchar *pszCmd, tcps_sess_t *pSess) {
+	uchar subCmd[1024];
+	int blockAgain = 0;
+	DEFiRet;
+
+	getFirstWord(&pszCmd, subCmd, sizeof(subCmd), TO_LOWERCASE);
+	blockAgain = (ustrcmp(UCHAR_CONSTANT("block_again"), subCmd) == 0);
+	if (statsReportingBlockStartTimeMs > 0) {
+		long delta = currentTimeMills() - statsReportingBlockStartTimeMs;
+		if (blockAgain) {
+			ATOMIC_STORE_1_TO_INT(&allowOnlyOnce, &mutAllowOnlyOnce);
+			errmsg.LogError(0, RS_RET_OK, "imdiag: un-blocking ONLY the next cycle of stats reporting");
+		} else {
+			statsReportingBlockStartTimeMs = 0;
+			errmsg.LogError(0, RS_RET_OK, "imdiag: un-blocking stats reporting");
+		}
+		sem_post(&statsReportingBlocker);
+		errmsg.LogError(0, RS_RET_OK, "imdiag: stats reporting unblocked");
+		STATSCOUNTER_ADD(potentialArtificialDelayMs, mutPotentialArtificialDelayMs, delta);
+		STATSCOUNTER_INC(delayInvocationCount, mutDelayInvocationCount);
+		errmsg.LogError(0, RS_RET_OK, "imdiag: will now await next reporting cycle");
+		CHKiConcCtrl(pthread_mutex_lock(&mutStatsReporterWatch));
+		while (! statsReported) {
+			CHKiConcCtrl(pthread_cond_wait(&statsReporterWatch, &mutStatsReporterWatch));
+		}
+		statsReported = 0;
+		CHKiConcCtrl(pthread_mutex_unlock(&mutStatsReporterWatch));
+		if (blockAgain) {
+			statsReportingBlockStartTimeMs = currentTimeMills();
+		}
+		errmsg.LogError(0, RS_RET_OK, "imdiag: stats were reported, wait complete, returning");
+		CHKiRet(sendResponse(pSess, "stats reporting was unblocked\n"));
+	} else {
+		CHKiRet(sendResponse(pSess, "imdiag::error : stats reporting was not blocked, bug?\n"));
+	}
+
+finalize_it:
+	if (iRet != RS_RET_OK) {
+		errmsg.LogError(0, iRet, "imdiag: stats-reporting unblock + await-run wasn't successfully completed");
+		CHKiRet(sendResponse(pSess, "imdiag::error something went wrong\n"));
+	}
 	RETiRet;
 }
 
@@ -315,12 +462,12 @@ OnMsgReceived(tcps_sess_t *pSess, uchar *pRcv, int iLenMsg)
 	 * WITHOUT a termination \0 char. So we need to convert it to one
 	 * before proceeding.
 	 */
-	CHKmalloc(pszMsg = MALLOC(sizeof(uchar) * (iLenMsg + 1)));
+	CHKmalloc(pszMsg = MALLOC(iLenMsg + 1));
 	pToFree = pszMsg;
 	memcpy(pszMsg, pRcv, iLenMsg);
 	pszMsg[iLenMsg] = '\0';
 
-	getFirstWord(&pszMsg, cmdBuf, sizeof(cmdBuf)/sizeof(uchar), TO_LOWERCASE);
+	getFirstWord(&pszMsg, cmdBuf, sizeof(cmdBuf), TO_LOWERCASE);
 
 	dbgprintf("imdiag received command '%s'\n", cmdBuf);
 	if(!ustrcmp(cmdBuf, UCHAR_CONSTANT("getmainmsgqueuesize"))) {
@@ -328,8 +475,14 @@ OnMsgReceived(tcps_sess_t *pSess, uchar *pRcv, int iLenMsg)
 		DBGPRINTF("imdiag: %d messages in main queue\n", iOverallQueueSize);
 	} else if(!ustrcmp(cmdBuf, UCHAR_CONSTANT("waitmainqueueempty"))) {
 		CHKiRet(waitMainQEmpty(pSess));
+	} else if(!ustrcmp(cmdBuf, UCHAR_CONSTANT("awaitlookuptablereload"))) {
+		CHKiRet(awaitLookupTableReload(pSess));
 	} else if(!ustrcmp(cmdBuf, UCHAR_CONSTANT("injectmsg"))) {
 		CHKiRet(injectMsg(pszMsg, pSess));
+	} else if(!ustrcmp(cmdBuf, UCHAR_CONSTANT("blockstatsreporting"))) {
+		CHKiRet(blockStatsReporting(pSess));
+	} else if(!ustrcmp(cmdBuf, UCHAR_CONSTANT("awaitstatsreport"))) {
+		CHKiRet(awaitStatsReport(pszMsg, pSess));
 	} else {
 		dbgprintf("imdiag unkown command '%s'\n", cmdBuf);
 		CHKiRet(sendResponse(pSess, "unkown command '%s'\n", cmdBuf));
@@ -383,7 +536,7 @@ static rsRetVal addTCPListener(void __attribute__((unused)) *pVal, uchar *pNewVa
 						UCHAR_CONSTANT("imdiag") : pszInputName));
 	CHKiRet(tcpsrv.SetOrigin(pOurTcpsrv, (uchar*)"imdiag"));
 	/* we support octect-cuunted frame (constant 1 below) */
-	tcpsrv.configureTCPListen(pOurTcpsrv, pNewVal, 1);
+	tcpsrv.configureTCPListen(pOurTcpsrv, pNewVal, 1, NULL);
 
 finalize_it:
 	if(iRet != RS_RET_OK) {
@@ -478,6 +631,12 @@ CODESTARTmodExit
 	/* free some globals to keep valgrind happy */
 	free(pszInputName);
 
+	statsobj.Destruct(&diagStats);
+	sem_destroy(&statsReportingBlocker);
+	DESTROY_ATOMIC_HELPER_MUT(mutAllowOnlyOnce);
+	pthread_cond_destroy(&statsReporterWatch);
+	pthread_mutex_destroy(&mutStatsReporterWatch);
+
 	/* release objects we used */
 	objRelease(net, LM_NET_FILENAME);
 	objRelease(netstrm, LM_NETSTRMS_FILENAME);
@@ -486,6 +645,7 @@ CODESTARTmodExit
 	objRelease(errmsg, CORE_COMPONENT);
 	objRelease(datetime, CORE_COMPONENT);
 	objRelease(prop, CORE_COMPONENT);
+	objRelease(statsobj, CORE_COMPONENT);
 ENDmodExit
 
 
@@ -531,6 +691,7 @@ CODEmodInit_QueryRegCFSLineHdlr
 	CHKiRet(objUse(errmsg, CORE_COMPONENT));
 	CHKiRet(objUse(datetime, CORE_COMPONENT));
 	CHKiRet(objUse(prop, CORE_COMPONENT));
+	CHKiRet(objUse(statsobj, CORE_COMPONENT));
 
 	/* register config file handlers */
 	CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiagserverrun"), 0, eCmdHdlrGetWord,
@@ -546,7 +707,28 @@ CODEmodInit_QueryRegCFSLineHdlr
 	CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiagserverinputname"), 0,
 				   eCmdHdlrGetWord, NULL, &pszInputName, STD_LOADABLE_MODULE_ID));
 	CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("resetconfigvariables"), 1, eCmdHdlrCustomHandler,
-		resetConfigVariables, NULL, STD_LOADABLE_MODULE_ID));
+							   resetConfigVariables, NULL, STD_LOADABLE_MODULE_ID));
+
+	sem_init(&statsReportingBlocker, 0, 1);
+	INIT_ATOMIC_HELPER_MUT(mutAllowOnlyOnce);
+	CHKiConcCtrl(pthread_mutex_init(&mutStatsReporterWatch, NULL));
+	CHKiConcCtrl(pthread_cond_init(&statsReporterWatch, NULL));
+
+	CHKiRet(statsobj.Construct(&diagStats));
+	CHKiRet(statsobj.SetName(diagStats, UCHAR_CONSTANT("imdiag-stats-reporting-controller")));
+	CHKiRet(statsobj.SetOrigin(diagStats, UCHAR_CONSTANT("imdiag")));
+	statsobj.SetStatsObjFlags(diagStats, STATSOBJ_FLAG_DO_PREPEND);
+	STATSCOUNTER_INIT(potentialArtificialDelayMs, mutPotentialArtificialDelayMs);
+	CHKiRet(statsobj.AddCounter(diagStats, UCHAR_CONSTANT("potentialTotalArtificialDelayInMs"),
+								ctrType_IntCtr, CTR_FLAG_NONE, &potentialArtificialDelayMs));
+	STATSCOUNTER_INIT(actualArtificialDelayMs, mutActualArtificialDelayMs);
+	CHKiRet(statsobj.AddCounter(diagStats, UCHAR_CONSTANT("actualTotalArtificialDelayInMs"),
+							ctrType_IntCtr, CTR_FLAG_NONE, &actualArtificialDelayMs));
+	STATSCOUNTER_INIT(delayInvocationCount, mutDelayInvocationCount);
+	CHKiRet(statsobj.AddCounter(diagStats, UCHAR_CONSTANT("delayInvocationCount"),
+								ctrType_IntCtr, CTR_FLAG_NONE, &delayInvocationCount));
+	CHKiRet(statsobj.SetReadNotifier(diagStats, imdiag_statsReadCallback, NULL));
+	CHKiRet(statsobj.ConstructFinalize(diagStats));
 ENDmodInit
 
 

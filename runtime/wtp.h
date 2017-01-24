@@ -50,6 +50,7 @@ struct wtp_s {
 	rsRetVal (*pConsumer)(void *); /* user-supplied consumer function for dewtpd messages */
 	/* synchronization variables */
 	pthread_mutex_t mutWtp; /* mutex for the wtp's thread management */
+	pthread_cond_t condThrdInitDone; /* signalled when a new thread is ready for work */
 	pthread_cond_t condThrdTrm;/* signalled when threads terminate */
 	/* end sync variables */
 	/* user objects */
@@ -83,6 +84,7 @@ rsRetVal wtpCancelAll(wtp_t *pThis);
 rsRetVal wtpSetDbgHdr(wtp_t *pThis, uchar *pszMsg, size_t lenMsg);
 rsRetVal wtpShutdownAll(wtp_t *pThis, wtpState_t tShutdownCmd, struct timespec *ptTimeout);
 PROTOTYPEObjClassInit(wtp);
+PROTOTYPEObjClassExit(wtp);
 PROTOTYPEpropSetMethFP(wtp, pfChkStopWrkr, rsRetVal(*pVal)(void*, int));
 PROTOTYPEpropSetMethFP(wtp, pfRateLimiter, rsRetVal(*pVal)(void*));
 PROTOTYPEpropSetMethFP(wtp, pfGetDeqBatchSize, rsRetVal(*pVal)(void*, int*));

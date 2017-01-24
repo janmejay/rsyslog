@@ -3,7 +3,7 @@
  *
  * File begun on 2014-07-07 by RGerhards
  *
- * Copyright 2014 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2014-2015 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of rsyslog.
  *
@@ -55,7 +55,8 @@ DEFobjCurrIf(datetime)
 
 /* parser instance parameters */
 static struct cnfparamdescr parserpdescr[] = {
-	{ "present.origin", eCmdHdlrBinary, 0 }
+	{ "present.origin", eCmdHdlrBinary, 0 },
+	{ "present.xr", eCmdHdlrBinary, 0 }
 };
 static struct cnfparamblk parserpblk =
 	{ CNFPARAMBLK_VERSION,
@@ -65,6 +66,7 @@ static struct cnfparamblk parserpblk =
 
 struct instanceConf_s {
 	int bOriginPresent; /* is ORIGIN field present? */
+	int bXrPresent; /* is XR? */
 };
 
 BEGINisCompatibleWithFeature
@@ -76,7 +78,7 @@ CODESTARTisCompatibleWithFeature
 ENDisCompatibleWithFeature
 
 
-/* create input instance, set default paramters, and
+/* create input instance, set default parameters, and
  * add it to the list of instances.
  */
 static rsRetVal
@@ -86,17 +88,26 @@ createInstance(instanceConf_t **pinst)
 	DEFiRet;
 	CHKmalloc(inst = MALLOC(sizeof(instanceConf_t)));
 	inst->bOriginPresent = 0;
+	inst->bXrPresent = 0;
 	*pinst = inst;
 finalize_it:
 	RETiRet;
 }
 
+
+BEGINfreeParserInst
+CODESTARTfreeParserInst
+	dbgprintf("pmciscoios: free parser instance %p\n", pInst);
+ENDfreeParserInst
+
+
 BEGINnewParserInst
-	struct cnfparamvals *pvals;
+	struct cnfparamvals *pvals = NULL;
 	int i;
 CODESTARTnewParserInst
 	DBGPRINTF("newParserInst (pmciscoios)\n");
 
+	inst = NULL;
 	CHKiRet(createInstance(&inst));
 
 	if(lst == NULL)
@@ -116,22 +127,20 @@ CODESTARTnewParserInst
 			continue;
 		if(!strcmp(parserpblk.descr[i].name, "present.origin")) {
 			inst->bOriginPresent = (int) pvals[i].val.d.n;
-		} else {
-			dbgprintf("pmciscoios: program error, non-handled "
-			  "param '%s'\n", parserpblk.descr[i].name);
-		}
+		} else if(!strcmp(parserpblk.descr[i].name, "present.xr")) {
+                        inst->bXrPresent = (int) pvals[i].val.d.n;
+                } else {
+                        dbgprintf("pmciscoios: program error, non-handled "
+                          "param '%s'\n", parserpblk.descr[i].name);
+                }
 	}
 finalize_it:
 CODE_STD_FINALIZERnewParserInst
 	if(lst != NULL)
 		cnfparamvalsDestruct(pvals, &parserpblk);
+	if(iRet != RS_RET_OK)
+		freeParserInst(inst);
 ENDnewParserInst
-
-
-BEGINfreeParserInst
-CODESTARTfreeParserInst
-	dbgprintf("pmciscoios: free parser instance %p\n", pInst);
-ENDfreeParserInst
 
 
 BEGINparse2
@@ -139,14 +148,15 @@ BEGINparse2
 	long long msgcounter;
 	int lenMsg;
 	int i;
-	int iHostname;
+	int iHostname = 0;
 	uchar bufParseTAG[512];
 	uchar bufParseHOSTNAME[CONF_HOSTNAME_MAXSIZE]; /* used by origin */
 CODESTARTparse2
 	DBGPRINTF("Message will now be parsed by pmciscoios\n");
 	assert(pMsg != NULL);
 	assert(pMsg->pszRawMsg != NULL);
-	lenMsg = pMsg->iLenRawMsg - pMsg->offAfterPRI; /* note: offAfterPRI is already the number of PRI chars (do not add one!) */
+	lenMsg = pMsg->iLenRawMsg - pMsg->offAfterPRI;
+	/* note: offAfterPRI is already the number of PRI chars (do not add one!) */
 	p2parse = pMsg->pszRawMsg + pMsg->offAfterPRI; /* point to start of text, after PRI */
 
 	/* first obtain the MESSAGE COUNTER. It must be numeric up until
@@ -184,8 +194,25 @@ CODESTARTparse2
 		p2parse += 2;
 	}
 
+        /* XR RSP (optional) */
+        if(pInst->bXrPresent) {
+                while(   lenMsg > 1
+                      && !(*p2parse == ':')) {
+                        --lenMsg;
+			++p2parse;
+                }
+                /* delimiter check */
+                if(lenMsg < 2) {
+                        DBGPRINTF("pmciscoios: fail after XR: '%s'\n", p2parse);
+                        ABORT_FINALIZE(RS_RET_COULD_NOT_PARSE);
+                }
+                p2parse += 1;
+        }
+
 	/* TIMESTAMP */
-	if(datetime.ParseTIMESTAMP3164(&(pMsg->tTIMESTAMP), &p2parse, &lenMsg, PARSE3164_TZSTRING) == RS_RET_OK) {
+	if(p2parse[0] == '*' || p2parse[0] == '.') p2parse++;
+	if(datetime.ParseTIMESTAMP3164(&(pMsg->tTIMESTAMP), &p2parse, &lenMsg, PARSE3164_TZSTRING,
+	NO_PERMIT_YEAR_AFTER_TIME) == RS_RET_OK) {
 		if(pMsg->dfltTZ[0] != '\0')
 			applyDfltTZ(&pMsg->tTIMESTAMP, pMsg->dfltTZ);
 	} else {
@@ -193,6 +220,20 @@ CODESTARTparse2
 		ABORT_FINALIZE(RS_RET_COULD_NOT_PARSE);
 	}
 	/* Note: date parser strips ": ", so we cannot do the delimiter check here */
+
+        /* XR RSP (optional) */
+        if(pInst->bXrPresent) {
+                while(   lenMsg > 1
+                      && !(*p2parse == '%')) {
+                        --lenMsg;
+                        p2parse++;
+                }
+                /* delimiter check */
+                if(lenMsg < 2) {
+                        DBGPRINTF("pmciscoios: fail after XR tag search: '%s'\n", p2parse);
+                        ABORT_FINALIZE(RS_RET_COULD_NOT_PARSE);
+                }
+        }
 
 	/* parse SYSLOG TAG. must always start with '%', else we have a field mismatch */
 	if(lenMsg < 1 || *p2parse != '%') {
@@ -206,6 +247,7 @@ CODESTARTparse2
 		--lenMsg;
 	}
 	/* delimiter check */
+	if(pInst->bXrPresent) p2parse++;
 	if(lenMsg < 2 || *p2parse != ':' || *(p2parse+1) != ' ') {
 		DBGPRINTF("pmciscoios: fail after tag: '%s'\n", p2parse);
 		ABORT_FINALIZE(RS_RET_COULD_NOT_PARSE);
@@ -217,6 +259,7 @@ CODESTARTparse2
 
 	/* if we reach this point, we have a wellformed message and can persist the values */
 	MsgSetTAG(pMsg, bufParseTAG, i);
+	/* if bOriginPresent !=0 iHostname gets initialized */
 	if(pInst->bOriginPresent)
 		MsgSetHOSTNAME(pMsg, bufParseHOSTNAME, iHostname);
 	MsgSetMSGoffs(pMsg, p2parse - pMsg->pszRawMsg);

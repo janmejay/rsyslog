@@ -55,6 +55,9 @@ librsyslog_la_SOURCES = \
 	modules.h \
 	statsobj.c \
 	statsobj.h \
+	dynstats.c \
+	dynstats.h \
+	statsobj.h \
 	stream.c \
 	stream.h \
 	var.c \
@@ -106,7 +109,7 @@ else
 librsyslog_la_CPPFLAGS = -DSD_EXPORT_SYMBOLS -D_PATH_MODDIR=\"$(pkglibdir)/\" -I\$(top_srcdir) -I\$(top_srcdir)/grammar
 endif
 #librsyslog_la_LDFLAGS = -module -avoid-version
-librsyslog_la_CPPFLAGS += $(PTHREADS_CFLAGS) $(LIBUUID_CFLAGS) $(JSON_C_CFLAGS) ${LIBESTR_CFLAGS} ${LIBLOGGING_STDLOG_CFLAGS} -I\$(top_srcdir)/tools
+librsyslog_la_CPPFLAGS += $(PTHREADS_CFLAGS) $(RSRT_CFLAGS) $(LIBUUID_CFLAGS) $(JSON_C_CFLAGS) ${LIBESTR_CFLAGS} ${LIBLOGGING_STDLOG_CFLAGS} -I\$(top_srcdir)/tools
 librsyslog_la_LIBADD =  $(DL_LIBS) $(RT_LIBS) $(LIBUUID_LIBS) $(JSON_C_LIBS) ${LIBESTR_LIBS} ${LIBLOGGING_STDLOG_LIBS}
 
 #
@@ -186,9 +189,11 @@ if ENABLE_LIBGCRYPT
    libgcry_la_SOURCES = libgcry.c libgcry_common.c libgcry.h
    libgcry_la_CPPFLAGS = $(RSRT_CFLAGS) $(LIBGCRYPT_CFLAGS)
    pkglib_LTLIBRARIES += lmcry_gcry.la
+   lmcry_gcry_la_DEPENDENCIES = librsyslog.la
    lmcry_gcry_la_SOURCES = lmcry_gcry.c lmcry_gcry.h
    lmcry_gcry_la_CPPFLAGS = $(RSRT_CFLAGS) $(LIBGCRYPT_CFLAGS)
-   lmcry_gcry_la_LDFLAGS = -module -avoid-version
+   lmcry_gcry_la_LDFLAGS = -module -avoid-version \
+	-Wl,--whole-archive,$(top_builddir)/runtime/.libs/librsyslog.a,--no-whole-archive
    lmcry_gcry_la_LIBADD = libgcry.la $(LIBGCRYPT_LIBS)
 endif
 
@@ -198,12 +203,63 @@ endif
 #
 if ENABLE_GUARDTIME
    noinst_LTLIBRARIES +=  librsgt.la
-   librsgt_la_SOURCES = librsgt.c librsgt_read.c librsgt.h
+   librsgt_la_SOURCES = librsgt.c librsgt_read.c librsgt.h librsgt_common.h
    pkglib_LTLIBRARIES += lmsig_gt.la
    lmsig_gt_la_SOURCES = lmsig_gt.c lmsig_gt.h
    lmsig_gt_la_CPPFLAGS = $(RSRT_CFLAGS) $(GUARDTIME_CFLAGS)
    lmsig_gt_la_LDFLAGS = -module -avoid-version
    lmsig_gt_la_LIBADD = librsgt.la $(GUARDTIME_LIBS)
+endif
+
+#
+# gssapi support
+# 
+if ENABLE_GSSAPI
+pkglib_LTLIBRARIES += lmgssutil.la
+lmgssutil_la_SOURCES = gss-misc.c gss-misc.h
+lmgssutil_la_CPPFLAGS = $(PTHREADS_CFLAGS) $(RSRT_CFLAGS)
+lmgssutil_la_LDFLAGS = -module -avoid-version
+lmgssutil_la_LIBADD = $(GSS_LIBS)
+endif
+
+pkglib_LTLIBRARIES += lmtcpsrv.la lmtcpclt.la
+#
+#
+# TCP (stream) server support
+#
+lmtcpsrv_la_SOURCES = \
+	tcps_sess.c \
+	tcps_sess.h \
+	tcpsrv.c \
+	tcpsrv.h
+lmtcpsrv_la_CPPFLAGS = $(PTHREADS_CFLAGS) $(RSRT_CFLAGS) $(LIBLOGGING_STDLOG_CFLAGS)
+lmtcpsrv_la_LDFLAGS = -module -avoid-version $(LIBLOGGING_STDLOG_LIBS)
+lmtcpsrv_la_LIBADD = 
+
+#
+# TCP (stream) client support
+#
+lmtcpclt_la_SOURCES = \
+	tcpclt.c \
+	tcpclt.h
+lmtcpclt_la_CPPFLAGS = $(PTHREADS_CFLAGS) $(RSRT_CFLAGS) $(LIBLOGGING_STDLOG_CFLAGS)
+lmtcpclt_la_LDFLAGS = -module -avoid-version $(LIBLOGGING_STDLOG_LIBS)
+lmtcpclt_la_LIBADD = 
+
+
+
+#
+# support library for guardtime KSI
+#
+if ENABLE_GT_KSI
+   noinst_LTLIBRARIES +=  librsksi.la
+   librsksi_la_SOURCES = librsksi.c librsksi_read.c librsksi.h librsgt_common.h
+   librsksi_la_CPPFLAGS =  $(RSRT_CFLAGS) $(GT_KSI_CFLAGS)
+   pkglib_LTLIBRARIES += lmsig_ksi.la
+   lmsig_ksi_la_SOURCES = lmsig_ksi.c lmsig_ksi.h
+   lmsig_ksi_la_CPPFLAGS = $(RSRT_CFLAGS) $(GT_KSI_CFLAGS)
+   lmsig_ksi_la_LDFLAGS = -module -avoid-version
+   lmsig_ksi_la_LIBADD = librsksi.la $(GT_KSI_LIBS)
 endif
 
 

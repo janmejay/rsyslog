@@ -3,7 +3,7 @@
  *
  * Begun 2005-09-15 RGerhards
  *
- * Copyright (C) 2005-2014 by Rainer Gerhards and Adiscon GmbH
+ * Copyright (C) 2005-2016 by Rainer Gerhards and Adiscon GmbH
  *
  * This file is part of the rsyslog runtime library.
  *
@@ -25,8 +25,24 @@
  */
 #ifndef INCLUDED_RSYSLOG_H
 #define INCLUDED_RSYSLOG_H
+#ifndef _AIX
+#pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
+#pragma GCC diagnostic ignored "-Wredundant-decls" // TODO: remove!
+#pragma GCC diagnostic ignored "-Wstrict-prototypes" // TODO: remove!
+#pragma GCC diagnostic ignored "-Wswitch-default" // TODO: remove!
+#endif 
 #include <pthread.h>
 #include "typedefs.h"
+
+#if defined(_AIX)
+#include <sys/select.h>
+/* AIXPORT : start*/
+#define SRC_FD          13
+#define SRCMSG          (sizeof(srcpacket))
+extern int src_exists;
+#endif
+/* src end */
+
 
 /* ############################################################# *
  * #                 Some constant values                      # *
@@ -83,7 +99,8 @@
 #define LOG_NFACILITIES 24+1 /* plus one for our special "invld" facility! */
 #define LOG_MAXPRI 191	/* highest supported valid PRI value --> RFC3164, RFC5424 */
 #undef LOG_MAKEPRI
-#define LOG_PRI_INVLD	(LOG_INVLD|LOG_DEBUG)	/* PRI is invalid --> special "invld.=debug" PRI code (rsyslog-specific) */
+#define LOG_PRI_INVLD	(LOG_INVLD|LOG_DEBUG)
+/* PRI is invalid --> special "invld.=debug" PRI code (rsyslog-specific) */
 
 #define	LOG_EMERG	0	/* system is unusable */
 #define	LOG_ALERT	1	/* action must be taken immediately */
@@ -106,6 +123,10 @@
 #define	LOG_CRON	(9<<3)	/* clock daemon */
 #define	LOG_AUTHPRIV	(10<<3)	/* security/authorization messages (private) */
 #define	LOG_FTP		(11<<3)	/* ftp daemon */
+#if defined(_AIX)		/* AIXPORT : These are necessary for AIX */
+#define	LOG_ASO		(12<<3) /* Active System Optimizer. Reserved for internal use */
+#define	LOG_CAA		(15<<3) /* Cluster aware AIX subsystem */
+#endif
 #define	LOG_LOCAL0	(16<<3)	/* reserved for local use */
 #define	LOG_LOCAL1	(17<<3)	/* reserved for local use */
 #define	LOG_LOCAL2	(18<<3)	/* reserved for local use */
@@ -117,18 +138,23 @@
 #define LOG_FAC_INVLD   24
 #define	LOG_INVLD	(LOG_FAC_INVLD<<3)	/* invalid facility/PRI code */
 
-/* we need to use a function to avoid side-effects. This MUST guard
- * against invalid facility values. rgerhards, 2014-09-16
+/* we need to evaluate our argument only once, as otherwise we may
+ * have side-effects (this was seen in some version).
+ * Note: I know that "static inline" is not the right thing from a C99
+ * PoV, but some environments treat, even in C99 mode, compile
+ * non-static inline into the source even if not defined as "extern". This
+ * obviously results in linker errors. Using "static inline" as below together
+ * with "__attribute__((unused))" works in all cases. Note also that we
+ * cannot work around this in pri2fac, as we would otherwise need to evaluate
+ * pri more than once.
  */
-static inline syslog_pri_t pri2fac(const syslog_pri_t pri)
+static inline syslog_pri_t __attribute__((unused))
+pri2fac(const syslog_pri_t pri)
 {
-	unsigned fac = pri >> 3;
-	return (fac > 23) ? LOG_FAC_INVLD : fac;
+       unsigned fac = pri >> 3;
+       return (fac > 23) ? LOG_FAC_INVLD : fac;
 }
-static inline syslog_pri_t pri2sev(const syslog_pri_t pri)
-{
-	return pri & 0x07;
-}
+#define pri2sev(pri) ((pri) & 0x07)
 
 /* the rsyslog core provides information about present feature to plugins
  * asking it. Below are feature-test macros which must be used to query
@@ -157,7 +183,9 @@ enum rsRetVal_				/** return value. All methods return this if not specified oth
 	/* begin regular error codes */
 	RS_RET_NOT_IMPLEMENTED = -7,	/**< implementation is missing (probably internal error or lazyness ;)) */
 	RS_RET_OUT_OF_MEMORY = -6,	/**< memory allocation failed */
-	RS_RET_PROVIDED_BUFFER_TOO_SMALL = -50,/**< the caller provided a buffer, but the called function sees the size of this buffer is too small - operation not carried out */
+	RS_RET_PROVIDED_BUFFER_TOO_SMALL = -50,
+/*< the caller provided a buffer, but the called function sees the size of this buffer is too small -
+operation not carried out */
 	RS_RET_TRUE = -3,		/**< to indicate a true state (can be used as TRUE, legacy) */
 	RS_RET_FALSE = -2,		/**< to indicate a false state (can be used as FALSE, legacy) */
 	RS_RET_NO_IRET = -8,	/**< This is a trick for the debuging system - it means no iRet is provided  */
@@ -171,6 +199,7 @@ enum rsRetVal_				/** return value. All methods return this if not specified oth
 	RS_RET_NO_MORE_DATA = -3006,	/**< insufficient data, e.g. end of string during parsing */
 	RS_RET_INVALID_IP = -3007,	/**< invalid ip found where valid was expected */
 	RS_RET_OBJ_CREATION_FAILED = - 3008, /**< the creation of an object failed (no details available) */
+	RS_RET_INOTIFY_INIT_FAILED = - 3009, /**< the initialization of an inotify instance failed (no details available) */
 	RS_RET_PARAM_ERROR = -1000,	/**< invalid parameter in call to function */
 	RS_RET_MISSING_INTERFACE = -1001,/**< interface version mismatch, required missing */
 	RS_RET_INVALID_CORE_INTERFACE = -1002,/**< interface provided by host invalid, can not be used */
@@ -241,7 +270,7 @@ enum rsRetVal_				/** return value. All methods return this if not specified oth
 	RS_RET_OUT_OF_STACKSPACE = -2055, /**< a stack data structure is exhausted and can not be grown */
 	RS_RET_STACK_EMPTY = -2056, /**< a pop was requested on a stack, but the stack was already empty */
 	RS_RET_INVALID_VMOP = -2057, /**< invalid virtual machine instruction */
-	RS_RET_INVALID_VAR = -2058, /**< a var_t or its content is unsuitable, eg. VARTYPE_NONE */
+	RS_RET_INVALID_VAR = -2058, /**< a var or its content is unsuitable, eg. VARTYPE_NONE */
 	RS_RET_INVALID_NUMBER = -2059, /**< number invalid during parsing */
 	RS_RET_NOT_A_NUMBER = -2060, /**< e.g. conversion impossible because the string is not a number */
 	RS_RET_OBJ_ALREADY_REGISTERED = -2061, /**< object (name) is already registered */
@@ -317,13 +346,15 @@ enum rsRetVal_				/** return value. All methods return this if not specified oth
 	RS_RET_ERR_OPEN_KLOG = -2145, /**< error opening or reading the kernel log socket */
 	RS_RET_ERR_AQ_CONLOG = -2146, /**< error aquiring console log (on solaris) */
 	RS_RET_ERR_DOOR = -2147, /**< some problems with handling the Solaris door functionality */
-	RS_RET_NO_SRCNAME_TPL = -2150, /**< sourcename template was not specified where one was needed (omudpspoof spoof addr) */
+	RS_RET_NO_SRCNAME_TPL = -2150, /**< sourcename template was not specified where one was needed
+(omudpspoof spoof addr) */
 	RS_RET_HOST_NOT_SPECIFIED = -2151, /**< (target) host was not specified where it was needed */
 	RS_RET_ERR_LIBNET_INIT = -2152, /**< error initializing libnet, e.g. because not running as root */
 	RS_RET_FORCE_TERM = -2153,	/**< thread was forced to terminate by bShallShutdown, a state, not an error */
 	RS_RET_RULES_QUEUE_EXISTS = -2154,/**< we were instructed to create a new ruleset queue, but one already exists */
 	RS_RET_NO_CURR_RULESET = -2155,/**< no current ruleset exists (but one is required) */
-	RS_RET_NO_MSG_PASSING = -2156,/**< output module interface parameter passing mode "MSG" is not available but required */
+	RS_RET_NO_MSG_PASSING = -2156,
+/*< output module interface parameter passing mode "MSG" is not available but required */
 	RS_RET_RULESET_NOT_FOUND = -2157,/**< a required ruleset could not be found */
 	RS_RET_NO_RULESET= -2158,/**< no ruleset name as specified where one was needed */
 	RS_RET_PARSER_NOT_FOUND = -2159,/**< parser with the specified name was not found */
@@ -337,7 +368,8 @@ enum rsRetVal_				/** return value. All methods return this if not specified oth
 	RS_RET_CONF_NOT_GLBL = -2167,	/**< $Begin not in global scope */
 	RS_RET_CONF_IN_GLBL = -2168,	/**< $End when in global scope */
 	RS_RET_CONF_INVLD_END = -2169,	/**< $End for wrong conf object (probably nesting error) */
-	RS_RET_CONF_INVLD_SCOPE = -2170,/**< config statement not valid in current scope (e.g. global stmt in action block) */
+	RS_RET_CONF_INVLD_SCOPE = -2170,
+/*< config statement not valid in current scope (e.g. global stmt in action block) */
 	RS_RET_CONF_END_NO_ACT = -2171,	/**< end of action block, but no actual action specified */
 	RS_RET_NO_LSTN_DEFINED = -2172, /**< no listener defined (e.g. inside an input module) */
 	RS_RET_EPOLL_CR_FAILED = -2173, /**< epoll_create() failed */
@@ -439,6 +471,18 @@ enum rsRetVal_				/** return value. All methods return this if not specified oth
 	RS_RET_KAFKA_ERROR = -2422,/**< error reported by Apache Kafka subsystem. See message for details. */
 	RS_RET_KAFKA_NO_VALID_BROKERS = -2423,/**< no valid Kafka brokers configured/available */
 	RS_RET_KAFKA_PRODUCE_ERR = -2424,/**< error during Kafka produce function */
+	RS_RET_CONF_PARAM_INVLD = -2425,/**< config parameter is invalid */
+	RS_RET_KSI_ERR = -2426,/**< error in KSI subsystem */
+	RS_RET_ERR_LIBLOGNORM = -2427,/**< cannot obtain liblognorm ctx */
+	RS_RET_CONC_CTRL_ERR = -2428,/**< error in lock/unlock/condition/concurrent-modification operation */
+	RS_RET_SENDER_GONE_AWAY = -2429,/**< warning: sender not seen for configured amount of time */
+	RS_RET_SENDER_APPEARED = -2430,/**< info: new sender appeared */
+	RS_RET_FILE_ALREADY_IN_TABLE = -2431,/**< in imfile: table already contains to be added file */
+	RS_RET_ERR_DROP_PRIV = -2432,/**< error droping privileges */
+	RS_RET_FILE_OPEN_ERROR = -2433, /**< error other than "not found" occured during open() */
+	RS_RET_FILE_CHOWN_ERROR = -2434, /**< error during chown() */
+	RS_RET_RENAME_TMP_QI_ERROR = -2435, /**< renaming temporary .qi file failed */
+	RS_RET_ERR_SETENV = -2436, /**< error setting an environment variable */
 
 	/* RainerScript error messages (range 1000.. 1999) */
 	RS_RET_SYSVAR_NOT_FOUND = 1001, /**< system variable could not be found (maybe misspelled) */
@@ -446,7 +490,8 @@ enum rsRetVal_				/** return value. All methods return this if not specified oth
 
 	/* some generic error/status codes */
 	RS_RET_OK = 0,			/**< operation successful */
-	RS_RET_OK_DELETE_LISTENTRY = 1,	/**< operation successful, but callee requested the deletion of an entry (special state) */
+	RS_RET_OK_DELETE_LISTENTRY = 1,
+/*< operation successful, but callee requested the deletion of an entry (special state) */
 	RS_RET_TERMINATE_NOW = 2,	/**< operation successful, function is requested to terminate (mostly used with threads) */
 	RS_RET_NO_RUN = 3,		/**< operation successful, but function does not like to be executed */
 	RS_RET_IDLE = 4,		/**< operation successful, but callee is idle (e.g. because queue is empty) */
@@ -457,11 +502,13 @@ enum rsRetVal_				/** return value. All methods return this if not specified oth
  * Be sure to call the to-be-returned variable always "iRet" and
  * the function finalizer always "finalize_it".
  */
-#if HAVE_BUILTIN_EXCEPT
+#ifdef HAVE_BUILTIN_EXCEPT
 #	define CHKiRet(code) if(__builtin_expect(((iRet = code) != RS_RET_OK), 0)) goto finalize_it
 #else
 #	define CHKiRet(code) if((iRet = code) != RS_RET_OK) goto finalize_it
 #endif
+
+# define CHKiConcCtrl(code) if (code != 0) { iRet = RS_RET_CONC_CTRL_ERR; errno = code; goto finalize_it; }
 
 /* macro below is to be used if we need our own handling, eg for cleanup */
 #define CHKiRet_Hdlr(code) if((iRet = code) != RS_RET_OK)
@@ -521,9 +568,9 @@ typedef enum rsObjectID rsObjID;
 #define RSFREEOBJ(x) {(x)->OID = OIDrsFreed; free(x);}
 #endif
 
+extern pthread_attr_t default_thread_attr;
 #ifdef HAVE_PTHREAD_SETSCHEDPARAM
 extern struct sched_param default_sched_param;
-extern pthread_attr_t default_thread_attr;
 extern int default_thr_sched_policy;
 #endif
 
@@ -540,11 +587,11 @@ extern int default_thr_sched_policy;
  * absolutely necessary - all output plugins need to be changed!
  *
  * If a change is "just" for internal working, consider adding a
- * separate paramter outside of this structure. Of course, it is
+ * separate parameter outside of this structure. Of course, it is
  * best to avoid this as well ;-)
  * rgerhards, 2013-12-04
  */
-struct __attribute__ ((__packed__)) actWrkrIParams {
+struct actWrkrIParams {
 	uchar *param;
 	uint32_t lenBuf;  /* length of string buffer (if string ptr) */
 	uint32_t lenStr;  /* length of current string (if string ptr) */
@@ -576,8 +623,9 @@ struct __attribute__ ((__packed__)) actWrkrIParams {
 #define MUTEX_ALREADY_LOCKED	0
 #define LOCK_MUTEX		1
 
-/* The following prototype is convenient, even though it may not be the 100% correct place.. -- rgerhards 2008-01-07 */
-void dbgprintf(char *, ...) __attribute__((format(printf, 1, 2)));
+/* The following prototype is convenient, even though it may not be the 100%
+correct place.. -- rgerhards 2008-01-07 */
+void dbgprintf(const char *, ...) __attribute__((format(printf, 1, 2)));
 
 
 #include "debug.h"
@@ -596,25 +644,13 @@ extern uchar *glblModPath; /* module load path */
 extern void (*glblErrLogger)(const int, const int, const uchar*);
 
 /* some runtime prototypes */
-rsRetVal rsrtInit(char **ppErrObj, obj_if_t *pObjIF);
+rsRetVal rsrtInit(const char **ppErrObj, obj_if_t *pObjIF);
 rsRetVal rsrtExit(void);
 int rsrtIsInit(void);
 void rsrtSetErrLogger(void (*errLogger)(const int, const int, const uchar*));
 
+void dfltErrLogger(const int, const int, const uchar *errMsg);
 
-/* our own support for breaking changes in json-c */
-#ifdef HAVE_JSON_OBJECT_OBJECT_GET_EX
-#	define RS_json_object_object_get_ex(obj, key, retobj) \
-		json_object_object_get_ex((obj), (key), (retobj))
-#else
-#	define RS_json_object_object_get_ex(obj, key, retobj) \
-		(!json_object_is_type(obj, json_type_object) || \
-				(*(retobj) = json_object_object_get((obj), (key))) == NULL) ? FALSE : TRUE
-#endif
-
-#ifndef HAVE_JSON_BOOL
-typedef int json_bool;
-#endif
 
 /* this define below is (later) intended to be used to implement empty
  * structs. TODO: check if compilers supports this and, if not, define
@@ -627,5 +663,15 @@ typedef int json_bool;
 extern rsconf_t *ourConf; /* defined by syslogd.c, a hack for functions that do not
 			     yet receive a copy, so that we can incrementially
 			     compile and change... -- rgerhars, 2011-04-19 */
+
+
+/* here we add some stuff from the compatibility layer. A separate include
+ * would be cleaner, but would potentially require changes all over the
+ * place. So doing it here is better. The respective replacement
+ * functions should usually be found under ./compat -- rgerhards, 2015-05-20
+ */
+#ifndef HAVE_STRNDUP
+char * strndup(const char *s, size_t n);
+#endif
 
 #endif /* multi-include protection */

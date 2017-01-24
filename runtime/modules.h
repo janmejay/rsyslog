@@ -38,6 +38,7 @@
 #include "objomsr.h"
 #include "rainerscript.h"
 
+
 /* the following define defines the current version of the module interface.
  * It can be used by any module which want's to simply prevent version conflicts
  * and does not intend to do specific old-version emulations.
@@ -103,7 +104,7 @@ struct modInfo_s {
 	unsigned	uRefCnt;	/* reference count for this module; 0 -> may be unloaded */
 	sbool		bSetModCnfCalled;/* is setModCnf already called? Needed for built-in modules */
 	/* functions supported by all types of modules */
-	rsRetVal (*modInit)(int, int*, rsRetVal(**)());		/* initialize the module */
+	rsRetVal (*modInit)(int, int*, rsRetVal(**)(void*));		/* initialize the module */
 		/* be sure to support version handshake! */
 	rsRetVal (*modQueryEtryPt)(uchar *name, rsRetVal (**EtryPoint)()); /* query entry point addresses */
 	rsRetVal (*isCompatibleWithFeature)(syslogFeature);
@@ -112,7 +113,8 @@ struct modInfo_s {
 	rsRetVal (*tryResume)(void*);/* called to see if module actin can be resumed now */
 	rsRetVal (*modExit)(void);		/* called before termination or module unload */
 	rsRetVal (*modGetID)(void **);		/* get its unique ID from module */
-	rsRetVal (*doHUP)(void *);		/* non-restart type HUP handler */
+	rsRetVal (*doHUP)(void *);		/* HUP handler, action level */
+	rsRetVal (*doHUPWrkr)(void *);		/* HUP handler, wrkr instance level */
 	/* v2 config system specific */
 	rsRetVal (*beginCnfLoad)(void*newCnf, rsconf_t *pConf);
 	rsRetVal (*setModCnf)(struct nvlst *lst);
@@ -135,7 +137,7 @@ struct modInfo_s {
 			 */
 			rsRetVal (*beginTransaction)(void*);
 			rsRetVal (*commitTransaction)(void *const, actWrkrIParams_t *const, const unsigned);
-			rsRetVal (*doAction)(uchar**, void*);
+			rsRetVal (*doAction)(void** params, void*pWrkrData);
 			rsRetVal (*endTransaction)(void*);
 			rsRetVal (*parseSelectorAct)(uchar**, void**,omodStringRequest_t**);
 			rsRetVal (*newActInst)(uchar *modName, struct nvlst *lst, void **, omodStringRequest_t **);
@@ -150,11 +152,11 @@ struct modInfo_s {
 		struct { /* data for parser modules */
 			rsRetVal (*newParserInst)(struct nvlst *lst, void *pinst);
 			rsRetVal (*freeParserInst)(void *pinst);
-			rsRetVal (*parse2)(instanceConf_t *const, msg_t*);
-			rsRetVal (*parse)(msg_t*);
+			rsRetVal (*parse2)(instanceConf_t *const, smsg_t*);
+			rsRetVal (*parse)(smsg_t*);
 		} pm;
 		struct { /* data for strgen modules */
-			rsRetVal (*strgen)(const msg_t*const, actWrkrIParams_t *const iparam);
+			rsRetVal (*strgen)(const smsg_t*const, actWrkrIParams_t *const iparam);
 		} sm;
 	} mod;
 	void *pModHdlr; /* handler to the dynamic library holding the module */
@@ -171,8 +173,8 @@ BEGINinterface(module) /* name must also be changed in ENDinterface macro! */
 	cfgmodules_etry_t *(*GetNxtCnfType)(rsconf_t *cnf, cfgmodules_etry_t *pThis, eModType_t rqtdType);
 	uchar *(*GetName)(modInfo_t *pThis);
 	uchar *(*GetStateName)(modInfo_t *pThis);
-	rsRetVal (*Use)(char *srcFile, modInfo_t *pThis);	/**< must be called before a module is used (ref counting) */
-	rsRetVal (*Release)(char *srcFile, modInfo_t **ppThis);	/**< release a module (ref counting) */
+	rsRetVal (*Use)(const char *srcFile, modInfo_t *pThis);	/**< must be called before a module is used (ref counting) */
+	rsRetVal (*Release)(const char *srcFile, modInfo_t **ppThis);	/**< release a module (ref counting) */
 	void (*PrintList)(void);
 	rsRetVal (*UnloadAndDestructAll)(eModLinkType_t modLinkTypesToUnload);
 	rsRetVal (*doModInit)(rsRetVal (*modInit)(), uchar *name, void *pModHdlr, modInfo_t **pNew);
@@ -180,7 +182,7 @@ BEGINinterface(module) /* name must also be changed in ENDinterface macro! */
 	rsRetVal (*SetModDir)(uchar *name);
 	modInfo_t *(*FindWithCnfName)(rsconf_t *cnf, uchar *name, eModType_t rqtdType); /* added v3, 2011-07-19 */
 ENDinterface(module)
-#define moduleCURR_IF_VERSION 4 /* increment whenever you change the interface structure! */
+#define moduleCURR_IF_VERSION 5 /* increment whenever you change the interface structure! */
 /* Changes: 
  * v2 
  * - added param bCondLoad to Load call - 2011-04-27
@@ -199,6 +201,7 @@ PROTOTYPEObj(module);
  */
 rsRetVal modulesProcessCnf(struct cnfobj *o);
 uchar *modGetName(modInfo_t *pThis);
-rsRetVal addModToCnfList(cfgmodules_etry_t *pNew, cfgmodules_etry_t *pLast);
+rsRetVal addModToCnfList(cfgmodules_etry_t **pNew, cfgmodules_etry_t *pLast);
 rsRetVal readyModForCnf(modInfo_t *pThis, cfgmodules_etry_t **ppNew, cfgmodules_etry_t **ppLast);
+
 #endif /* #ifndef MODULES_H_INCLUDED */

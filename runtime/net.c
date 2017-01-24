@@ -12,7 +12,7 @@
  * long term, but it is good to have it out of syslogd.c. Maybe this here is
  * an interim location ;)
  *
- * Copyright 2007-2014 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2007-2016 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of rsyslog.
  *
@@ -77,6 +77,9 @@ DEFobjCurrIf(errmsg)
 DEFobjCurrIf(glbl)
 DEFobjCurrIf(prop)
 
+#ifndef HAVE_STRUCT_SOCKADDR_SA_LEN
+extern size_t SALEN(struct sockaddr *sa);
+#endif
 /* support for defining allowed TCP and UDP senders. We use the same
  * structure to implement this (a linked list), but we define two different
  * list roots, one for UDP and one for TCP.
@@ -102,7 +105,7 @@ int     ACLDontResolve = 0;       /* add hostname to acl instead of resolving it
 /* sets the correct allow root pointer based on provided type
  * rgerhards, 2008-12-01
  */
-static inline rsRetVal
+static rsRetVal
 setAllowRoot(struct AllowedSenders **ppAllowRoot, uchar *pszType)
 {
 	DEFiRet;
@@ -126,7 +129,7 @@ finalize_it:
 /* re-initializes (sets to NULL) the correct allow root pointer
  * rgerhards, 2009-01-12
  */
-static inline rsRetVal
+static rsRetVal
 reinitAllowRoot(uchar *pszType)
 {
 	DEFiRet;
@@ -484,7 +487,7 @@ finalize_it:
 
 /* Code for handling allowed/disallowed senders
  */
-static inline void MaskIP6 (struct in6_addr *addr, uint8_t bits) {
+static void MaskIP6 (struct in6_addr *addr, uint8_t bits) {
 	register uint8_t i;
 	
 	assert (addr != NULL);
@@ -497,7 +500,7 @@ static inline void MaskIP6 (struct in6_addr *addr, uint8_t bits) {
 		addr->s6_addr32[i] = 0;
 }
 
-static inline void MaskIP4 (struct in_addr  *addr, uint8_t bits) {
+static void MaskIP4 (struct in_addr  *addr, uint8_t bits) {
 	
 	assert (addr != NULL);
 	assert (bits <=32 );
@@ -514,7 +517,7 @@ static inline void MaskIP4 (struct in_addr  *addr, uint8_t bits) {
  * when being cancelled, at least if the module was dlloaded.
  * rgerhards, 2008-09-30
  */
-static inline int
+static int
 mygetnameinfo(const struct sockaddr *sa, socklen_t salen,
                        char *host, size_t hostlen,
                        char *serv, size_t servlen, int flags)
@@ -684,7 +687,8 @@ static rsRetVal AddAllowedSender(struct AllowedSenders **ppRoot, struct AllowedS
 			        errmsg.LogError(0, NO_ERRCODE, "DNS error: Can't resolve \"%s\"", iAllow->addr.HostWildcard);
 				
 				if (ACLAddHostnameOnFail) {
-				        errmsg.LogError(0, NO_ERRCODE, "Adding hostname \"%s\" to ACL as a wildcard entry.", iAllow->addr.HostWildcard);
+				        errmsg.LogError(0, NO_ERRCODE, "Adding hostname \"%s\" to ACL as a wildcard "
+					"entry.", iAllow->addr.HostWildcard);
 				        iRet = AddAllowedSenderEntry(ppRoot, ppLast, iAllow, iSignificantBits);
 					FINALIZE;
 				} else {
@@ -715,7 +719,7 @@ static rsRetVal AddAllowedSender(struct AllowedSenders **ppRoot, struct AllowedS
 						
 						iSignificantBits = 32;
 						allowIP.flags = 0;
-						if((allowIP.addr.NetAddr = (struct sockaddr *) MALLOC(sizeof(struct sockaddr_in)))
+						if((allowIP.addr.NetAddr = (struct sockaddr *) MALLOC(sizeof(struct sockaddr)))
 						    == NULL) {
 							ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
 						}
@@ -773,15 +777,30 @@ finalize_it:
  * iListToPrint = 1 means UDP, 2 means TCP
  * rgerhards, 2005-09-27
  */
-void PrintAllowedSenders(int iListToPrint)
+static void
+PrintAllowedSenders(int iListToPrint)
 {
 	struct AllowedSenders *pSender;
 	uchar szIP[64];
 	
-	assert((iListToPrint == 1) || (iListToPrint == 2)
-#ifdef USE_GSSAPI
-	       || (iListToPrint == 3)
-#endif
+#ifdef _AIX
+#ifdef USE_GSSAPI 
+	assert((iListToPrint == 1) || (iListToPrint == 2) || (iListToPrint == 3));
+	dbgprintf("Allowed %s Senders:\n",
+	       (iListToPrint == 1) ? "UDP" :
+	       (iListToPrint == 3) ? "GSS" :
+	       "TCP");
+#else 
+	assert((iListToPrint == 1) || (iListToPrint == 2));
+	dbgprintf("Allowed %s Senders:\n",
+	       (iListToPrint == 1) ? "UDP" :
+	       "TCP");
+#endif /* USE_GSSAPI */
+#else /* _AIX */
+	assert((iListToPrint == 1) || (iListToPrint == 2) 
+#ifdef USE_GSSAPI 
+	       || (iListToPrint == 3)  
+#endif 
 	       );
 
 	dbgprintf("Allowed %s Senders:\n",
@@ -790,6 +809,7 @@ void PrintAllowedSenders(int iListToPrint)
 	       (iListToPrint == 3) ? "GSS" :
 #endif
 	       "TCP");
+#endif /* End of _AIX */
 
 	pSender = (iListToPrint == 1) ? pAllowedSenders_UDP :
 #ifdef USE_GSSAPI
@@ -826,7 +846,8 @@ void PrintAllowedSenders(int iListToPrint)
  * (if the line is correct).
  * rgerhards, 2005-09-27
  */
-rsRetVal addAllowedSenderLine(char* pName, uchar** ppRestOfConfLine)
+static rsRetVal
+addAllowedSenderLine(char* pName, uchar** ppRestOfConfLine)
 {
 	struct AllowedSenders **ppRoot;
 	struct AllowedSenders **ppLast;
@@ -900,12 +921,11 @@ rsRetVal addAllowedSenderLine(char* pName, uchar** ppRestOfConfLine)
 
 /* compares a host to an allowed sender list entry. Handles all subleties
  * including IPv4/v6 as well as domain name wildcards.
- * This is a helper to isAllowedSender. As it is only called once, it is
- * declared inline.
+ * This is a helper to isAllowedSender.
  * Returns 0 if they do not match, 1 if they match and 2 if a DNS name would have been required.
  * contributed 2007-07-16 by mildew@gmail.com
  */
-static inline int
+static int
 MaskCmp(struct NetAddr *pAllow, uint8_t bits, struct sockaddr *pFrom, const char *pszFromHost, int bChkDNS)
 {
 	assert(pAllow != NULL);
@@ -1077,9 +1097,10 @@ should_use_so_bsdcompat(void)
 /* print out which socket we are listening on. This is only
  * a debug aid. rgerhards, 2007-07-02
  */
-void debugListenInfo(int fd, char *type)
+static void
+debugListenInfo(int fd, char *type)
 {
-	char *szFamily;
+	const char *szFamily;
 	int port;
 	struct sockaddr_storage sa;
 	socklen_t saLen = sizeof(sa);
@@ -1115,7 +1136,7 @@ void debugListenInfo(int fd, char *type)
 /* Return a printable representation of a host addresses. If
  * a parameter is NULL, it is not set.  rgerhards, 2013-01-22
  */
-rsRetVal
+static rsRetVal
 cvthname(struct sockaddr_storage *f, prop_t **localName, prop_t **fqdn, prop_t **ip)
 {
 	DEFiRet;
@@ -1135,20 +1156,31 @@ cvthname(struct sockaddr_storage *f, prop_t **localName, prop_t **fqdn, prop_t *
  * normalized to lower case. The hostname is kept in mixed case for historic
  * reasons.
  */
+#define EMPTY_HOSTNAME_REPLACEMENT "localhost-empty-hostname"
 static rsRetVal
 getLocalHostname(uchar **ppName)
 {
 	DEFiRet;
 	char hnbuf[8192];
 	uchar *fqdn = NULL;
+	int empty_hostname = 1;
 
 	if(gethostname(hnbuf, sizeof(hnbuf)) != 0) {
-		strcpy(hnbuf, "localhost");
+		strcpy(hnbuf, EMPTY_HOSTNAME_REPLACEMENT);
 	} else {
-		hnbuf[sizeof(hnbuf)-1] = '\0'; /* be on the safe side... */
+		/* now guard against empty hostname
+		 * see https://github.com/rsyslog/rsyslog/issues/1040
+		 */
+		if(hnbuf[0] == '\0') {
+			strcpy(hnbuf, EMPTY_HOSTNAME_REPLACEMENT);
+		} else {
+			empty_hostname = 0;
+			hnbuf[sizeof(hnbuf)-1] = '\0'; /* be on the safe side... */
+		}
 	}
+
 	char *dot = strstr(hnbuf, ".");
-	if(dot == NULL) {
+	if(!empty_hostname && dot == NULL) {
 		/* we need to (try) to find the real name via resolver */
 		struct hostent *hent = gethostbyname((char*)hnbuf);
 		if(hent) {
@@ -1189,7 +1221,8 @@ finalize_it:
 /* closes the UDP listen sockets (if they exist) and frees
  * all dynamically assigned memory. 
  */
-void closeUDPListenSockets(int *pSockArr)
+static void
+closeUDPListenSockets(int *pSockArr)
 {
 	register int i;
 
@@ -1208,7 +1241,8 @@ void closeUDPListenSockets(int *pSockArr)
  * 1 - server, 0 - client
  * param rcvbuf indicates desired rcvbuf size; 0 means OS default
  */
-int *create_udp_socket(uchar *hostname, uchar *pszPort, int bIsServer, int rcvbuf)
+static int *
+create_udp_socket(uchar *hostname, uchar *pszPort, int bIsServer, int rcvbuf, int ipfreebind, char *device)
 {
         struct addrinfo hints, *res, *r;
         int error, maxs, *s, *socks, on = 1;
@@ -1225,6 +1259,12 @@ int *create_udp_socket(uchar *hostname, uchar *pszPort, int bIsServer, int rcvbu
 		hints.ai_flags = AI_NUMERICSERV;
         hints.ai_family = glbl.GetDefPFFamily();
         hints.ai_socktype = SOCK_DGRAM;
+ #if defined (_AIX)
+/* AIXPORT : SOCK_DGRAM has the protocol IPPROTO_UDP 
+ *           getaddrinfo needs this hint on AIX
+ */
+        hints.ai_protocol = IPPROTO_UDP;
+#endif
         error = getaddrinfo((char*) hostname, (char*) pszPort, &hints, &res);
         if(error) {
                errmsg.LogError(0, NO_ERRCODE, "%s",  gai_strerror(error));
@@ -1237,7 +1277,8 @@ int *create_udp_socket(uchar *hostname, uchar *pszPort, int bIsServer, int rcvbu
 		/* EMPTY */;
         socks = MALLOC((maxs+1) * sizeof(int));
         if (socks == NULL) {
-               errmsg.LogError(0, NO_ERRCODE, "couldn't allocate memory for UDP sockets, suspending UDP message reception");
+		errmsg.LogError(0, NO_ERRCODE, "couldn't allocate memory for UDP sockets, suspending UDP "
+		"message reception");
                freeaddrinfo(res);
                return NULL;
         }
@@ -1245,7 +1286,12 @@ int *create_udp_socket(uchar *hostname, uchar *pszPort, int bIsServer, int rcvbu
         *socks = 0;   /* num of sockets counter at start of array */
         s = socks + 1;
 	for (r = res; r != NULL ; r = r->ai_next) {
+#if defined (_AIX)
+/* AIXPORT : socktype will be SOCK_DGRAM, as set in hints above */
+               *s = socket(r->ai_family, SOCK_DGRAM, r->ai_protocol);
+#else
                *s = socket(r->ai_family, r->ai_socktype, r->ai_protocol);
+#endif
         	if (*s < 0) {
 			if(!(r->ai_family == PF_INET6 && errno == EAFNOSUPPORT))
 				errmsg.LogError(errno, NO_ERRCODE, "create_udp_socket(), socket");
@@ -1268,6 +1314,18 @@ int *create_udp_socket(uchar *hostname, uchar *pszPort, int bIsServer, int rcvbu
                 }
 #		endif
 
+		if(device) {
+#			if defined(SO_BINDTODEVICE)
+			if(setsockopt(*s, SOL_SOCKET, SO_BINDTODEVICE, device, strlen(device) + 1) < 0)
+#			endif
+			{
+				errmsg.LogError(errno, NO_ERRCODE, "setsockopt(SO_BINDTODEVICE)");
+                                close(*s);
+				*s = -1;
+				continue;
+			}
+		}
+
 		/* if we have an error, we "just" suspend that socket. Eventually
 		 * other sockets will work. At the end of this function, we check
 		 * if we managed to open at least one socket. If not, we'll write
@@ -1286,7 +1344,10 @@ int *create_udp_socket(uchar *hostname, uchar *pszPort, int bIsServer, int rcvbu
 		/* We need to enable BSD compatibility. Otherwise an attacker
 		 * could flood our log files by sending us tons of ICMP errors.
 		 */
-#if !defined(OS_BSD) && !defined(__hpux)
+/* AIXPORT : SO_BSDCOMPAT socket option is depricated , and its usage has been discontinued
+             on most unixes, AIX does not support this option , hence avoid the call.
+*/
+#if !defined(OS_BSD) && !defined(__hpux)  && !defined(_AIX)
 		if (should_use_so_bsdcompat()) {
 			if (setsockopt(*s, SOL_SOCKET, SO_BSDCOMPAT,
 					(char *) &on, sizeof(on)) < 0) {
@@ -1348,6 +1409,7 @@ int *create_udp_socket(uchar *hostname, uchar *pszPort, int bIsServer, int rcvbu
 		}
 
 		if(bIsServer) {
+
 			/* rgerhards, 2007-06-22: if we run on a kernel that does not support
 			 * the IPV6_V6ONLY socket option, we need to use a work-around. On such
 			 * systems the IPv6 socket does also accept IPv4 sockets. So an IPv4
@@ -1360,7 +1422,18 @@ int *create_udp_socket(uchar *hostname, uchar *pszPort, int bIsServer, int rcvbu
 			     && (errno != EADDRINUSE)
 	#		endif
 			   ) {
-				errmsg.LogError(errno, NO_ERRCODE, "bind");
+				if (errno == EADDRNOTAVAIL && ipfreebind != IPFREEBIND_DISABLED) {
+					if (setsockopt(*s, IPPROTO_IP, IP_FREEBIND, &on, sizeof(on)) < 0) {
+						errmsg.LogError(errno, NO_ERRCODE, "setsockopt(IP_FREEBIND)");
+					}
+					else if (bind(*s, r->ai_addr, r->ai_addrlen) < 0) {
+						errmsg.LogError(errno, NO_ERRCODE, "bind with IP_FREEBIND");
+					} else {
+						if (ipfreebind >= IPFREEBIND_ENABLED_WITH_LOG)
+							errmsg.LogMsg(0, RS_RET_OK_WARN, LOG_WARNING, "bound address %s IP free", hostname);
+						continue;
+					}
+				}
 				close(*s);
 				*s = -1;
 				continue;
@@ -1465,11 +1538,21 @@ finalize_it:
  * However, it caches entries in order to avoid too-frequent requery.
  * rgerhards, 2012-03-06
  */
+#if !defined(_AIX)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-align" /* TODO: how can we fix these warnings? */
+/* Problem with the warnings: they seem to stem back from the way the API is structured */
+#endif
 static rsRetVal
 getIFIPAddr(uchar *szif, int family, uchar *pszbuf, int lenBuf)
 {
+#ifdef _AIX
+	struct ifaddrs_rsys * ifaddrs = NULL;
+	struct ifaddrs_rsys * ifa;
+#else
 	struct ifaddrs * ifaddrs = NULL;
 	struct ifaddrs * ifa;
+#endif
 	void * pAddr;
 	DEFiRet;
 
@@ -1503,6 +1586,9 @@ finalize_it:
 	RETiRet;
 
 }
+#if !defined(_AIX)
+#pragma GCC diagnostic pop
+#endif
 
 
 /* queryInterface function

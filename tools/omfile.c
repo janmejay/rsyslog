@@ -17,7 +17,7 @@
  * pipes. These have been moved to ompipe, to reduced the entanglement
  * between the two different functionalities. -- rgerhards
  *
- * Copyright 2007-2015 Adiscon GmbH.
+ * Copyright 2007-2017 Adiscon GmbH.
  *
  * This file is part of rsyslog.
  *
@@ -48,9 +48,7 @@
 #include <libgen.h>
 #include <unistd.h>
 #include <sys/file.h>
-#ifdef OS_SOLARIS
-#	include <fcntl.h>
-#endif
+#include <fcntl.h>
 #ifdef HAVE_ATOMIC_BUILTINS
 #	include <pthread.h>
 #endif
@@ -290,7 +288,7 @@ static struct cnfparamblk actpblk =
 /* this function gets the default template. It coordinates action between
  * old-style and new-style configuration parts.
  */
-static inline uchar*
+static uchar*
 getDfltTpl(void)
 {
 	if(loadModConf != NULL && loadModConf->tplName != NULL)
@@ -346,7 +344,7 @@ ENDdbgPrintInstInfo
  * is we do not permit this directive after the v2 config system has been used to set
  * the parameter.
  */
-rsRetVal
+static rsRetVal
 setLegacyDfltTpl(void __attribute__((unused)) *pVal, uchar* newVal)
 {
 	DEFiRet;
@@ -367,7 +365,7 @@ finalize_it:
 /* set the dynaFile cache size. Does some limit checking.
  * rgerhards, 2007-07-31
  */
-rsRetVal setDynaFileCacheSize(void __attribute__((unused)) *pVal, int iNewVal)
+static rsRetVal setDynaFileCacheSize(void __attribute__((unused)) *pVal, int iNewVal)
 {
 	DEFiRet;
 
@@ -400,7 +398,8 @@ rsRetVal setDynaFileCacheSize(void __attribute__((unused)) *pVal, int iNewVal)
  * removed.
  * rgerhards 2005-06-21
  */
-static rsRetVal cflineParseOutchannel(instanceData *pData, uchar* p, omodStringRequest_t *pOMSR, int iEntry, int iTplOpts)
+static rsRetVal cflineParseOutchannel(instanceData *pData, uchar* p, omodStringRequest_t *pOMSR,
+	int iEntry, int iTplOpts)
 {
 	DEFiRet;
 	size_t i;
@@ -411,7 +410,7 @@ static rsRetVal cflineParseOutchannel(instanceData *pData, uchar* p, omodStringR
 	i = 0;
 	/* get outchannel name */
 	while(*p && *p != ';' && *p != ' ' &&
-	      i < sizeof(szBuf) / sizeof(char)) {
+	      i < (sizeof(szBuf) - 1) ) {
 	      szBuf[i++] = *p++;
 	}
 	szBuf[i] = '\0';
@@ -496,7 +495,7 @@ finalize_it:
  * relevant files. Part of Shutdown and HUP processing.
  * rgerhards, 2008-10-23
  */
-static inline void
+static void
 dynaFileFreeCacheEntries(instanceData *__restrict__ const pData)
 {
 	register int i;
@@ -558,6 +557,7 @@ static rsRetVal
 prepareFile(instanceData *__restrict__ const pData, const uchar *__restrict__ const newFileName)
 {
 	int fd;
+	char errStr[1024]; /* buffer for strerr() */
 	DEFiRet;
 
 	pData->pStrm = NULL;
@@ -571,6 +571,10 @@ prepareFile(instanceData *__restrict__ const pData, const uchar *__restrict__ co
 			if(makeFileParentDirs(newFileName, ustrlen(newFileName),
 			     pData->fDirCreateMode, pData->dirUID,
 			     pData->dirGID, pData->bFailOnChown) != 0) {
+				rs_strerror_r(errno, errStr, sizeof(errStr));
+				errmsg.LogError(0, RS_RET_ERR, "omfile: creating parent "
+					"directories for file  '%s' failed: %s",
+					errStr, newFileName);
 			     	ABORT_FINALIZE(RS_RET_ERR); /* we give up */
 			}
 		}
@@ -584,11 +588,13 @@ prepareFile(instanceData *__restrict__ const pData, const uchar *__restrict__ co
 			if(pData->fileUID != (uid_t)-1 || pData->fileGID != (gid_t) -1) {
 				/* we need to set owner/group */
 				if(fchown(fd, pData->fileUID, pData->fileGID) != 0) {
+					rs_strerror_r(errno, errStr, sizeof(errStr));
+					errmsg.LogError(0, RS_RET_FILE_CHOWN_ERROR,
+						"omfile: chown for file '%s' failed: %s",
+						errStr, newFileName);
 					if(pData->bFailOnChown) {
-						int eSave = errno;
 						close(fd);
-						fd = -1;
-						errno = eSave;
+						ABORT_FINALIZE(RS_RET_ERR); /* we give up */
 					}
 					/* we will silently ignore the chown() failure
 					 * if configured to do so.
@@ -656,7 +662,7 @@ finalize_it:
  * be written.
  * This is a helper to writeFile(). rgerhards, 2007-07-03
  */
-static inline rsRetVal
+static rsRetVal
 prepareDynFile(instanceData *__restrict__ const pData, const uchar *__restrict__ const newFileName)
 {
 	uint64 ctOldest; /* "timestamp" of oldest element */
@@ -714,12 +720,6 @@ prepareDynFile(instanceData *__restrict__ const pData, const uchar *__restrict__
 	/* we have not found an entry */
 	STATSCOUNTER_INC(pData->ctrMiss, pData->mutCtrMiss);
 
-	/* invalidate iCurrElt as we may error-exit out of this function when the currrent
-	 * iCurrElt has been freed or otherwise become unusable. This is a precaution, and
-	 * performance-wise it may be better to do that in each of the exits. However, that
-	 * is error-prone, so I prefer to do it here. -- rgerhards, 2010-03-02
-	 */
-	pData->iCurrElt = -1;
 	/* similarly, we need to set the current pStrm to NULL, because otherwise, if prepareFile() fails,
 	 * we may end up using an old stream. This bug depends on how exactly prepareFile fails,
 	 * but it could be triggered in the common case of a failed open() system call.
@@ -754,7 +754,8 @@ prepareDynFile(instanceData *__restrict__ const pData, const uchar *__restrict__
 		/* We do no longer care about internal messages. The errmsg rate limiter
 		 * will take care of too-frequent error messages.
 		 */
-		errmsg.LogError(0, localRet, "Could not open dynamic file '%s' [state %d] - discarding message", newFileName, localRet);
+		errmsg.LogError(0, localRet, "Could not open dynamic file '%s' [state %d] - discarding "
+		"message", newFileName, localRet);
 		ABORT_FINALIZE(localRet);
 	}
 
@@ -770,7 +771,8 @@ prepareDynFile(instanceData *__restrict__ const pData, const uchar *__restrict__
 	DBGPRINTF("Added new entry %d for file cache, file '%s'.\n", iFirstFree, newFileName);
 
 finalize_it:
-	pCache[pData->iCurrElt]->nInactive = 0;
+	if(iRet == RS_RET_OK)
+		pCache[pData->iCurrElt]->nInactive = 0;
 	RETiRet;
 }
 
@@ -909,7 +911,7 @@ finalize_it:
 ENDsetModCnf
 
 /* This function checks dynafile cache for janitor action */
-static inline void
+static void
 janitorChkDynaFiles(instanceData *__restrict__ const pData)
 {
 	int i;
@@ -933,7 +935,7 @@ janitorChkDynaFiles(instanceData *__restrict__ const pData)
 }
 
 /* callback for the janitor. This cleans out files (if so configured) */
-void
+static void
 janitorCB(void *pUsr)
 {
 	instanceData *__restrict__ const pData = (instanceData *) pUsr;
@@ -1001,6 +1003,8 @@ CODESTARTfreeInstance
 		dynaFileFreeCache(pData);
 	} else if(pData->pStrm != NULL)
 		closeFile(pData);
+	if(pData->stats != NULL)
+		statsobj.Destruct(&(pData->stats));
 	if(pData->useSigprov) {
 		pData->sigprov.Destruct(&pData->sigprovData);
 		obj.ReleaseObj(__FILE__, pData->sigprovNameFull+2, pData->sigprovNameFull,
@@ -1044,20 +1048,27 @@ CODESTARTcommitTransaction
 		writeFile(pData, pParams, i);
 	}
 	/* Note: pStrm may be NULL if there was an error opening the stream */
+	/* if bFlushOnTXEnd is set, we need to flush on transaction end - in
+	 * any case. It is not relevant if this is using background writes
+	 * (which then become pretty slow) or not. And, similarly, no flush
+	 * happens when it is not set. Please see
+	 * https://github.com/rsyslog/rsyslog/issues/1297
+	 * for a discussion of why we actually need this.
+	 * rgerhards, 2017-01-13
+	 */
 	if(pData->bFlushOnTXEnd && pData->pStrm != NULL) {
-		/* if we have an async writer, it controls the flush via
-		 * a timeout. However, without it, we actually need to flush,
-		 * else incomplete records are written.
-		 */
-		if(!pData->bUseAsyncWriter)
-			CHKiRet(strm.Flush(pData->pStrm));
+		CHKiRet(strm.Flush(pData->pStrm));
 	}
+
 finalize_it:
+	if (pData->bDynamicName &&
+	    (iRet == RS_RET_FILE_OPEN_ERROR || iRet == RS_RET_FILE_NOT_FOUND) )
+		iRet = RS_RET_OK;
 	pthread_mutex_unlock(&pData->mutWrite);
 ENDcommitTransaction
 
 
-static inline void
+static void
 setInstParamDefaults(instanceData *__restrict__ const pData)
 {
 	pData->fname = NULL;
@@ -1126,7 +1137,7 @@ finalize_it:
 	RETiRet;
 }
 
-static inline void
+static void
 initSigprov(instanceData *__restrict__ const pData, struct nvlst *lst)
 {
 	uchar szDrvrName[1024];
@@ -1168,7 +1179,7 @@ initSigprov(instanceData *__restrict__ const pData, struct nvlst *lst)
 done:	return;
 }
 
-static inline rsRetVal
+static rsRetVal
 initCryprov(instanceData *__restrict__ const pData, struct nvlst *lst)
 {
 	uchar szDrvrName[1024];
@@ -1222,7 +1233,7 @@ CODESTARTnewActInst
 	pvals = nvlstGetParams(lst, &actpblk, NULL);
 	if(pvals == NULL) {
 		errmsg.LogError(0, RS_RET_MISSING_CNFPARAMS, "omfile: either the \"file\" or "
-				"\"dynfile\" parameter must be given");
+				"\"dynafile\" parameter must be given");
 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
 	}
 
@@ -1513,28 +1524,50 @@ INITLegCnfVars
 
 	INITChkCoreFeature(bCoreSupportsBatching, CORE_FEATURE_BATCHING);
 	DBGPRINTF("omfile: %susing transactional output interface.\n", bCoreSupportsBatching ? "" : "not ");
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"dynafilecachesize", 0, eCmdHdlrInt, (void*) setDynaFileCacheSize, NULL, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"omfileziplevel", 0, eCmdHdlrInt, NULL, &cs.iZipLevel, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"omfileflushinterval", 0, eCmdHdlrInt, NULL, &cs.iFlushInterval, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"omfileasyncwriting", 0, eCmdHdlrBinary, NULL, &cs.bUseAsyncWriter, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"omfileflushontxend", 0, eCmdHdlrBinary, NULL, &cs.bFlushOnTXEnd, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"omfileiobuffersize", 0, eCmdHdlrSize, NULL, &cs.iIOBufSize, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"dirowner", 0, eCmdHdlrUID, NULL, &cs.dirUID, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"dirownernum", 0, eCmdHdlrInt, NULL, &cs.dirUID, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"dirgroup", 0, eCmdHdlrGID, NULL, &cs.dirGID, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"dirgroupnum", 0, eCmdHdlrInt, NULL, &cs.dirGID, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"fileowner", 0, eCmdHdlrUID, NULL, &cs.fileUID, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"fileownernum", 0, eCmdHdlrInt, NULL, &cs.fileUID, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"filegroup", 0, eCmdHdlrGID, NULL, &cs.fileGID, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"filegroupnum", 0, eCmdHdlrInt, NULL, &cs.fileGID, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"dircreatemode", 0, eCmdHdlrFileCreateMode, NULL, &cs.fDirCreateMode, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"filecreatemode", 0, eCmdHdlrFileCreateMode, NULL, &cs.fCreateMode, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"createdirs", 0, eCmdHdlrBinary, NULL, &cs.bCreateDirs, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"failonchownfailure", 0, eCmdHdlrBinary, NULL, &cs.bFailOnChown, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"omfileforcechown", 0, eCmdHdlrGoneAway, NULL, NULL, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"actionfileenablesync", 0, eCmdHdlrBinary, NULL, &cs.bEnableSync, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"actionfiledefaulttemplate", 0, eCmdHdlrGetWord, setLegacyDfltTpl, NULL, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler, resetConfigVariables, NULL, STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"dynafilecachesize", 0, eCmdHdlrInt, (void*) setDynaFileCacheSize,
+		NULL, STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"omfileziplevel", 0, eCmdHdlrInt, NULL, &cs.iZipLevel,
+		STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"omfileflushinterval", 0, eCmdHdlrInt, NULL, &cs.iFlushInterval,
+		STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"omfileasyncwriting", 0, eCmdHdlrBinary, NULL, &cs.bUseAsyncWriter,
+		STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"omfileflushontxend", 0, eCmdHdlrBinary, NULL, &cs.bFlushOnTXEnd,
+		STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"omfileiobuffersize", 0, eCmdHdlrSize, NULL, &cs.iIOBufSize,
+		STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"dirowner", 0, eCmdHdlrUID, NULL, &cs.dirUID,
+		STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"dirownernum", 0, eCmdHdlrInt, NULL, &cs.dirUID,
+		STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"dirgroup", 0, eCmdHdlrGID, NULL, &cs.dirGID,
+		STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"dirgroupnum", 0, eCmdHdlrInt, NULL, &cs.dirGID,
+		STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"fileowner", 0, eCmdHdlrUID, NULL, &cs.fileUID,
+		STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"fileownernum", 0, eCmdHdlrInt, NULL, &cs.fileUID,
+		STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"filegroup", 0, eCmdHdlrGID, NULL, &cs.fileGID,
+		STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"filegroupnum", 0, eCmdHdlrInt, NULL, &cs.fileGID,
+		STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"dircreatemode", 0, eCmdHdlrFileCreateMode, NULL,
+		&cs.fDirCreateMode, STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"filecreatemode", 0, eCmdHdlrFileCreateMode, NULL,
+		&cs.fCreateMode, STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"createdirs", 0, eCmdHdlrBinary, NULL, &cs.bCreateDirs,
+		STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"failonchownfailure", 0, eCmdHdlrBinary, NULL, &cs.bFailOnChown,
+		STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"omfileforcechown", 0, eCmdHdlrGoneAway, NULL, NULL,
+		STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"actionfileenablesync", 0, eCmdHdlrBinary, NULL, &cs.bEnableSync,
+		STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"actionfiledefaulttemplate", 0, eCmdHdlrGetWord, setLegacyDfltTpl,
+		NULL, STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler, resetConfigVariables,
+		NULL, STD_LOADABLE_MODULE_ID));
 ENDmodInit
 /* vi:set ai:
  */

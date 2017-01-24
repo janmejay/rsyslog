@@ -9,7 +9,7 @@
  * Please note that the original syslogd.c source was under BSD license
  * at the time of the rsyslog fork from sysklogd.
  *
- * Copyright 2008-2012 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2008-2016 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of rsyslog.
  *
@@ -96,7 +96,7 @@ cstr_t *pDfltProgNameCmp = NULL;
 
 
 /* process a $ModLoad config line.  */
-rsRetVal
+static rsRetVal
 doModLoad(uchar **pp, __attribute__((unused)) void* pVal)
 {
 	DEFiRet;
@@ -107,7 +107,7 @@ doModLoad(uchar **pp, __attribute__((unused)) void* pVal)
 	ASSERT(*pp != NULL);
 
 	skipWhiteSpace(pp); /* skip over any whitespace */
-	if(getSubString(pp, (char*) szName, sizeof(szName) / sizeof(uchar), ' ')  != 0) {
+	if(getSubString(pp, (char*) szName, sizeof(szName), ' ')  != 0) {
 		errmsg.LogError(0, RS_RET_NOT_FOUND, "could not extract module name");
 		ABORT_FINALIZE(RS_RET_NOT_FOUND);
 	}
@@ -133,7 +133,7 @@ finalize_it:
  * getSubString(), but I was not brave enough to fix the former as
  * it has many other callers... -- rgerhards, 2013-05-27
  */
-static inline void
+static void
 ltrim(char *src)
 {
 	char *dst = src;
@@ -154,7 +154,7 @@ ltrim(char *src)
  * rgerhards 2005-06-21: previously only for templates, now 
  *    generalized.
  */
-rsRetVal
+static rsRetVal
 doNameLine(uchar **pp, void* pVal)
 {
 	DEFiRet;
@@ -168,7 +168,7 @@ doNameLine(uchar **pp, void* pVal)
 
 	eDir = (enum eDirective) pVal;	/* this time, it actually is NOT a pointer! */
 
-	if(getSubString(&p, szName, sizeof(szName) / sizeof(char), ',')  != 0) {
+	if(getSubString(&p, szName, sizeof(szName), ',')  != 0) {
 		errmsg.LogError(0, RS_RET_NOT_FOUND, "Invalid config line: could not extract name - line ignored");
 		ABORT_FINALIZE(RS_RET_NOT_FOUND);
 	}
@@ -214,7 +214,7 @@ finalize_it:
  * extended configuration parameters.
  * 2004-11-17 rgerhards
  */
-rsRetVal
+static rsRetVal
 cfsysline(uchar *p)
 {
 	DEFiRet;
@@ -222,7 +222,7 @@ cfsysline(uchar *p)
 
 	ASSERT(p != NULL);
 	errno = 0;
-	if(getSubString(&p, (char*) szCmd, sizeof(szCmd) / sizeof(uchar), ' ')  != 0) {
+	if(getSubString(&p, (char*) szCmd, sizeof(szCmd), ' ')  != 0) {
 		errmsg.LogError(0, RS_RET_NOT_FOUND, "Invalid $-configline - could not extract command - line ignored\n");
 		ABORT_FINALIZE(RS_RET_NOT_FOUND);
 	}
@@ -293,7 +293,7 @@ rsRetVal cflineParseTemplateName(uchar** pp, omodStringRequest_t *pOMSR, int iEn
 			CHKiRet(cstrAppendChar(pStrB, *p));
 			++p;
 		}
-		CHKiRet(cstrFinalize(pStrB));
+		cstrFinalize(pStrB);
 		CHKiRet(cstrConvSzStrAndDestruct(&pStrB, &tplName, 0));
 	}
 
@@ -631,7 +631,8 @@ BEGINAbstractObjClassInit(conf, 1, OBJ_IS_CORE_MODULE) /* class, version - CHANG
  	/* These commands will NOT be supported -- the new v6.3 config system provides
 	 * far better methods. We will remove the related code soon. -- rgerhards, 2012-01-09
 	 */
-	CHKiRet(regCfSysLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler, resetConfigVariables, NULL, NULL));
+	CHKiRet(regCfSysLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler, resetConfigVariables,
+NULL, NULL));
 ENDObjClassInit(conf)
 
 /* vi:set ai:

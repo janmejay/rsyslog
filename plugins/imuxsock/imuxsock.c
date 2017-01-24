@@ -6,7 +6,7 @@
  *
  * File begun on 2007-12-20 by RGerhards (extracted from syslogd.c)
  *
- * Copyright 2007-2015 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2007-2016 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of rsyslog.
  *
@@ -50,12 +50,17 @@
 #include "parser.h"
 #include "prop.h"
 #include "debug.h"
+#include "ruleset.h"
 #include "unlimited_select.h"
 #include "sd-daemon.h"
 #include "statsobj.h"
 #include "datetime.h"
 #include "hashtable.h"
 #include "ratelimit.h"
+
+#if !defined(_AIX)
+#pragma GCC diagnostic ignored "-Wswitch-enum"
+#endif
 
 MODULE_TYPE_INPUT
 MODULE_TYPE_NOKEEP
@@ -80,6 +85,9 @@ MODULE_CNFNAME("imuxsock")
 /* forward definitions */
 static rsRetVal resetConfigVariables(uchar __attribute__((unused)) *pp, void __attribute__((unused)) *pVal);
 
+#if defined(_AIX)
+#define ucred  ucred_t
+#endif 
 /* emulate struct ucred for platforms that do not have it */
 #ifndef HAVE_SCM_CREDENTIALS
 struct ucred { int pid; uid_t uid; gid_t gid; };
@@ -99,6 +107,7 @@ DEFobjCurrIf(net)
 DEFobjCurrIf(parser)
 DEFobjCurrIf(datetime)
 DEFobjCurrIf(statsobj)
+DEFobjCurrIf(ruleset)
 
 
 statsobj_t *modStats;
@@ -148,6 +157,7 @@ typedef struct lstn_s {
 	sbool bUseSysTimeStamp;	/* use timestamp from system (instead of from message) */
 	sbool bUnlink;		/* unlink&re-create socket at start and end of processing */
 	sbool bUseSpecialParser;/* use "canned" log socket parser instead of parser chain? */
+	ruleset_t *pRuleset;
 } lstn_t;
 static lstn_t *listeners;
 
@@ -208,6 +218,8 @@ struct instanceConf_s {
 	sbool bUnlink;
 	sbool bUseSpecialParser;
 	sbool bParseHost;
+	uchar *pszBindRuleset;		/* name of ruleset to bind to */
+	ruleset_t *pBindRuleset;	/* ruleset to bind listener to (use system default if unspecified) */
 	struct instanceConf_s *next;
 };
 
@@ -273,6 +285,7 @@ static struct cnfparamdescr inppdescr[] = {
 	{ "usespecialparser", eCmdHdlrBinary, 0 },
 	{ "parsehostname", eCmdHdlrBinary, 0 },
 	{ "usepidfromsystem", eCmdHdlrBinary, 0 },
+	{ "ruleset", eCmdHdlrString, 0 },
 	{ "ratelimit.interval", eCmdHdlrInt, 0 },
 	{ "ratelimit.burst", eCmdHdlrInt, 0 },
 	{ "ratelimit.severity", eCmdHdlrInt, 0 }
@@ -283,8 +296,7 @@ static struct cnfparamblk inppblk =
 	  inppdescr
 	};
 
-/* we do not use this, because we do not bind to a ruleset so far
- * enable when this is changed: #include "im-helper.h" */ /* must be included AFTER the type definitions! */
+#include "im-helper.h" /* must be included AFTER the type definitions! */
 
 static int bLegacyCnfModGlobalsPermitted;/* are legacy module-global config parameters permitted? */
 
@@ -300,6 +312,8 @@ createInstance(instanceConf_t **pinst)
 	CHKmalloc(inst = MALLOC(sizeof(instanceConf_t)));
 	inst->sockName = NULL;
 	inst->pLogHostName = NULL;
+	inst->pszBindRuleset = NULL;
+	inst->pBindRuleset = NULL;
 	inst->ratelimitInterval = DFLT_ratelimitInterval;
 	inst->ratelimitBurst = DFLT_ratelimitBurst;
 	inst->ratelimitSeverity = DFLT_ratelimitSeverity;
@@ -312,7 +326,7 @@ createInstance(instanceConf_t **pinst)
 	inst->bWritePid = 0;
 	inst->bAnnotate = 0;
 	inst->bParseTrusted = 0;
-	inst->bDiscardOwnMsgs = 1;
+	inst->bDiscardOwnMsgs = bProcessInternalMessages;
 	inst->bUnlink = 1;
 	inst->next = NULL;
 
@@ -364,8 +378,7 @@ static rsRetVal addInstance(void __attribute__((unused)) *pVal, uchar *pNewVal)
 	inst->bParseHost = UNSET;
 	inst->next = NULL;
 
-	/* some legacy conf processing */
-	free(cs.pLogHostName); /* reset hostname for next socket */
+	/* reset hostname for next socket */
 	cs.pLogHostName = NULL;
 
 finalize_it:
@@ -415,7 +428,8 @@ addListner(instanceConf_t *inst)
 	listeners[nfd].flags = inst->bIgnoreTimestamp ? IGNDATE : NOFLAG;
 	listeners[nfd].bCreatePath = inst->bCreatePath;
 	listeners[nfd].sockName = ustrdup(inst->sockName);
-	listeners[nfd].bUseCreds = (inst->bDiscardOwnMsgs || inst->bWritePid || inst->ratelimitInterval || inst->bAnnotate || inst->bUseSysTimeStamp) ? 1 : 0;
+	listeners[nfd].bUseCreds = (inst->bDiscardOwnMsgs || inst->bWritePid || inst->ratelimitInterval
+	|| inst->bAnnotate || inst->bUseSysTimeStamp) ? 1 : 0;
 	listeners[nfd].bAnnotate = inst->bAnnotate;
 	listeners[nfd].bParseTrusted = inst->bParseTrusted;
 	listeners[nfd].bDiscardOwnMsgs = inst->bDiscardOwnMsgs;
@@ -423,6 +437,7 @@ addListner(instanceConf_t *inst)
 	listeners[nfd].bWritePid = inst->bWritePid;
 	listeners[nfd].bUseSysTimeStamp = inst->bUseSysTimeStamp;
 	listeners[nfd].bUseSpecialParser = inst->bUseSpecialParser;
+	listeners[nfd].pRuleset = inst->pBindRuleset;
 	CHKiRet(ratelimitNew(&listeners[nfd].dflt_ratelimiter, "imuxsock", NULL));
 	ratelimitSetLinuxLike(listeners[nfd].dflt_ratelimiter,
 			      listeners[nfd].ratelimitInterval,
@@ -470,7 +485,7 @@ static rsRetVal discardLogSockets(void)
 
 /* used to create a log socket if NOT passed in via systemd. 
  */
-static inline rsRetVal
+static rsRetVal
 createLogSocket(lstn_t *pLstn)
 {
 	struct sockaddr_un sunx;
@@ -499,11 +514,11 @@ finalize_it:
 }
 
 
-static inline rsRetVal
+static rsRetVal
 openLogSocket(lstn_t *pLstn)
 {
 	DEFiRet;
-#	if HAVE_SCM_CREDENTIALS
+#	ifdef HAVE_SCM_CREDENTIALS
 	int one;
 #	endif /* HAVE_SCM_CREDENTIALS */
 
@@ -539,7 +554,7 @@ openLogSocket(lstn_t *pLstn)
 		CHKiRet(createLogSocket(pLstn));
 	}
 
-#	if HAVE_SCM_CREDENTIALS
+#	ifdef HAVE_SCM_CREDENTIALS
 	if(pLstn->bUseCreds) {
 		one = 1;
 		if(setsockopt(pLstn->fd, SOL_SOCKET, SO_PASSCRED, &one, (socklen_t) sizeof(one)) != 0) {
@@ -573,7 +588,7 @@ finalize_it:
  * Returns NULL if not found or rate-limiting not activated for this
  * listener (the latter being a performance enhancement).
  */
-static inline rsRetVal
+static rsRetVal
 findRatelimiter(lstn_t *pLstn, struct ucred *cred, ratelimit_t **prl)
 {
 	ratelimit_t *rl = NULL;
@@ -628,7 +643,7 @@ finalize_it:
 
 /* patch correct pid into tag. bufTAG MUST be CONF_TAG_MAXSIZE long!
  */
-static inline void
+static void
 fixPID(uchar *bufTAG, int *lenTag, struct ucred *cred)
 {
 	int i;
@@ -659,7 +674,7 @@ fixPID(uchar *bufTAG, int *lenTag, struct ucred *cred)
  * journald. Currently works with Linux /proc filesystem, only.
  */
 static rsRetVal
-getTrustedProp(struct ucred *cred, char *propName, uchar *buf, size_t lenBuf, int *lenProp)
+getTrustedProp(struct ucred *cred, const char *propName, uchar *buf, size_t lenBuf, int *lenProp)
 {
 	int fd;
 	int i;
@@ -731,7 +746,7 @@ finalize_it:
  * It is assumed the output buffer is large enough. Returns the number of
  * characters added.
  */
-static inline int
+static int
 copyescaped(uchar *dstbuf, uchar *inbuf, int inlen)
 {
 	int iDst, iSrc;
@@ -752,10 +767,10 @@ copyescaped(uchar *dstbuf, uchar *inbuf, int inlen)
  * We now parse the message according to expected format so that we
  * can also mangle it if necessary.
  */
-static inline rsRetVal
+static rsRetVal
 SubmitMsg(uchar *pRcv, int lenRcv, lstn_t *pLstn, struct ucred *cred, struct timeval *ts)
 {
-	msg_t *pMsg = NULL;
+	smsg_t *pMsg = NULL;
 	int lenMsg;
 	int offs;
 	int i;
@@ -792,9 +807,9 @@ SubmitMsg(uchar *pRcv, int lenRcv, lstn_t *pLstn, struct ucred *cred, struct tim
 	findRatelimiter(pLstn, cred, &ratelimiter); /* ignore error, better so than others... */
 
 	if(ts == NULL) {
-		datetime.getCurrTime(&st, &tt);
+		datetime.getCurrTime(&st, &tt, TIME_IN_LOCALTIME);
 	} else {
-		datetime.timeval2syslogTime(ts, &st);
+		datetime.timeval2syslogTime(ts, &st, TIME_IN_LOCALTIME);
 		tt = ts->tv_sec;
 	}
 
@@ -847,7 +862,7 @@ SubmitMsg(uchar *pRcv, int lenRcv, lstn_t *pLstn, struct ucred *cred, struct tim
 			/* as per lumberjack spec, these properties need to go into
 			 * the CEE root.
 			 */
-			msgAddJSON(pMsg, (uchar*)"!", json, 0);
+			msgAddJSON(pMsg, (uchar*)"!", json, 0, 0);
 
 			MsgSetRawMsg(pMsg, (char*)pRcv, lenRcv);
 		} else {
@@ -889,6 +904,9 @@ SubmitMsg(uchar *pRcv, int lenRcv, lstn_t *pLstn, struct ucred *cred, struct tim
 			pmsgbuf[toffs+1] = '\0';
 
 			MsgSetRawMsg(pMsg, (char*)pmsgbuf, toffs + 1);
+			if (pmsgbuf != msgbuf) {
+				free(pmsgbuf);
+			}
 		}
 	} else {
 		/* just add the unmodified message */
@@ -921,20 +939,22 @@ SubmitMsg(uchar *pRcv, int lenRcv, lstn_t *pLstn, struct ucred *cred, struct tim
 				 * datestamp or not .. and advance the parse pointer accordingly.
 				 */
 				if (datetime.ParseTIMESTAMP3339(&dummyTS, &parse, &lenMsg) != RS_RET_OK) {
-					datetime.ParseTIMESTAMP3164(&dummyTS, &parse, &lenMsg, NO_PARSE3164_TZSTRING);
+					datetime.ParseTIMESTAMP3164(&dummyTS, &parse, &lenMsg, NO_PARSE3164_TZSTRING, NO_PERMIT_YEAR_AFTER_TIME);
 				}
 			} else {
 				if(datetime.ParseTIMESTAMP3339(&(pMsg->tTIMESTAMP), &parse, &lenMsg) != RS_RET_OK &&
-				   datetime.ParseTIMESTAMP3164(&(pMsg->tTIMESTAMP), &parse, &lenMsg, NO_PARSE3164_TZSTRING) != RS_RET_OK) {
+				datetime.ParseTIMESTAMP3164(&(pMsg->tTIMESTAMP), &parse, &lenMsg,
+				NO_PARSE3164_TZSTRING, NO_PERMIT_YEAR_AFTER_TIME) != RS_RET_OK) {
 					DBGPRINTF("we have a problem, invalid timestamp in msg!\n");
 				}
 			}
 		} else { /* if we pulled the time from the system, we need to update the message text */
 			uchar *tmpParse = parse; /* just to check correctness of TS */
 			if(datetime.ParseTIMESTAMP3339(&dummyTS, &tmpParse, &lenMsg) == RS_RET_OK ||
-			   datetime.ParseTIMESTAMP3164(&dummyTS, &tmpParse, &lenMsg, NO_PARSE3164_TZSTRING) == RS_RET_OK) {
-				/* We modify the message only if it contained a valid timestamp,
-				 * otherwise we do not touch it at all. */
+		 	datetime.ParseTIMESTAMP3164(&dummyTS, &tmpParse, &lenMsg, NO_PARSE3164_TZSTRING,
+			NO_PERMIT_YEAR_AFTER_TIME) == RS_RET_OK) {
+			/* We modify the message only if it contained a valid timestamp,
+			otherwise we do not touch it at all. */
 				datetime.formatTimestamp3164(&st, (char*)parse, 0);
 				parse[15] = ' '; /* re-write \0 from fromatTimestamp3164 by SP */
 				/* update "counters" to reflect processed timestamp */
@@ -960,6 +980,7 @@ SubmitMsg(uchar *pRcv, int lenRcv, lstn_t *pLstn, struct ucred *cred, struct tim
 
 	MsgSetRcvFrom(pMsg, pLstn->hostName == NULL ? glbl.GetLocalHostNameProp() : pLstn->hostName);
 	CHKiRet(MsgSetRcvFromIP(pMsg, pLocalHostIP));
+	MsgSetRuleset(pMsg, pLstn->pRuleset);
 	ratelimitAddMsg(ratelimiter, NULL, pMsg);
 	STATSCOUNTER_INC(ctrSubmit, mutCtrSubmit);
 finalize_it:
@@ -978,6 +999,11 @@ finalize_it:
  * of the socket which is to be processed. This eases access to the
  * growing number of properties. -- rgerhards, 2008-08-01
  */
+#if !defined(_AIX)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-align" /* TODO: how can we fix these warnings? */
+#endif
+/* Problem with the warnings: they seem to stem back from the way the API is structured */
 static rsRetVal readSocket(lstn_t *pLstn)
 {
 	DEFiRet;
@@ -989,7 +1015,7 @@ static rsRetVal readSocket(lstn_t *pLstn)
 	struct timeval *ts;
 	uchar bufRcv[4096+1];
 	uchar *pRcv = NULL; /* receive buffer */
-#	if HAVE_SCM_CREDENTIALS
+#	ifdef HAVE_SCM_CREDENTIALS
 	char aux[128];
 #	endif
 
@@ -1006,12 +1032,12 @@ static rsRetVal readSocket(lstn_t *pLstn)
 	if((size_t) iMaxLine < sizeof(bufRcv) - 1) {
 		pRcv = bufRcv;
 	} else {
-		CHKmalloc(pRcv = (uchar*) MALLOC(sizeof(uchar) * (iMaxLine + 1)));
+		CHKmalloc(pRcv = (uchar*) MALLOC(iMaxLine + 1));
 	}
 
 	memset(&msgh, 0, sizeof(msgh));
 	memset(&msgiov, 0, sizeof(msgiov));
-#	if HAVE_SCM_CREDENTIALS
+#	ifdef HAVE_SCM_CREDENTIALS
 	if(pLstn->bUseCreds) {
 		memset(&aux, 0, sizeof(aux));
 		msgh.msg_control = aux;
@@ -1022,6 +1048,10 @@ static rsRetVal readSocket(lstn_t *pLstn)
 	msgiov.iov_len = iMaxLine;
 	msgh.msg_iov = &msgiov;
 	msgh.msg_iovlen = 1;
+/*  AIXPORT : MSG_DONTWAIT not supported */
+#if defined (_AIX)
+#define MSG_DONTWAIT    MSG_NONBLOCK
+#endif
 	iRcvd = recvmsg(pLstn->fd, &msgh, MSG_DONTWAIT);
  
 	DBGPRINTF("Message from UNIX socket: #%d\n", pLstn->fd);
@@ -1032,7 +1062,7 @@ static rsRetVal readSocket(lstn_t *pLstn)
 		if(pLstn->bUseCreds) {
 			struct cmsghdr *cm;
 			for(cm = CMSG_FIRSTHDR(&msgh); cm; cm = CMSG_NXTHDR(&msgh, cm)) {
-#				if HAVE_SCM_CREDENTIALS
+#				ifdef HAVE_SCM_CREDENTIALS
 				if(   pLstn->bUseCreds
 				   && cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_CREDENTIALS) {
 					cred = (struct ucred*) CMSG_DATA(cm);
@@ -1061,11 +1091,14 @@ finalize_it:
 
 	RETiRet;
 }
+#if  !defined(_AIX)
+#pragma GCC diagnostic pop
+#endif
 
 
 /* activate current listeners */
-static inline rsRetVal
-activateListeners()
+static rsRetVal
+activateListeners(void)
 {
 	register int i;
 	int actSocks;
@@ -1094,13 +1127,16 @@ activateListeners()
 			listeners[0].ht = NULL;
 		}
 		listeners[0].fd = -1;
+		listeners[0].pRuleset = NULL;
 		listeners[0].hostName = NULL;
 		listeners[0].bParseHost = 0;
 		listeners[0].bCreatePath = 0;
 		listeners[0].ratelimitInterval = runModConf->ratelimitIntervalSysSock;
 		listeners[0].ratelimitBurst = runModConf->ratelimitBurstSysSock;
 		listeners[0].ratelimitSev = runModConf->ratelimitSeveritySysSock;
-		listeners[0].bUseCreds = (runModConf->bWritePidSysSock || runModConf->ratelimitIntervalSysSock || runModConf->bAnnotateSysSock || runModConf->bDiscardOwnMsgs || runModConf->bUseSysTimeStamp) ? 1 : 0;
+		listeners[0].bUseCreds = (runModConf->bWritePidSysSock || runModConf->ratelimitIntervalSysSock
+		|| runModConf->bAnnotateSysSock || runModConf->bDiscardOwnMsgs
+		|| runModConf->bUseSysTimeStamp) ? 1 : 0;
 		listeners[0].bWritePid = runModConf->bWritePidSysSock;
 		listeners[0].bAnnotate = runModConf->bAnnotateSysSock;
 		listeners[0].bParseTrusted = runModConf->bParseTrusted;
@@ -1160,7 +1196,10 @@ CODESTARTbeginCnfLoad
 	pModConf->bParseTrusted = 0;
 	pModConf->bParseHost = UNSET;
 	pModConf->bUseSpecialParser = 1;
-	pModConf->bDiscardOwnMsgs = 1;
+	/* if we do not process internal messages, we will see messages
+	 * from ourselves, and so we need to permit this.
+	 */
+	pModConf->bDiscardOwnMsgs = bProcessInternalMessages;
 	pModConf->bUnlink = 1;
 	pModConf->ratelimitIntervalSysSock = DFLT_ratelimitInterval;
 	pModConf->ratelimitBurstSysSock = DFLT_ratelimitBurst;
@@ -1286,6 +1325,8 @@ CODESTARTnewInpInst
 			inst->bParseHost  = (int) pvals[i].val.d.n;
 		} else if(!strcmp(inppblk.descr[i].name, "usespecialparser")) {
 			inst->bUseSpecialParser  = (int) pvals[i].val.d.n;
+		} else if(!strcmp(inppblk.descr[i].name, "ruleset")) {
+			inst->pszBindRuleset = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
 		} else if(!strcmp(inppblk.descr[i].name, "ratelimit.interval")) {
 			inst->ratelimitInterval = (int) pvals[i].val.d.n;
 		} else if(!strcmp(inppblk.descr[i].name, "ratelimit.burst")) {
@@ -1329,8 +1370,20 @@ CODESTARTendCnfLoad
 ENDendCnfLoad
 
 
+/* function to generate error message if framework does not find requested ruleset */
+static void
+std_checkRuleset_genErrMsg(__attribute__((unused)) modConfData_t *modConf, instanceConf_t *inst)
+{
+	errmsg.LogError(0, NO_ERRCODE, "imuxsock: ruleset '%s' for socket %s not found - "
+			"using default ruleset instead", inst->pszBindRuleset,
+			inst->sockName);
+}
 BEGINcheckCnf
+	instanceConf_t *inst;
 CODESTARTcheckCnf
+	for(inst = pModConf->root ; inst != NULL ; inst = inst->next) {
+		std_checkRuleset(pModConf, inst);
+	}
 ENDcheckCnf
 
 
@@ -1385,6 +1438,7 @@ CODESTARTfreeCnf
 	free(pModConf->pLogSockName);
 	for(inst = pModConf->root ; inst != NULL ; ) {
 		free(inst->sockName);
+		free(inst->pszBindRuleset);
 		free(inst->pLogHostName);
 		del = inst;
 		inst = inst->next;
@@ -1471,6 +1525,11 @@ BEGINafterRun
 	int i;
 CODESTARTafterRun
 	/* do cleanup here */
+        if(startIndexUxLocalSockets == 1 && nfd == 1) {
+                /* No sockets were configured, no cleanup needed. */
+                return RS_RET_OK;
+        }
+
 	/* Close the UNIX sockets. */
        for (i = 0; i < nfd; i++)
 		if (listeners[i].fd != -1)
@@ -1513,6 +1572,7 @@ CODESTARTmodExit
 	objRelease(prop, CORE_COMPONENT);
 	objRelease(statsobj, CORE_COMPONENT);
 	objRelease(datetime, CORE_COMPONENT);
+	objRelease(ruleset, CORE_COMPONENT);
 ENDmodExit
 
 
@@ -1574,6 +1634,7 @@ CODEmodInit_QueryRegCFSLineHdlr
 	CHKiRet(objUse(statsobj, CORE_COMPONENT));
 	CHKiRet(objUse(datetime, CORE_COMPONENT));
 	CHKiRet(objUse(parser, CORE_COMPONENT));
+	CHKiRet(objUse(ruleset, CORE_COMPONENT));
 
 	DBGPRINTF("imuxsock version %s initializing\n", PACKAGE_VERSION);
 

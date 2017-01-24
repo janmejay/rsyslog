@@ -10,7 +10,7 @@
  *
  * File begun on 2010-07-13 by RGerhards
  *
- * Copyright 2014-2014 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2014-2016 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of rsyslog.
  *
@@ -82,7 +82,8 @@ CODESTARTparse
 	dbgprintf("Message will now be parsed by \"last message repated n times\" parser.\n");
 	assert(pMsg != NULL);
 	assert(pMsg->pszRawMsg != NULL);
-	lenMsg = pMsg->iLenRawMsg - pMsg->offAfterPRI; /* note: offAfterPRI is already the number of PRI chars (do not add one!) */
+	lenMsg = pMsg->iLenRawMsg - pMsg->offAfterPRI;
+	/* note: offAfterPRI is already the number of PRI chars (do not add one!) */
 	p2parse = pMsg->pszRawMsg + pMsg->offAfterPRI; /* point to start of text, after PRI */
 
 	/* check if this message is of the type we handle in this (very limited) parser */
@@ -91,16 +92,13 @@ CODESTARTparse
 		--lenMsg;
 		++p2parse;
 	}
-dbgprintf("pmlastmsg: msg to look at: [%d]'%s'\n", lenMsg, p2parse);
 	if((unsigned) lenMsg < sizeof(OpeningText)-1 + sizeof(ClosingText)-1 + 1) {
 		/* too short, can not be "our" message */
-dbgprintf("msg too short!\n");
 		ABORT_FINALIZE(RS_RET_COULD_NOT_PARSE);
 	}
 
 	if(strncasecmp((char*) p2parse, OpeningText, sizeof(OpeningText)-1) != 0) {
 		/* wrong opening text */
-dbgprintf("wrong opening text!\n");
 		ABORT_FINALIZE(RS_RET_COULD_NOT_PARSE);
 	}
 	lenMsg -= sizeof(OpeningText) - 1;
@@ -119,9 +117,6 @@ dbgprintf("wrong opening text!\n");
 
 	if(strncasecmp((char*) p2parse, ClosingText, lenMsg) != 0) {
 		/* wrong closing text */
-dbgprintf("strcasecmp: %d\n", strncasecmp((char*) p2parse, ClosingText, lenMsg));
-dbgprintf("pmlastmsg: closing msg to look at: [%d]'%s', (%s)\n", lenMsg, p2parse, ClosingText);
-dbgprintf("wrong closing text!\n");
 		ABORT_FINALIZE(RS_RET_COULD_NOT_PARSE);
 	}
 
@@ -166,7 +161,8 @@ CODEmodInit_QueryRegCFSLineHdlr
 	CHKiRet(objUse(datetime, CORE_COMPONENT));
 
 	dbgprintf("lastmsg parser init called, compiled with version %s\n", VERSION);
- 	bParseHOSTNAMEandTAG = glbl.GetParseHOSTNAMEandTAG(); /* cache value, is set only during rsyslogd option processing */
+ 	bParseHOSTNAMEandTAG = glbl.GetParseHOSTNAMEandTAG();
+	/* cache value, is set only during rsyslogd option processing */
 
 
 ENDmodInit

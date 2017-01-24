@@ -7,7 +7,7 @@
  * are very small, and so we use a single driver for both OS's with
  * a little help of conditional compilation.
  *
- * Copyright 2008-2014 Adiscon GmbH
+ * Copyright 2008-2015 Adiscon GmbH
  *
  * This file is part of rsyslog.
  *
@@ -167,7 +167,6 @@ rsRetVal
 klogWillRunPrePrivDrop(modConfData_t *pModConf)
 {
 	char errmsg[2048];
-	int r;
 	DEFiRet;
 
 	fklog = open((char*)GetPath(pModConf), O_RDONLY, 0);
@@ -180,7 +179,7 @@ klogWillRunPrePrivDrop(modConfData_t *pModConf)
 #	ifdef OS_LINUX
 	/* Set level of kernel console messaging.. */
 	if(pModConf->console_log_level != -1) {
-		r = klogctl(8, NULL, pModConf->console_log_level);
+		int r = klogctl(8, NULL, pModConf->console_log_level);
 		if(r != 0) {
 			imklogLogIntMsg(LOG_WARNING, "imklog: cannot set console log level: %s",
 				rs_strerror_r(errno, errmsg, sizeof(errmsg)));
@@ -241,7 +240,7 @@ readklog(modConfData_t *pModConf)
 	if((size_t) iMaxLine < sizeof(bufRcv) - 1) {
 		pRcv = bufRcv;
 	} else {
-		if((pRcv = (uchar*) MALLOC(sizeof(uchar) * (iMaxLine + 1))) == NULL) {
+		if((pRcv = (uchar*) MALLOC(iMaxLine + 1)) == NULL) {
 			iMaxLine = sizeof(bufRcv) - 1; /* better this than noting */
 			pRcv = bufRcv;
 		}
@@ -278,7 +277,7 @@ readklog(modConfData_t *pModConf)
 	if (len > 0)
 		submitSyslog(pModConf, LOG_INFO, pRcv);
 
-	if(pRcv != NULL && (size_t) iMaxLine >= sizeof(bufRcv) - 1)
+	if(pRcv != bufRcv)
 		free(pRcv);
 }
 

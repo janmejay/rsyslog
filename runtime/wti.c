@@ -9,7 +9,7 @@
  * (and in the web doc set on http://www.rsyslog.com/doc). Be sure to read it
  * if you are getting aquainted to the object.
  *
- * Copyright 2008-2012 Adiscon GmbH.
+ * Copyright 2008-2016 Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
@@ -53,6 +53,7 @@ DEFobjCurrIf(glbl)
 
 pthread_key_t thrd_wti_key;
 
+
 /* forward-definitions */
 
 /* methods */
@@ -60,7 +61,7 @@ pthread_key_t thrd_wti_key;
 /* get the header for debug messages
  * The caller must NOT free or otherwise modify the returned string!
  */
-static inline uchar *
+static uchar *
 wtiGetDbgHdr(wti_t *pThis)
 {
 	ISOBJ_TYPE_assert(pThis, wti);
@@ -124,7 +125,7 @@ wtiWakeupThrd(wti_t *pThis)
 	if(wtiGetState(pThis)) {
 		/* we first try the cooperative "cancel" interface */
 		pthread_kill(pThis->thrdID, SIGTTIN);
-		DBGPRINTF("sent SIGTTIN to worker thread 0x%x\n", (unsigned) pThis->thrdID);
+		DBGPRINTF("sent SIGTTIN to worker thread %p\n", (void*) pThis->thrdID);
 	}
 
 	RETiRet;
@@ -151,7 +152,7 @@ wtiCancelThrd(wti_t *pThis)
 	if(wtiGetState(pThis)) {
 		/* we first try the cooperative "cancel" interface */
 		pthread_kill(pThis->thrdID, SIGTTIN);
-		DBGPRINTF("sent SIGTTIN to worker thread 0x%x, giving it a chance to terminate\n", (unsigned) pThis->thrdID);
+		DBGPRINTF("sent SIGTTIN to worker thread %p, giving it a chance to terminate\n", (void *) pThis->thrdID);
 		srSleep(0, 10000);
 	}
 
@@ -167,6 +168,34 @@ wtiCancelThrd(wti_t *pThis)
 
 	RETiRet;
 }
+
+/* note: this function is only called once in action.c */
+rsRetVal
+wtiNewIParam(wti_t *const pWti, action_t *const pAction, actWrkrIParams_t **piparams)
+{
+	actWrkrInfo_t *const wrkrInfo = &(pWti->actWrkrInfo[pAction->iActionNbr]);
+	actWrkrIParams_t *iparams;
+	int newMax;
+	DEFiRet;
+
+	if(wrkrInfo->p.tx.currIParam == wrkrInfo->p.tx.maxIParams) {
+		/* we need to extend */
+		newMax = (wrkrInfo->p.tx.maxIParams == 0) ? CONF_IPARAMS_BUFSIZE
+							  : 2 * wrkrInfo->p.tx.maxIParams;
+		CHKmalloc(iparams = realloc(wrkrInfo->p.tx.iparams,
+					    sizeof(actWrkrIParams_t) * pAction->iNumTpls * newMax));
+		memset(iparams + (wrkrInfo->p.tx.currIParam * pAction->iNumTpls), 0,
+		       sizeof(actWrkrIParams_t) * pAction->iNumTpls * (newMax - wrkrInfo->p.tx.maxIParams));
+		wrkrInfo->p.tx.iparams = iparams;
+		wrkrInfo->p.tx.maxIParams = newMax;
+	}
+	*piparams = wrkrInfo->p.tx.iparams + wrkrInfo->p.tx.currIParam * pAction->iNumTpls;
+	++wrkrInfo->p.tx.currIParam;
+
+finalize_it:
+	RETiRet;
+}
+
 
 
 /* Destructor */
@@ -253,7 +282,7 @@ wtiWorkerCancelCleanup(void *arg)
  * re-tested by the caller, so it is OK to NOT do it here.
  * rgerhards, 2009-05-20
  */
-static inline void
+static void
 doIdleProcessing(wti_t *pThis, wtp_t *pWtp, int *pbInactivityTOOccured)
 {
 	struct timespec t;
@@ -282,12 +311,14 @@ doIdleProcessing(wti_t *pThis, wtp_t *pWtp, int *pbInactivityTOOccured)
  * long (during shutdown). So what we do is block cancellation, and every
  * consumer must enable it during the periods where it is safe.
  */
+#if !defined(_AIX)
 #pragma GCC diagnostic ignored "-Wempty-body"
+#endif
 rsRetVal
 wtiWorker(wti_t *__restrict__ const pThis)
 {
 	wtp_t *__restrict__ const pWtp = pThis->pWtp; /* our worker thread pool -- shortcut */
-	const action_t *__restrict__ pAction;
+	action_t *__restrict__ pAction;
 	int bInactivityTOOccured = 0;
 	rsRetVal localRet;
 	rsRetVal terminateRet;
@@ -356,6 +387,7 @@ wtiWorker(wti_t *__restrict__ const pThis)
 		dbgprintf("wti %p, action %d, ptr %p\n", pThis, i, wrkrInfo->actWrkrData);
 		if(wrkrInfo->actWrkrData != NULL) {
 			pAction = wrkrInfo->pAction;
+			actionRemoveWorker(pAction, wrkrInfo->actWrkrData);
 			pAction->pMod->mod.om.freeWrkrInstance(wrkrInfo->actWrkrData);
 			if(pAction->isTransactional) {
 				/* free iparam "cache" - we need to go through to max! */
@@ -369,6 +401,8 @@ wtiWorker(wti_t *__restrict__ const pThis)
 				wrkrInfo->p.tx.iparams = NULL;
 				wrkrInfo->p.tx.currIParam = 0;
 				wrkrInfo->p.tx.maxIParams = 0;
+			} else {
+				releaseDoActionParams(pAction, pThis, 1);
 			}
 			wrkrInfo->actWrkrData = NULL; /* re-init for next activation */
 		}
@@ -381,7 +415,9 @@ wtiWorker(wti_t *__restrict__ const pThis)
 
 	RETiRet;
 }
+#if !defined(_AIX)
 #pragma GCC diagnostic warning "-Wempty-body"
+#endif
 
 
 /* some simple object access methods */
@@ -407,7 +443,7 @@ wtiSetDbgHdr(wti_t *pThis, uchar *pszMsg, size_t lenMsg)
 		free(pThis->pszDbgHdr);
 	}
 
-	if((pThis->pszDbgHdr = MALLOC(sizeof(uchar) * lenMsg + 1)) == NULL)
+	if((pThis->pszDbgHdr = MALLOC(lenMsg + 1)) == NULL)
 		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
 
 	memcpy(pThis->pszDbgHdr, pszMsg, lenMsg + 1); /* always think about the \0! */
@@ -436,7 +472,8 @@ wtiGetDummy(void)
 	pWti = (wti_t*) pthread_getspecific(thrd_wti_key);
 	if(pWti == NULL) {
 		wtiConstruct(&pWti);
-		wtiConstructFinalize(pWti);
+		if(pWti != NULL)
+			wtiConstructFinalize(pWti);
 		if(pthread_setspecific(thrd_wti_key, pWti) != 0) {
 			DBGPRINTF("wtiGetDummy: error setspecific thrd_wti_key\n");
 		}
@@ -445,7 +482,7 @@ wtiGetDummy(void)
 }
 
 /* dummy */
-rsRetVal wtiQueryInterface(void) { return RS_RET_NOT_IMPLEMENTED; }
+static rsRetVal wtiQueryInterface(void) { return RS_RET_NOT_IMPLEMENTED; }
 
 /* exit our class
  */
@@ -468,7 +505,7 @@ BEGINObjClassInit(wti, 1, OBJ_IS_CORE_MODULE) /* one is the object version (most
 	r = pthread_key_create(&thrd_wti_key, NULL);
 	if(r != 0) {
 		dbgprintf("wti.c: pthread_key_create failed\n");
-		iRet = RS_RET_ERR;
+		ABORT_FINALIZE(RS_RET_ERR);
 	}
 ENDObjClassInit(wti)
 

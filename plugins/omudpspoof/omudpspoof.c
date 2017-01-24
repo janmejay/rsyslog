@@ -24,7 +24,7 @@
  * rgerhards, 2009-07-10
  *
  * Copyright 2009 David Lang (spoofing code)
- * Copyright 2009-2012 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2009-2016 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of rsyslog.
  *
@@ -179,13 +179,13 @@ static rsRetVal doTryResume(wrkrInstanceData_t *pWrkrData);
 /* this function gets the default template. It coordinates action between
  * old-style and new-style configuration parts.
  */
-static inline uchar*
+static uchar*
 getDfltTpl(void)
 {
 	if(loadModConf != NULL && loadModConf->tplName != NULL)
 		return loadModConf->tplName;
 	else if(cs.tplName == NULL)
-		return (uchar*)"RSYSLOG_FileFormat";
+		return (uchar*)"RSYSLOG_TraditionalForwardFormat";
 	else
 		return cs.tplName;
 }
@@ -197,7 +197,7 @@ getDfltTpl(void)
  * is we do not permit this directive after the v2 config system has been used to set
  * the parameter.
  */
-rsRetVal
+static rsRetVal
 setLegacyDfltTpl(void __attribute__((unused)) *pVal, uchar* newVal)
 {
 	DEFiRet;
@@ -355,8 +355,10 @@ ENDdbgPrintInstInfo
  * Note: libnet is not thread-safe, so we need to ensure that only one
  * instance ever is calling libnet code.
  * rgehards, 2007-12-20
- */
-static inline rsRetVal
+ */ 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-align"
+static rsRetVal
 UDPSend(wrkrInstanceData_t *pWrkrData, uchar *pszSourcename, char *msg, size_t len)
 {
 	struct addrinfo *r;
@@ -521,6 +523,7 @@ finalize_it:
 	}
 	RETiRet;
 }
+#pragma GCC diagnostic pop
 
 
 /* try to resume connection if it is not ready
@@ -573,7 +576,7 @@ static rsRetVal doTryResume(wrkrInstanceData_t *pWrkrData)
 	}
 	DBGPRINTF("%s found, resuming.\n", pData->host);
 	pWrkrData->f_addr = res;
-	pWrkrData->pSockArray = net.create_udp_socket((uchar*)pData->host, NULL, 0, 0);
+	pWrkrData->pSockArray = net.create_udp_socket((uchar*)pData->host, NULL, 0, 0, 0, NULL);
 
 finalize_it:
 	if(iRet != RS_RET_OK) {
@@ -615,7 +618,7 @@ finalize_it:
 ENDdoAction
 
 
-static inline void
+static void
 setInstParamDefaults(instanceData *pData)
 {
 	pData->tplName = NULL;
@@ -783,13 +786,20 @@ CODEmodInit_QueryRegCFSLineHdlr
 
 	pthread_mutex_init(&mutLibnet, NULL);
 
-	CHKiRet(regCfSysLineHdlr((uchar *)"actionomudpspoofdefaulttemplate", 0, eCmdHdlrGetWord, setLegacyDfltTpl, NULL, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"actionomudpspoofsourcenametemplate", 0, eCmdHdlrGetWord, NULL, &cs.pszSourceNameTemplate, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"actionomudpspooftargethost", 0, eCmdHdlrGetWord, NULL, &cs.pszTargetHost, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"actionomudpspooftargetport", 0, eCmdHdlrGetWord, NULL, &cs.pszTargetPort, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"actionomudpspoofsourceportstart", 0, eCmdHdlrInt, NULL, &cs.iSourcePortStart, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"actionomudpspoofsourceportend", 0, eCmdHdlrInt, NULL, &cs.iSourcePortEnd, NULL));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler, resetConfigVariables, NULL, STD_LOADABLE_MODULE_ID));
+	CHKiRet(regCfSysLineHdlr((uchar *)"actionomudpspoofdefaulttemplate", 0, eCmdHdlrGetWord,
+	setLegacyDfltTpl, NULL, NULL));
+	CHKiRet(regCfSysLineHdlr((uchar *)"actionomudpspoofsourcenametemplate", 0, eCmdHdlrGetWord, NULL,
+	&cs.pszSourceNameTemplate, NULL));
+	CHKiRet(regCfSysLineHdlr((uchar *)"actionomudpspooftargethost", 0, eCmdHdlrGetWord, NULL,
+	&cs.pszTargetHost, NULL));
+	CHKiRet(regCfSysLineHdlr((uchar *)"actionomudpspooftargetport", 0, eCmdHdlrGetWord, NULL,
+	&cs.pszTargetPort, NULL));
+	CHKiRet(regCfSysLineHdlr((uchar *)"actionomudpspoofsourceportstart", 0, eCmdHdlrInt, NULL,
+	&cs.iSourcePortStart, NULL));
+	CHKiRet(regCfSysLineHdlr((uchar *)"actionomudpspoofsourceportend", 0, eCmdHdlrInt, NULL,
+	&cs.iSourcePortEnd, NULL));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler, resetConfigVariables,
+	NULL, STD_LOADABLE_MODULE_ID));
 ENDmodInit
 
 /* vim:set ai:

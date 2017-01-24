@@ -165,7 +165,7 @@ ENDtryResume
 
 
 static rsRetVal
-processJSON(wrkrInstanceData_t *pWrkrData, msg_t *pMsg, char *buf, size_t lenBuf)
+processJSON(wrkrInstanceData_t *pWrkrData, smsg_t *pMsg, char *buf, size_t lenBuf)
 {
 	struct json_object *json;
 	const char *errMsg;
@@ -183,11 +183,7 @@ processJSON(wrkrInstanceData_t *pWrkrData, msg_t *pMsg, char *buf, size_t lenBuf
 
 			err = pWrkrData->tokener->err;
 			if(err != json_tokener_continue)
-#				if HAVE_JSON_TOKENER_ERROR_DESC
-					errMsg = json_tokener_error_desc(err);
-#				else
-					errMsg = json_tokener_errors[err];
-#				endif
+				errMsg = json_tokener_error_desc(err);
 			else
 				errMsg = "Unterminated input";
 		} else if((size_t)pWrkrData->tokener->char_offset < lenBuf)
@@ -202,16 +198,21 @@ processJSON(wrkrInstanceData_t *pWrkrData, msg_t *pMsg, char *buf, size_t lenBuf
 	if(json == NULL
 	   || ((size_t)pWrkrData->tokener->char_offset < lenBuf)
 	   || (!json_object_is_type(json, json_type_object))) {
+		if(json != NULL) {
+			/* Release json object as we are not going to add it to pMsg */
+			json_object_put(json);
+		}
 		ABORT_FINALIZE(RS_RET_NO_CEE_MSG);
 	}
  
- 	msgAddJSON(pMsg, pWrkrData->pData->container, json, 0);
+ 	msgAddJSON(pMsg, pWrkrData->pData->container, json, 0, 0);
 finalize_it:
 	RETiRet;
 }
 
-BEGINdoAction
-	msg_t *pMsg;
+BEGINdoAction_NoStrings
+	smsg_t **ppMsg = (smsg_t **) pMsgData;
+	smsg_t *pMsg = ppMsg[0];
 	uchar *buf;
 	rs_size_t len;
 	int bSuccess = 0;
@@ -220,7 +221,6 @@ BEGINdoAction
 	instanceData *pData;
 CODESTARTdoAction
 	pData = pWrkrData->pData;
-	pMsg = (msg_t*) ppString[0];
 	/* note that we can performance-optimize the interface, but this also
 	 * requires changes to the libraries. For now, we accept message
 	 * duplication. -- rgerhards, 2010-12-01
@@ -247,7 +247,7 @@ finalize_it:
 		json = json_object_new_object();
 		jval = json_object_new_string((char*)buf);
 		json_object_object_add(json, "msg", jval);
-		msgAddJSON(pMsg, pData->container, json, 0);
+		msgAddJSON(pMsg, pData->container, json, 0, 0);
 		iRet = RS_RET_OK;
 	}
 	MsgSetParseSuccess(pMsg, bSuccess);
@@ -256,7 +256,6 @@ ENDdoAction
 static inline void
 setInstParamDefaults(instanceData *pData)
 {
-	pData->cookie = NULL;
 	pData->bUseRawMsg = 0;
 }
 
@@ -293,8 +292,6 @@ CODESTARTnewActInst
 
 	if(pData->container == NULL)
 		CHKmalloc(pData->container = (uchar*) strdup("!"));
-	if(pData->cookie == NULL)
-		CHKmalloc(pData->cookie = strdup("@cee:"));
 	pData->lenCookie = strlen(pData->cookie);
 CODE_STD_FINALIZERnewActInst
 	cnfparamvalsDestruct(pvals, &actpblk);

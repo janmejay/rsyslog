@@ -11,7 +11,7 @@
  *
  * Module begun 2009-06-10 by Rainer Gerhards
  *
- * Copyright 2009-2014 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2009-2016 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
@@ -51,6 +51,7 @@
 #include "wti.h"
 #include "dirty.h" /* for main ruleset queue creation */
 
+
 /* static data */
 DEFobjStaticHelpers
 DEFobjCurrIf(errmsg)
@@ -69,7 +70,7 @@ static struct cnfparamblk rspblk =
 
 /* forward definitions */
 static rsRetVal processBatch(batch_t *pBatch, wti_t *pWti);
-static rsRetVal scriptExec(struct cnfstmt *root, msg_t *pMsg, wti_t *pWti);
+static rsRetVal scriptExec(struct cnfstmt *root, smsg_t *pMsg, wti_t *pWti);
 
 
 /* ---------- linked-list key handling functions (ruleset) ---------- */
@@ -94,6 +95,9 @@ scriptIterateAllActions(struct cnfstmt *root, rsRetVal (*pFunc)(void*, void*), v
 		switch(stmt->nodetype) {
 		case S_NOP:
 		case S_STOP:
+		case S_SET:
+		case S_UNSET:
+		case S_CALL_INDIRECT:
 		case S_CALL:/* call does not need to do anything - done in called ruleset! */
 			break;
 		case S_ACT:
@@ -108,6 +112,11 @@ scriptIterateAllActions(struct cnfstmt *root, rsRetVal (*pFunc)(void*, void*), v
 				scriptIterateAllActions(stmt->d.s_if.t_else,
 							pFunc, pParam);
 			break;
+		case S_FOREACH:
+			if(stmt->d.s_foreach.body != NULL)
+				scriptIterateAllActions(stmt->d.s_foreach.body,
+                                        pFunc, pParam);
+			break;
 		case S_PRIFILT:
 			if(stmt->d.s_prifilt.t_then != NULL)
 				scriptIterateAllActions(stmt->d.s_prifilt.t_then,
@@ -120,9 +129,16 @@ scriptIterateAllActions(struct cnfstmt *root, rsRetVal (*pFunc)(void*, void*), v
 			scriptIterateAllActions(stmt->d.s_propfilt.t_then,
 						pFunc, pParam);
 			break;
+		case S_RELOAD_LOOKUP_TABLE: /* this is a NOP */
+			break;
 		default:
 			dbgprintf("error: unknown stmt type %u during iterateAll\n",
 				(unsigned) stmt->nodetype);
+			#ifndef NDEBUG
+				fprintf(stderr, "error: unknown stmt type %u during iterateAll\n",
+					(unsigned) stmt->nodetype);
+			#endif
+			assert(0); /* abort under debugging */
 			break;
 		}
 	}
@@ -174,18 +190,15 @@ DEFFUNC_llExecFunc(doActivateRulesetQueues)
 }
 /* activate all ruleset queues */
 rsRetVal
-activateRulesetQueues()
+activateRulesetQueues(void)
 {
-	DEFiRet;
-
 	llExecFunc(&(runConf->rulesets.llRulesets), doActivateRulesetQueues, NULL);
-
-	RETiRet;
+	return RS_RET_OK;
 }
 
 
 static rsRetVal
-execAct(struct cnfstmt *stmt, msg_t *pMsg, wti_t *pWti)
+execAct(struct cnfstmt *stmt, smsg_t *pMsg, wti_t *pWti)
 {
 	DEFiRet;
 	if(stmt->d.act->bDisabled) {
@@ -206,9 +219,9 @@ finalize_it:
 }
 
 static rsRetVal
-execSet(struct cnfstmt *stmt, msg_t *pMsg)
+execSet(struct cnfstmt *stmt, smsg_t *pMsg)
 {
-	struct var result;
+	struct svar result;
 	DEFiRet;
 	cnfexprEval(stmt->d.s_set.expr, &result, pMsg);
 	msgSetJSONFromVar(pMsg, stmt->d.s_set.varname, &result, stmt->d.s_set.force_reset);
@@ -217,7 +230,7 @@ execSet(struct cnfstmt *stmt, msg_t *pMsg)
 }
 
 static rsRetVal
-execUnset(struct cnfstmt *stmt, msg_t *pMsg)
+execUnset(struct cnfstmt *stmt, smsg_t *pMsg)
 {
 	DEFiRet;
 	msgDelJSON(pMsg, stmt->d.s_unset.varname);
@@ -225,13 +238,55 @@ execUnset(struct cnfstmt *stmt, msg_t *pMsg)
 }
 
 static rsRetVal
-execCall(struct cnfstmt *stmt, msg_t *pMsg, wti_t *pWti)
+execCallIndirect(struct cnfstmt *const __restrict__ stmt,
+	smsg_t *pMsg,
+	wti_t *const __restrict__ pWti)
+{
+	ruleset_t *pRuleset;
+	struct svar result;
+	int bMustFree; /* dummy parameter */
+	DEFiRet;
+
+	assert(stmt->d.s_call_ind.expr != NULL);
+
+	cnfexprEval(stmt->d.s_call_ind.expr, &result, pMsg);
+	uchar *const rsName = (uchar*) var2CString(&result, &bMustFree);
+	const rsRetVal localRet = rulesetGetRuleset(loadConf, &pRuleset, rsName);
+	if(localRet != RS_RET_OK) {
+		/* in that case, we accept that a NOP will "survive" */
+		errmsg.LogError(0, RS_RET_RULESET_NOT_FOUND, "error: CALL_INDIRECT: "
+			"ruleset '%s' cannot be found, treating as NOP\n", rsName);
+		FINALIZE;
+	}
+	DBGPRINTF("CALL_INDIRECT obtained ruleset ptr %p for ruleset '%s' [hasQueue:%d]\n",
+		  pRuleset, rsName, rulesetHasQueue(pRuleset));
+	if(rulesetHasQueue(pRuleset)) {
+		CHKmalloc(pMsg = MsgDup((smsg_t*) pMsg));
+		DBGPRINTF("CALL_INDIRECT: forwarding message to async ruleset %p\n",
+			  pRuleset->pQueue);
+		MsgSetFlowControlType(pMsg, eFLOWCTL_NO_DELAY);
+		MsgSetRuleset(pMsg, pRuleset);
+		/* Note: we intentionally use submitMsg2() here, as we process messages
+		 * that were already run through the rate-limiter.
+		 */
+		submitMsg2(pMsg);
+	} else {
+		CHKiRet(scriptExec(pRuleset->root, pMsg, pWti));
+	}
+finalize_it:
+	varDelete(&result);
+	free(rsName);
+	RETiRet;
+}
+
+static rsRetVal
+execCall(struct cnfstmt *stmt, smsg_t *pMsg, wti_t *pWti)
 {
 	DEFiRet;
 	if(stmt->d.s_call.ruleset == NULL) {
 		CHKiRet(scriptExec(stmt->d.s_call.stmt, pMsg, pWti));
 	} else {
-		CHKmalloc(pMsg = MsgDup((msg_t*) pMsg));
+		CHKmalloc(pMsg = MsgDup((smsg_t*) pMsg));
 		DBGPRINTF("CALL: forwarding message to async ruleset %p\n",
 			  stmt->d.s_call.ruleset->pQueue);
 		MsgSetFlowControlType(pMsg, eFLOWCTL_NO_DELAY);
@@ -246,7 +301,7 @@ finalize_it:
 }
 
 static rsRetVal
-execIf(struct cnfstmt *stmt, msg_t *pMsg, wti_t *pWti)
+execIf(struct cnfstmt *stmt, smsg_t *pMsg, wti_t *pWti)
 {
 	sbool bRet;
 	DEFiRet;
@@ -264,32 +319,97 @@ finalize_it:
 }
 
 static rsRetVal
-execForeach(struct cnfstmt *stmt, msg_t *pMsg, wti_t *pWti)
-{
-	json_object *arr;
+invokeForeachBodyWith(struct cnfstmt *stmt, json_object *o, smsg_t *pMsg, wti_t *pWti) {
+	struct svar v;
+	v.datatype = 'J';
+	v.d.json = o;
 	DEFiRet;
-	arr = cnfexprEvalCollection(stmt->d.s_foreach.iter->collection, pMsg);
-	if (arr == NULL) {
-		DBGPRINTF("foreach loop skipped, as collection is empty\n");
-		FINALIZE;
-	}
-	int len = json_object_array_length(arr);
-	json_object *curr;
-	for (int i = 0; i < len; i++) {
-		curr = json_object_array_get_idx(arr, i);
-		struct var v;
-		v.d.json = curr;
-		v.datatype = 'J';
-		CHKiRet(msgSetJSONFromVar(pMsg, (uchar*)stmt->d.s_foreach.iter->var, &v, 1));
-		CHKiRet(scriptExec(stmt->d.s_foreach.body, pMsg, pWti));
-	}
-	CHKiRet(msgDelJSON(pMsg, stmt->d.s_foreach.iter->var));
+	CHKiRet(msgSetJSONFromVar(pMsg, (uchar*)stmt->d.s_foreach.iter->var, &v, 1));
+	CHKiRet(scriptExec(stmt->d.s_foreach.body, pMsg, pWti));
 finalize_it:
 	RETiRet;
 }
 
 static rsRetVal
-execPRIFILT(struct cnfstmt *stmt, msg_t *pMsg, wti_t *pWti)
+callForeachArray(struct cnfstmt *stmt, json_object *arr, smsg_t *pMsg, wti_t *pWti) {
+	DEFiRet;
+	int len = json_object_array_length(arr);
+	json_object *curr;
+	for (int i = 0; i < len; i++) {
+		curr = json_object_array_get_idx(arr, i);
+		CHKiRet(invokeForeachBodyWith(stmt, curr, pMsg, pWti));
+	}
+finalize_it:
+	RETiRet;
+}
+
+
+static rsRetVal
+callForeachObject(struct cnfstmt *stmt, json_object *arr, smsg_t *pMsg, wti_t *pWti) {
+	json_object *entry = NULL;
+	json_object *key = NULL;
+	const char **keys = NULL;
+	DEFiRet;
+
+	int len = json_object_object_length(arr);
+	CHKmalloc(keys = calloc(len, sizeof(char*)));
+	const char **curr_key = keys;
+	struct json_object_iterator it = json_object_iter_begin(arr);
+	struct json_object_iterator itEnd = json_object_iter_end(arr);
+	while (!json_object_iter_equal(&it, &itEnd)) {
+		*curr_key = json_object_iter_peek_name(&it);
+		curr_key++;
+		json_object_iter_next(&it);
+	}
+	json_object *curr = NULL;
+	CHKmalloc(entry = json_object_new_object());
+	for (int i = 0; i < len; i++) {
+		if (json_object_object_get_ex(arr, keys[i], &curr)) {
+			CHKmalloc(key = json_object_new_string(keys[i]));
+			json_object_object_add(entry, "key", key);
+			key = NULL;
+			json_object_object_add(entry, "value", json_object_get(curr));
+			CHKiRet(invokeForeachBodyWith(stmt, entry, pMsg, pWti));
+		}
+	}
+finalize_it:
+	if (keys != NULL) free(keys);
+	if (entry != NULL) json_object_put(entry);
+	if (key != NULL) json_object_put(key);
+	
+	RETiRet;
+}
+
+static rsRetVal
+execForeach(struct cnfstmt *stmt, smsg_t *pMsg, wti_t *pWti)
+{
+	json_object *arr = NULL;
+	DEFiRet;
+
+	/* arr can either be an array or an associative-array (obj) */
+	arr = cnfexprEvalCollection(stmt->d.s_foreach.iter->collection, pMsg);
+	
+	if (arr == NULL) {
+		DBGPRINTF("foreach loop skipped, as object to iterate upon is empty\n");
+		FINALIZE;
+	} else if (json_object_is_type(arr, json_type_array)) {
+		CHKiRet(callForeachArray(stmt, arr, pMsg, pWti));
+	} else if (json_object_is_type(arr, json_type_object)) {
+		CHKiRet(callForeachObject(stmt, arr, pMsg, pWti));
+	} else {
+		DBGPRINTF("foreach loop skipped, as object to iterate upon is not an array\n");
+		FINALIZE;
+	}
+	CHKiRet(msgDelJSON(pMsg, (uchar*)stmt->d.s_foreach.iter->var));
+
+finalize_it:
+	if (arr != NULL) json_object_put(arr);
+
+	RETiRet;
+}
+
+static rsRetVal
+execPRIFILT(struct cnfstmt *stmt, smsg_t *pMsg, wti_t *pWti)
 {
 	int bRet;
 	DEFiRet;
@@ -315,7 +435,7 @@ finalize_it:
 
 /* helper to execPROPFILT(), as the evaluation itself is quite lengthy */
 static int
-evalPROPFILT(struct cnfstmt *stmt, msg_t *pMsg)
+evalPROPFILT(struct cnfstmt *stmt, smsg_t *pMsg)
 {
 	unsigned short pbMustBeFreed;
 	uchar *pszPropVal;
@@ -358,6 +478,7 @@ evalPROPFILT(struct cnfstmt *stmt, msg_t *pMsg)
 				  (unsigned char*) pszPropVal, 1, &stmt->d.s_propfilt.regex_cache) == RS_RET_OK)
 			bRet = 1;
 		break;
+	case FIOP_NOP:
 	default:
 		/* here, it handles NOP (for performance reasons) */
 		assert(stmt->d.s_propfilt.operation == FIOP_NOP);
@@ -405,7 +526,7 @@ done:
 }
 
 static rsRetVal
-execPROPFILT(struct cnfstmt *stmt, msg_t *pMsg, wti_t *pWti)
+execPROPFILT(struct cnfstmt *stmt, smsg_t *pMsg, wti_t *pWti)
 {
 	sbool bRet;
 	DEFiRet;
@@ -418,6 +539,24 @@ finalize_it:
 	RETiRet;
 }
 
+static rsRetVal
+execReloadLookupTable(struct cnfstmt *stmt) {
+	lookup_ref_t *t;
+	DEFiRet;
+	t = stmt->d.s_reload_lookup_table.table;
+	if (t == NULL) {
+		ABORT_FINALIZE(RS_RET_NONE);
+	}
+	
+	CHKiRet(lookupReload(t, stmt->d.s_reload_lookup_table.stub_value));
+	/* Note that reload dispatched above is performed asynchronously,
+	   on a different thread. So rsRetVal it returns means it was triggered
+	   successfully, and not that it was reloaded successfully. */
+	
+finalize_it:
+	RETiRet;
+}
+
 /* The rainerscript execution engine. It is debatable if that would be better
  * contained in grammer/rainerscript.c, HOWEVER, that file focusses primarily
  * on the parsing and object creation part. So as an actual executor, it is
@@ -425,7 +564,7 @@ finalize_it:
  * rgerhards, 2012-09-04
  */
 static rsRetVal
-scriptExec(struct cnfstmt *root, msg_t *pMsg, wti_t *pWti)
+scriptExec(struct cnfstmt *root, smsg_t *pMsg, wti_t *pWti)
 {
 	struct cnfstmt *stmt;
 	DEFiRet;
@@ -457,6 +596,9 @@ scriptExec(struct cnfstmt *root, msg_t *pMsg, wti_t *pWti)
 		case S_CALL:
 			CHKiRet(execCall(stmt, pMsg, pWti));
 			break;
+		case S_CALL_INDIRECT:
+			CHKiRet(execCallIndirect(stmt, pMsg, pWti));
+			break;
 		case S_IF:
 			CHKiRet(execIf(stmt, pMsg, pWti));
 			break;
@@ -468,6 +610,9 @@ scriptExec(struct cnfstmt *root, msg_t *pMsg, wti_t *pWti)
 			break;
 		case S_PROPFILT:
 			CHKiRet(execPROPFILT(stmt, pMsg, pWti));
+			break;
+        case S_RELOAD_LOOKUP_TABLE:
+			CHKiRet(execReloadLookupTable(stmt));
 			break;
 		default:
 			dbgprintf("error: unknown stmt type %u during exec\n",
@@ -487,8 +632,9 @@ static rsRetVal
 processBatch(batch_t *pBatch, wti_t *pWti)
 {
 	int i;
-	msg_t *pMsg;
+	smsg_t *pMsg;
 	ruleset_t *pRuleset;
+	rsRetVal localRet;
 	DEFiRet;
 
 	DBGPRINTF("processBATCH: batch of %d elements must be processed\n", pBatch->nElem);
@@ -500,15 +646,19 @@ processBatch(batch_t *pBatch, wti_t *pWti)
 		pMsg = pBatch->pElem[i].pMsg;
 		DBGPRINTF("processBATCH: next msg %d: %.128s\n", i, pMsg->pszRawMsg);
 		pRuleset = (pMsg->pRuleset == NULL) ? ourConf->rulesets.pDflt : pMsg->pRuleset;
-		scriptExec(pRuleset->root, pMsg, pWti);
-		// TODO: think if we need a return state of scriptExec - most probably
-		// the answer is "no", as we need to process the batch in any case!
-		// TODO: we must refactor this!  flag messages as committed
-		batchSetElemState(pBatch, i, BATCH_STATE_COMM);
+		localRet = scriptExec(pRuleset->root, pMsg, pWti);
+		/* the most important case here is that processing may be aborted
+		 * due to pbShutdownImmediate, in which case we MUST NOT flag this
+		 * message as committed. If we would do so, the message would
+		 * potentially be lost.
+		 */
+		if(localRet == RS_RET_OK)
+			batchSetElemState(pBatch, i, BATCH_STATE_COMM);
 	}
 
 	/* commit phase */
-	dbgprintf("END batch execution phase, entering to commit phase\n");
+	DBGPRINTF("END batch execution phase, entering to commit phase "
+		"[processed %d of %d messages]\n", i, batchNumMsgs(pBatch));
 	actionCommitAllDirect(pWti);
 
 	DBGPRINTF("processBATCH: batch of %d elements has been processed\n", pBatch->nElem);
@@ -521,7 +671,7 @@ processBatch(batch_t *pBatch, wti_t *pWti)
  * rgerhards, 2009-11-04
  */
 static parserList_t*
-GetParserList(rsconf_t *conf, msg_t *pMsg)
+GetParserList(rsconf_t *conf, smsg_t *pMsg)
 {
 	return (pMsg->pRuleset == NULL) ? conf->rulesets.pDflt->pParserLst : pMsg->pRuleset->pParserLst;
 }
@@ -733,7 +883,7 @@ debugPrintAll(rsconf_t *conf)
 	RETiRet;
 }
 
-static inline void
+static void
 rulesetOptimize(ruleset_t *pRuleset)
 {
 	if(Debug) {
@@ -775,7 +925,7 @@ rulesetOptimizeAll(rsconf_t *conf)
  * considered acceptable for the time being.
  * rgerhards, 2009-10-27
  */
-static inline rsRetVal
+static rsRetVal
 doRulesetCreateQueue(rsconf_t *conf, int *pNewVal)
 {
 	uchar *rsname;

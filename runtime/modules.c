@@ -11,7 +11,7 @@
  *
  * File begun on 2007-07-22 by RGerhards
  *
- * Copyright 2007-2012 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2007-2016 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
@@ -94,17 +94,17 @@ static struct cnfparamblk pblk =
  * if the transactional entry points exist.
  */
 static rsRetVal
-dummyBeginTransaction() 
+dummyBeginTransaction(__attribute__((unused)) void * dummy)
 {
 	return RS_RET_OK;
 }
 static rsRetVal
-dummyEndTransaction() 
+dummyEndTransaction(__attribute__((unused)) void * dummy)
 {
 	return RS_RET_OK;
 }
 static rsRetVal
-dummyIsCompatibleWithFeature() 
+dummyIsCompatibleWithFeature(__attribute__((unused)) syslogFeature eFeat)
 {
 	return RS_RET_INCOMPATIBLE;
 }
@@ -125,7 +125,7 @@ dummynewActInst(uchar *modName, struct nvlst __attribute__((unused)) *dummy1,
 
 /* add a user to the current list of users (always at the root) */
 static void
-modUsrAdd(modInfo_t *pThis, char *pszUsr)
+modUsrAdd(modInfo_t *pThis, const char *pszUsr)
 {
 	modUsr_t *pUsr;
 
@@ -152,7 +152,7 @@ finalize_it:
  * rgerhards, 2008-03-11
  */
 static void
-modUsrDel(modInfo_t *pThis, char *pszUsr)
+modUsrDel(modInfo_t *pThis, const char *pszUsr)
 {
 	modUsr_t *pUsr;
 	modUsr_t *pPrev = NULL;
@@ -201,15 +201,15 @@ modUsrPrint(modInfo_t *pThis)
  * to be called at end of run to detect "module leaks" and who is causing them.
  * rgerhards, 2008-03-11
  */
-//static void
-void
+static void
 modUsrPrintAll(void)
 {
 	modInfo_t *pMod;
 
 	BEGINfunc
 	for(pMod = pLoadedModules ; pMod != NULL ; pMod = pMod->pNext) {
-		dbgprintf("printing users of loadable module %s, refcount %u, ptr %p, type %d\n", pMod->pszName, pMod->uRefCnt, pMod, pMod->eType);
+		dbgprintf("printing users of loadable module %s, refcount %u, ptr %p, type %d\n",
+		pMod->pszName, pMod->uRefCnt, pMod, pMod->eType);
 		modUsrPrint(pMod);
 	}
 	ENDfunc
@@ -247,10 +247,16 @@ static void moduleDestruct(modInfo_t *pThis)
 	free(pThis->cnfName);
 	if(pThis->pModHdlr != NULL) {
 #	ifdef	VALGRIND
-#		warning "dlclose disabled for valgrind"
+		DBGPRINTF("moduleDestruct: compiled with valgrind, do "
+			"not unload module\n");
 #	else
-		if (pThis->eKeepType == eMOD_NOKEEP) {
-			dlclose(pThis->pModHdlr);
+		if(glblUnloadModules) {
+			if(pThis->eKeepType == eMOD_NOKEEP) {
+				dlclose(pThis->pModHdlr);
+			}
+		} else {
+			DBGPRINTF("moduleDestruct: not unloading module "
+				"due to user configuration\n");
 		}
 #	endif
 	}
@@ -266,7 +272,7 @@ static rsRetVal queryCoreFeatureSupport(int *pBool, unsigned uFeat)
 {
 	DEFiRet;
 
-	if((pBool == NULL))
+	if(pBool == NULL)
 		ABORT_FINALIZE(RS_RET_PARAM_ERROR);
 
 	*pBool = (uFeat & CORE_FEATURE_BATCHING) ? 1 : 0;
@@ -333,7 +339,7 @@ static uchar *modGetStateName(modInfo_t *pThis)
 
 /* Add a module to the loaded module linked list
  */
-static inline void
+static void
 addModToGlblList(modInfo_t *pThis)
 {
 	assert(pThis != NULL);
@@ -414,33 +420,43 @@ finalize_it:
  * module list. Needed to prevent mem leaks.
  */
 static inline void
-abortCnfUse(cfgmodules_etry_t *pNew)
+abortCnfUse(cfgmodules_etry_t **pNew)
 {
-	free(pNew);
+	if(pNew != NULL) {
+		free(*pNew);
+		*pNew = NULL;
+	}
 }
 
 
 /* Add a module to the config module list for current loadConf.
  * Requires last pointer obtained by readyModForCnf().
+ * The module pointer is handed over to this function. It is no
+ * longer available to caller one we are called.
  */
 rsRetVal
-addModToCnfList(cfgmodules_etry_t *pNew, cfgmodules_etry_t *pLast)
+addModToCnfList(cfgmodules_etry_t **pNew, cfgmodules_etry_t *pLast)
 {
 	DEFiRet;
-	assert(pNew != NULL);
+	assert(*pNew != NULL);
 
+	if(pNew == NULL)
+		ABORT_FINALIZE(RS_RET_ERR);
 	if(loadConf == NULL) {
+		abortCnfUse(pNew);
 		FINALIZE; /* we are in an early init state */
 	}
 
 	if(pLast == NULL) {
-		loadConf->modules.root = pNew;
+		loadConf->modules.root = *pNew;
 	} else {
 		/* there already exist entries */
-		pLast->next = pNew;
+		pLast->next = *pNew;
 	}
 
 finalize_it:
+	if(pNew != NULL)
+		*pNew = NULL;
 	RETiRet;
 }
 
@@ -571,7 +587,7 @@ doModInit(rsRetVal (*modInit)(int, int*, rsRetVal(**)(), rsRetVal(*)(), modInfo_
 
 	if((iRet = moduleConstruct(&pNew)) != RS_RET_OK) {
 		pNew = NULL;
-		ABORT_FINALIZE(iRet);
+		FINALIZE;
 	}
 
 	CHKiRet((*modInit)(CURR_MOD_IF_VERSION, &pNew->iIFVers, &pNew->modQueryEtryPt, queryHostEtryPt, pNew));
@@ -661,6 +677,10 @@ doModInit(rsRetVal (*modInit)(int, int*, rsRetVal(**)(), rsRetVal(*)(), modInfo_
 			if(localRet != RS_RET_OK && localRet != RS_RET_MODULE_ENTRY_POINT_NOT_FOUND)
 				ABORT_FINALIZE(localRet);
 
+			localRet = (*pNew->modQueryEtryPt)((uchar*)"doHUPWrkr", &pNew->doHUPWrkr);
+			if(localRet != RS_RET_OK && localRet != RS_RET_MODULE_ENTRY_POINT_NOT_FOUND)
+				ABORT_FINALIZE(localRet);
+
 			localRet = (*pNew->modQueryEtryPt)((uchar*)"SetShutdownImmdtPtr", &pNew->mod.om.SetShutdownImmdtPtr);
 			if(localRet != RS_RET_OK && localRet != RS_RET_MODULE_ENTRY_POINT_NOT_FOUND)
 				ABORT_FINALIZE(localRet);
@@ -668,7 +688,12 @@ doModInit(rsRetVal (*modInit)(int, int*, rsRetVal(**)(), rsRetVal(*)(), modInfo_
 			pNew->mod.om.supportsTX = 1;
 			localRet = (*pNew->modQueryEtryPt)((uchar*)"beginTransaction", &pNew->mod.om.beginTransaction);
 			if(localRet == RS_RET_MODULE_ENTRY_POINT_NOT_FOUND) {
+#ifdef _AIX
+/* AIXPORT : typecaste the return type for AIX */
+				pNew->mod.om.beginTransaction = (rsRetVal(*)(void*))dummyBeginTransaction;
+#else
 				pNew->mod.om.beginTransaction = dummyBeginTransaction;
+#endif
 				pNew->mod.om.supportsTX = 0;
 			} else if(localRet != RS_RET_OK) {
 				ABORT_FINALIZE(localRet);
@@ -719,7 +744,12 @@ doModInit(rsRetVal (*modInit)(int, int*, rsRetVal(**)(), rsRetVal(*)(), modInfo_
 			localRet = (*pNew->modQueryEtryPt)((uchar*)"endTransaction",
 				   &pNew->mod.om.endTransaction);
 			if(localRet == RS_RET_MODULE_ENTRY_POINT_NOT_FOUND) {
+#ifdef _AIX
+/* AIXPORT : typecaste the return type for AIX */
+				pNew->mod.om.endTransaction = (rsRetVal(*)(void*))dummyEndTransaction;
+#else
 				pNew->mod.om.endTransaction = dummyEndTransaction;
+#endif
 			} else if(localRet != RS_RET_OK) {
 				ABORT_FINALIZE(localRet);
 			}
@@ -876,10 +906,20 @@ static void modPrintList(void)
 								    NULL :  pMod->mod.om.newActInst);
 			dbgprintf("\ttryResume:          %p\n", pMod->tryResume);
 			dbgprintf("\tdoHUP:              %p\n", pMod->doHUP);
+#ifdef _AIX
+/* AIXPORT : typecaste the return type in AIX  */
+			dbgprintf("\tBeginTransaction:   %p\n",
+((pMod->mod.om.beginTransaction == (rsRetVal (*) (void*))dummyBeginTransaction) ?
+								   NULL :  pMod->mod.om.beginTransaction));
+			dbgprintf("\tEndTransaction:     %p\n",
+			((pMod->mod.om.endTransaction == (rsRetVal (*)(void*))dummyEndTransaction) ?
+								   NULL :  pMod->mod.om.endTransaction));
+#else
 			dbgprintf("\tBeginTransaction:   %p\n", ((pMod->mod.om.beginTransaction == dummyBeginTransaction) ?
 								   NULL :  pMod->mod.om.beginTransaction));
 			dbgprintf("\tEndTransaction:     %p\n", ((pMod->mod.om.endTransaction == dummyEndTransaction) ?
 								   NULL :  pMod->mod.om.endTransaction));
+#endif
 			break;
 		case eMOD_IN:
 			dbgprintf("Input Module Entry Points\n");
@@ -1005,7 +1045,7 @@ modUnloadAndDestructAll(eModLinkType_t modLinkTypesToUnload)
 }
 
 /* find module with given name in global list */
-static inline rsRetVal
+static rsRetVal
 findModule(uchar *pModName, int iModNameLen, modInfo_t **pMod)
 {
 	modInfo_t *pModInfo;
@@ -1049,8 +1089,8 @@ Load(uchar *pModName, sbool bConfLoad, struct nvlst *lst)
 	int bHasExtension;
         void *pModHdlr, *pModInit;
 	modInfo_t *pModInfo;
-	cfgmodules_etry_t *pNew;
-	cfgmodules_etry_t *pLast;
+	cfgmodules_etry_t *pNew = NULL;
+	cfgmodules_etry_t *pLast = NULL;
 	uchar *pModDirCurr, *pModDirNext;
 	int iLoadCnt;
 	struct dlhandle_s *pHandle = NULL;
@@ -1106,7 +1146,7 @@ Load(uchar *pModName, sbool bConfLoad, struct nvlst *lst)
 					/* regular modules need to be added to conf list (for
 					 * builtins, this happend during initial load).
 					 */
-					addModToCnfList(pNew, pLast);
+					addModToCnfList(&pNew, pLast);
 				}
 			}
 		}
@@ -1125,7 +1165,7 @@ Load(uchar *pModName, sbool bConfLoad, struct nvlst *lst)
 					free(pPathBuf);
 				/* we always alloc enough memory for everything we potentiall need to add */
 				lenPathBuf = PATHBUF_OVERHEAD;
-				CHKmalloc(pPathBuf = malloc(sizeof(uchar)*lenPathBuf));
+				CHKmalloc(pPathBuf = malloc(lenPathBuf));
 			}
 			*pPathBuf = '\0';	/* we do not need to append the path - its already in the module name */
 			iPathLen = 0;
@@ -1148,7 +1188,7 @@ Load(uchar *pModName, sbool bConfLoad, struct nvlst *lst)
 					free(pPathBuf);
 				/* we always alloc enough memory for everything we potentiall need to add */
 				lenPathBuf = iPathLen + PATHBUF_OVERHEAD;
-				CHKmalloc(pPathBuf = malloc(sizeof(uchar)*lenPathBuf));
+				CHKmalloc(pPathBuf = malloc(lenPathBuf));
 			}
 
 			memcpy((char *) pPathBuf, (char *)pModDirCurr, iPathLen);
@@ -1210,7 +1250,13 @@ Load(uchar *pModName, sbool bConfLoad, struct nvlst *lst)
 		dlclose(pModHdlr);
 		ABORT_FINALIZE(RS_RET_MODULE_LOAD_ERR_NO_INIT);
 	}
+#ifdef _AIX
+/*  AIXPORT : typecaste address of pModInit  in AIX */
+	if((iRet = doModInit((rsRetVal(*)(int,int*,rsRetVal(**)(),rsRetVal(*)(),struct modInfo_s*))pModInit,
+(uchar*) pModName, pModHdlr, &pModInfo)) != RS_RET_OK) {
+#else
 	if((iRet = doModInit(pModInit, (uchar*) pModName, pModHdlr, &pModInfo)) != RS_RET_OK) {
+#endif
 		errmsg.LogError(0, RS_RET_MODULE_LOAD_ERR_INIT_FAILED,
 				"could not load module '%s', rsyslog error %d\n", pPathBuf, iRet);
 		dlclose(pModHdlr);
@@ -1226,18 +1272,19 @@ Load(uchar *pModName, sbool bConfLoad, struct nvlst *lst)
 					errmsg.LogError(0, localRet,
 						"module '%s', failed processing config parameters",
 						pPathBuf);
-					abortCnfUse(pNew);
 					ABORT_FINALIZE(localRet);
 				}
 			}
 			pModInfo->bSetModCnfCalled = 1;
 		}
-		addModToCnfList(pNew, pLast);
+		addModToCnfList(&pNew, pLast);
 	}
 
 finalize_it:
 	if(pPathBuf != pathBuf) /* used malloc()ed memory? */
 		free(pPathBuf);
+	if(iRet != RS_RET_OK)
+		abortCnfUse(&pNew);
 	pthread_mutex_unlock(&mutObjGlobalOp);
 	RETiRet;
 }
@@ -1301,7 +1348,7 @@ SetModDir(uchar *pszModDir)
  * called by anyone interested in using a module. -- rgerhards, 20080-03-10
  */
 static rsRetVal
-Use(char *srcFile, modInfo_t *pThis)
+Use(const char *srcFile, modInfo_t *pThis)
 {
 	DEFiRet;
 
@@ -1324,7 +1371,7 @@ Use(char *srcFile, modInfo_t *pThis)
  * module is unloaded. -- rgerhards, 20080-03-10
  */
 static rsRetVal
-Release(char *srcFile, modInfo_t **ppThis)
+Release(const char *srcFile, modInfo_t **ppThis)
 {
 	DEFiRet;
 	modInfo_t *pThis;

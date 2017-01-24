@@ -16,7 +16,7 @@
  *
  * File begun on 2008-03-13 by RGerhards
  *
- * Copyright 2008-2014 Adiscon GmbH.
+ * Copyright 2008-2016 Adiscon GmbH.
  *
  * This file is part of rsyslog.
  *
@@ -54,6 +54,10 @@
 #include "debug.h"
 #include "unicode-helper.h"
 
+#ifndef RELP_DFLT_PT
+#	define RELP_DFLT_PT "514"
+#endif
+
 MODULE_TYPE_OUTPUT
 MODULE_TYPE_NOKEEP
 MODULE_CNFNAME("omrelp")
@@ -74,6 +78,7 @@ typedef struct _instanceData {
 	uchar *port;
 	int sizeWindow;		/**< the RELP window size - 0=use default */
 	unsigned timeout;
+	int connTimeout;
 	unsigned rebindInterval;
 	sbool bEnableTLS;
 	sbool bEnableTLSZip;
@@ -122,6 +127,7 @@ static struct cnfparamdescr actpdescr[] = {
 	{ "rebindinterval", eCmdHdlrInt, 0 },
 	{ "windowsize", eCmdHdlrInt, 0 },
 	{ "timeout", eCmdHdlrInt, 0 },
+	{ "conn.timeout", eCmdHdlrInt, 0 },
 	{ "localclientip", eCmdHdlrGetWord, 0 },
 	{ "template", eCmdHdlrGetWord, 0 }
 };
@@ -143,7 +149,7 @@ static uchar *getRelpPt(instanceData *pData)
 {
 	assert(pData != NULL);
 	if(pData->port == NULL)
-		return((uchar*)"514");
+		return((uchar*)RELP_DFLT_PT);
 	else
 		return(pData->port);
 }
@@ -186,6 +192,9 @@ doCreateRelpClient(wrkrInstanceData_t *pWrkrData)
 		ABORT_FINALIZE(RS_RET_RELP_ERR);
 	if(relpCltSetTimeout(pWrkrData->pRelpClt, pData->timeout) != RELP_RET_OK)
 		ABORT_FINALIZE(RS_RET_RELP_ERR);
+	if(relpCltSetConnTimeout(pWrkrData->pRelpClt, pData->connTimeout) != RELP_RET_OK) {
+		ABORT_FINALIZE(RS_RET_RELP_ERR);
+	}
 	if(relpCltSetWindowSize(pWrkrData->pRelpClt, pData->sizeWindow) != RELP_RET_OK)
 		ABORT_FINALIZE(RS_RET_RELP_ERR);
 	if(relpCltSetUsrPtr(pWrkrData->pRelpClt, pWrkrData) != RELP_RET_OK)
@@ -228,6 +237,7 @@ BEGINcreateInstance
 CODESTARTcreateInstance
 	pData->sizeWindow = 0;
 	pData->timeout = 90;
+	pData->connTimeout = 10;
 	pData->rebindInterval = 0;
 	pData->bEnableTLS = DFLT_ENABLE_TLS;
 	pData->bEnableTLSZip = DFLT_ENABLE_TLSZIP;
@@ -259,8 +269,10 @@ CODESTARTfreeInstance
 	free(pData->caCertFile);
 	free(pData->myCertFile);
 	free(pData->myPrivKeyFile);
-	for(i = 0 ; i <  pData->permittedPeers.nmemb ; ++i) {
-		free(pData->permittedPeers.name[i]);
+	if(pData->permittedPeers.name != NULL) {
+		for(i = 0 ; i <  pData->permittedPeers.nmemb ; ++i) {
+			free(pData->permittedPeers.name[i]);
+		}
 	}
 ENDfreeInstance
 
@@ -270,13 +282,14 @@ CODESTARTfreeWrkrInstance
 		relpEngineCltDestruct(pRelpEngine, &pWrkrData->pRelpClt);
 ENDfreeWrkrInstance
 
-static inline void
+static void
 setInstParamDefaults(instanceData *pData)
 {
 	pData->target = NULL;
 	pData->port = NULL;
 	pData->tplName = NULL;
 	pData->timeout = 90;
+	pData->connTimeout = 10;
 	pData->sizeWindow = 0;
 	pData->rebindInterval = 0;
 	pData->bEnableTLS = DFLT_ENABLE_TLS;
@@ -290,6 +303,7 @@ setInstParamDefaults(instanceData *pData)
 	pData->caCertFile = NULL;
 	pData->myCertFile = NULL;
 	pData->myPrivKeyFile = NULL;
+	pData->permittedPeers.name = NULL;
 	pData->permittedPeers.nmemb = 0;
 }
 
@@ -318,6 +332,8 @@ CODESTARTnewActInst
 			pData->localClientIP = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
 		} else if(!strcmp(actpblk.descr[i].name, "timeout")) {
 			pData->timeout = (unsigned) pvals[i].val.d.n;
+		} else if(!strcmp(actpblk.descr[i].name, "conn.timeout")) {
+			pData->connTimeout = (int) pvals[i].val.d.n;
 		} else if(!strcmp(actpblk.descr[i].name, "rebindinterval")) {
 			pData->rebindInterval = (unsigned) pvals[i].val.d.n;
 		} else if(!strcmp(actpblk.descr[i].name, "windowsize")) {
@@ -340,7 +356,7 @@ CODESTARTnewActInst
 			pData->permittedPeers.nmemb = pvals[i].val.d.ar->nmemb;
 			CHKmalloc(pData->permittedPeers.name =
 				malloc(sizeof(uchar*) * pData->permittedPeers.nmemb));
-			for(j = 0 ; j <  pvals[i].val.d.ar->nmemb ; ++j) {
+			for(j = 0 ; j <  pData->permittedPeers.nmemb ; ++j) {
 				pData->permittedPeers.name[j] = (uchar*)es_str2cstr(pvals[i].val.d.ar->arr[j], NULL);
 			}
 		} else {
@@ -388,7 +404,7 @@ static rsRetVal doConnect(wrkrInstanceData_t *pWrkrData)
 
 	if(pWrkrData->bInitialConnect) {
 		iRet = relpCltConnect(pWrkrData->pRelpClt, glbl.GetDefPFFamily(),
-				      pWrkrData->pData->port, pWrkrData->pData->target);
+				      getRelpPt(pWrkrData->pData), pWrkrData->pData->target);
 		if(iRet == RELP_RET_OK)
 			pWrkrData->bInitialConnect = 0;
 	} else {
@@ -398,13 +414,13 @@ static rsRetVal doConnect(wrkrInstanceData_t *pWrkrData)
 	if(iRet == RELP_RET_OK) {
 		pWrkrData->bIsConnected = 1;
 	} else if(iRet == RELP_RET_ERR_NO_TLS) {
-		errmsg.LogError(0, RS_RET_RELP_NO_TLS, "Could not connect, librelp does NOT "
+		errmsg.LogError(0, RS_RET_RELP_NO_TLS, "omrelp: Could not connect, librelp does NOT "
 				"does not support TLS (most probably GnuTLS lib "
 				"is too old)!");
 		ABORT_FINALIZE(RS_RET_RELP_NO_TLS);
 	} else if(iRet == RELP_RET_ERR_NO_TLS) {
 		errmsg.LogError(0, RS_RET_RELP_NO_TLS_AUTH,
-				"imrelp: could not activate relp TLS with "
+				"omrelp: could not activate relp TLS with "
 				"authentication, librelp does not support it "
 				"(most probably GnuTLS lib is too old)! "
 				"Note: anonymous TLS is probably supported.");
@@ -428,7 +444,7 @@ CODESTARTtryResume
 finalize_it:
 ENDtryResume
 
-static inline rsRetVal
+static rsRetVal
 doRebind(wrkrInstanceData_t *pWrkrData)
 {
 	DEFiRet;
@@ -442,7 +458,7 @@ finalize_it:
 
 BEGINbeginTransaction
 CODESTARTbeginTransaction
-dbgprintf("omrelp: beginTransaction\n");
+	DBGPRINTF("omrelp: beginTransaction\n");
 	if(!pWrkrData->bIsConnected) {
 		CHKiRet(doConnect(pWrkrData));
 	}
@@ -610,7 +626,7 @@ INITLegCnfVars
 CODEmodInit_QueryRegCFSLineHdlr
 	/* create our relp engine */
 	CHKiRet(relpEngineConstruct(&pRelpEngine));
-	CHKiRet(relpEngineSetDbgprint(pRelpEngine, dbgprintf));
+	CHKiRet(relpEngineSetDbgprint(pRelpEngine, (void (*)(char *, ...))dbgprintf));
 	CHKiRet(relpEngineSetOnAuthErr(pRelpEngine, onAuthErr));
 	CHKiRet(relpEngineSetOnGenericErr(pRelpEngine, onGenericErr));
 	CHKiRet(relpEngineSetOnErr(pRelpEngine, onErr));

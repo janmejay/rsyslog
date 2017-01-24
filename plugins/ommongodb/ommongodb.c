@@ -4,7 +4,7 @@
  * mongodb C interface is crap. Obtain the library here:
  * https://github.com/algernon/libmongo-client
  *
- * Copyright 2007-2013 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2007-2016 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of rsyslog.
  *
@@ -32,10 +32,12 @@
 #include <signal.h>
 #include <stdint.h>
 #include <time.h>
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpragmas"
+#pragma GCC diagnostic ignored "-Wunknown-attributes"
 #include <mongo.h>
+#pragma GCC diagnostic pop
 #include <json.h>
-/* For struct json_object_iter, should not be necessary in future versions */
-#include <json_object_private.h>
 
 #include "rsyslog.h"
 #include "conf.h"
@@ -178,10 +180,10 @@ reportMongoError(instanceData *pData)
  */
 static rsRetVal initMongoDB(instanceData *pData, int bSilent)
 {
-	char *server;
+	const char *server;
 	DEFiRet;
 
-	server = (pData->server == NULL) ? "127.0.0.1" : (char*) pData->server;
+	server = (pData->server == NULL) ? "127.0.0.1" : (const char*) pData->server;
 	DBGPRINTF("ommongodb: trying connect to '%s' at port %d\n", server, pData->port);
 
 	pData->conn = mongo_sync_connect(server, pData->port, TRUE);
@@ -225,7 +227,7 @@ finalize_it:
  * TODO: consider moving this to msg.c - make some dirty "friend" references...
  * rgerhards, 2012-03-19
  */
-static  inline char *
+static const char *
 getLumberjackLevel(short severity)
 {
 	switch(severity) {
@@ -244,7 +246,7 @@ getLumberjackLevel(short severity)
 
 
 /* small helper: get integer power of 10 */
-static inline int
+static int
 i10pow(int exp)
 {
 	int r = 1;
@@ -261,7 +263,7 @@ i10pow(int exp)
  * backward compatibility, which we consider pretty important).
  */
 static bson *
-getDefaultBSON(msg_t *pMsg)
+getDefaultBSON(smsg_t *pMsg)
 {
 	bson *doc = NULL;
 	uchar *procid; short unsigned procid_free; rs_size_t procid_len;
@@ -287,8 +289,8 @@ getDefaultBSON(msg_t *pMsg)
 
 	/* TODO: move to datetime? Refactor in any case! rgerhards, 2012-03-30 */
 	ts_gen = (gint64) datetime.syslogTime2time_t(&pMsg->tTIMESTAMP) * 1000; /* ms! */
-dbgprintf("ommongodb: ts_gen is %lld\n", (long long) ts_gen);
-dbgprintf("ommongodb: secfrac is %d, precision %d\n",  pMsg->tTIMESTAMP.secfrac, pMsg->tTIMESTAMP.secfracPrecision);
+	DBGPRINTF("ommongodb: ts_gen is %lld\n", (long long) ts_gen);
+	DBGPRINTF("ommongodb: secfrac is %d, precision %d\n",  pMsg->tTIMESTAMP.secfrac, pMsg->tTIMESTAMP.secfracPrecision);
 	if(pMsg->tTIMESTAMP.secfracPrecision > 3) {
 		secfrac = pMsg->tTIMESTAMP.secfrac / i10pow(pMsg->tTIMESTAMP.secfracPrecision - 3);
 	} else if(pMsg->tTIMESTAMP.secfracPrecision < 3) {
@@ -337,6 +339,7 @@ dbgprintf("ommongodb: secfrac is %d, precision %d\n",  pMsg->tTIMESTAMP.secfrac,
 
 static bson *BSONFromJSONArray(struct json_object *json);
 static bson *BSONFromJSONObject(struct json_object *json);
+static gboolean BSONAppendExtendedJSON(bson *doc, const gchar *name, struct json_object *json);
 
 /* Append a BSON variant of json to doc using name.  Return TRUE on success */
 static gboolean
@@ -354,17 +357,17 @@ BSONAppendJSONObject(bson *doc, const gchar *name, struct json_object *json)
 	case json_type_int: {
 		int64_t i;
 
-#ifdef HAVE_JSON_OBJECT_NEW_INT64
 		i = json_object_get_int64(json);
-#else /* HAVE_JSON_OBJECT_NEW_INT64 */
-		i = json_object_get_int(json);
-#endif /* HAVE_JSON_OBJECT_NEW_INT64 */
 		if (i >= INT32_MIN && i <= INT32_MAX)
 			return bson_append_int32(doc, name, i);
 		else
 			return bson_append_int64(doc, name, i);
 	}
 	case json_type_object: {
+
+		if (BSONAppendExtendedJSON(doc, name, json) == TRUE)
+		    return TRUE;
+
 		bson *sub;
 		gboolean ok;
 
@@ -393,6 +396,37 @@ BSONAppendJSONObject(bson *doc, const gchar *name, struct json_object *json)
 	default:
 		return FALSE;
 	}
+}
+
+/* Note: this function assumes that at max a single sub-object exists. This
+ * may need to be extended to cover cases where multiple objects are contained.
+ * However, I am not sure about the original intent of this contribution and
+ * just came across it when refactoring the json calls. As everything seems
+ * to work since quite a while, I do not make any changes now.
+ * rgerhards, 2016-04-09
+ */
+static gboolean
+BSONAppendExtendedJSON(bson *doc, const gchar *name, struct json_object *json)
+{
+	struct json_object_iterator itEnd = json_object_iter_end(json);
+	struct json_object_iterator it = json_object_iter_begin(json);
+
+	if (!json_object_iter_equal(&it, &itEnd)) {
+		const char *const key = json_object_iter_peek_name(&it);
+		if (strcmp(key, "$date") == 0) {
+			struct tm tm;
+			gint64 ts;
+			struct json_object *val;
+
+			val = json_object_iter_peek_value(&it);
+			DBGPRINTF("ommongodb: extended json date detected %s", json_object_get_string(val));
+			tm.tm_isdst = -1;
+			strptime(json_object_get_string(val), "%Y-%m-%dT%H:%M:%S%z", &tm);
+			ts = 1000 * (gint64) mktime(&tm);
+			return bson_append_utc_datetime(doc, name, ts);
+		}
+	}
+	return FALSE;
 }
 
 /* Return a BSON variant of json, which must be a json_type_array */
@@ -435,15 +469,18 @@ static bson *
 BSONFromJSONObject(struct json_object *json)
 {
 	bson *doc = NULL;
-	struct json_object_iter it;
 
 	doc = bson_new();
 	if(doc == NULL)
 		goto error;
 
-	json_object_object_foreachC(json, it) {
-		if (BSONAppendJSONObject(doc, it.key, it.val) == FALSE)
+	struct json_object_iterator it = json_object_iter_begin(json);
+	struct json_object_iterator itEnd = json_object_iter_end(json);
+	while (!json_object_iter_equal(&it, &itEnd)) {
+		if (BSONAppendJSONObject(doc, json_object_iter_peek_name(&it),
+			json_object_iter_peek_value(&it)) == FALSE)
 			goto error;
+		json_object_iter_next(&it);
 	}
 
 	if(bson_finish(doc) == FALSE)
@@ -464,7 +501,7 @@ CODESTARTtryResume
 	}
 ENDtryResume
 
-BEGINdoAction
+BEGINdoAction_NoStrings
 	bson *doc = NULL;
 	instanceData *pData;
 CODESTARTdoAction
@@ -476,9 +513,9 @@ CODESTARTdoAction
 	}
 
 	if(pData->tplName == NULL) {
-		doc = getDefaultBSON((msg_t*)ppString[0]);
+		doc = getDefaultBSON(*(smsg_t**)pMsgData);
 	} else {
-		doc = BSONFromJSONObject((struct json_object *)ppString[0]);
+		doc = BSONFromJSONObject(*(struct json_object **)pMsgData);
 	}
 	if(doc == NULL) {
 		dbgprintf("ommongodb: error creating BSON doc\n");
@@ -490,6 +527,8 @@ CODESTARTdoAction
 	} else {
 		dbgprintf("ommongodb: insert error\n");
 		reportMongoError(pData);
+		/* close on insert error to permit resume */
+		closeMongoDB(pData);
 		ABORT_FINALIZE(RS_RET_SUSPENDED);
 	}
 
@@ -500,7 +539,7 @@ finalize_it:
 ENDdoAction
 
 
-static inline void
+static void
 setInstParamDefaults(instanceData *pData)
 {
 	pData->server = NULL;
@@ -557,9 +596,9 @@ CODESTARTnewActInst
 	}
 
 	if(pData->db == NULL)
-		pData->db = (uchar*)strdup("syslog");
+		CHKmalloc(pData->db = (uchar*)strdup("syslog"));
 	if(pData->collection == NULL)
-		pData->collection = (uchar*)strdup("log");
+		 CHKmalloc(pData->collection = (uchar*)strdup("log"));
 
 	/* we now create a db+collection string as we need to pass this
 	 * into the API and we do not want to generate it each time ;)

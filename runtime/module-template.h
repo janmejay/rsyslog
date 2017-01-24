@@ -4,7 +4,7 @@
  *
  * File begun on 2007-07-25 by RGerhards
  *
- * Copyright 2007-2012 Adiscon GmbH.
+ * Copyright 2007-2015 Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
@@ -33,7 +33,8 @@
 /* macro to define standard output-module static data members
  */
 #define DEF_MOD_STATIC_DATA \
-	static __attribute__((unused)) rsRetVal (*omsdRegCFSLineHdlr)(uchar *pCmdName, int bChainingPermitted, ecslCmdHdrlType eType, rsRetVal (*pHdlr)(), void *pData, void *pOwnerCookie);
+	static __attribute__((unused)) rsRetVal (*omsdRegCFSLineHdlr)(uchar *pCmdName, int bChainingPermitted, \
+	ecslCmdHdrlType eType, rsRetVal (*pHdlr)(), void *pData, void *pOwnerCookie);
 
 #define DEF_OMOD_STATIC_DATA \
 	DEF_MOD_STATIC_DATA \
@@ -248,7 +249,8 @@ static rsRetVal beginTransaction(wrkrInstanceData_t __attribute__((unused)) *pWr
  * introduced in v8.1.3 -- rgerhards, 2013-12-04
  */
 #define BEGINcommitTransaction \
-static rsRetVal commitTransaction(wrkrInstanceData_t __attribute__((unused)) *const pWrkrData, actWrkrIParams_t *const pParams, const unsigned nParams)\
+static rsRetVal commitTransaction(wrkrInstanceData_t __attribute__((unused)) *const pWrkrData, \
+	actWrkrIParams_t *const pParams, const unsigned nParams)\
 {\
 	DEFiRet;
 
@@ -276,8 +278,9 @@ static rsRetVal endTransaction(wrkrInstanceData_t __attribute__((unused)) *pWrkr
 /* doAction()
  */
 #define BEGINdoAction \
-static rsRetVal doAction(uchar __attribute__((unused)) **ppString, wrkrInstanceData_t __attribute__((unused)) *pWrkrData)\
+static rsRetVal doAction(void * pMsgData, wrkrInstanceData_t __attribute__((unused)) *pWrkrData)\
 {\
+	uchar **ppString = (uchar **) pMsgData; \
 	DEFiRet;
 
 #define CODESTARTdoAction \
@@ -286,6 +289,14 @@ static rsRetVal doAction(uchar __attribute__((unused)) **ppString, wrkrInstanceD
 #define ENDdoAction \
 	RETiRet;\
 }
+
+/* below is a variant of doAction where the passed-in data is not the common
+ * case of string.
+ */
+#define BEGINdoAction_NoStrings \
+static rsRetVal doAction(void * pMsgData, wrkrInstanceData_t __attribute__((unused)) *pWrkrData)\
+{\
+	DEFiRet;
 
 
 /* dbgPrintInstInfo()
@@ -376,7 +387,8 @@ finalize_it:\
  */
 #define BEGINnewActInst \
 static rsRetVal newActInst(uchar __attribute__((unused)) *modName, \
-	struct nvlst *lst, void **ppModData, omodStringRequest_t **ppOMSR)\
+	struct nvlst __attribute__((unused)) *lst, void **ppModData, \
+	omodStringRequest_t **ppOMSR)\
 {\
 	DEFiRet;\
 	instanceData *pData = NULL; \
@@ -761,7 +773,12 @@ static rsRetVal queryEtryPt(uchar *name, rsRetVal (**pEtryPoint)())\
  * cached, left-in-memory copy of a previous incarnation.
  */
 #define BEGINmodInit(uniqName) \
-rsRetVal modInit##uniqName(int iIFVersRequested __attribute__((unused)), int *ipIFVersProvided, rsRetVal (**pQueryEtryPt)(), rsRetVal (*pHostQueryEtryPt)(uchar*, rsRetVal (**)()), modInfo_t __attribute__((unused)) *pModInfo)\
+rsRetVal __attribute__((unused)) modInit##uniqName(int iIFVersRequested __attribute__((unused)), \
+int *ipIFVersProvided, rsRetVal (**pQueryEtryPt)(), rsRetVal (*pHostQueryEtryPt)(uchar*, rsRetVal (**)()), \
+modInfo_t __attribute__((unused)) *pModInfo);\
+rsRetVal __attribute__((unused)) modInit##uniqName(int iIFVersRequested __attribute__((unused)), \
+int *ipIFVersProvided, rsRetVal (**pQueryEtryPt)(), rsRetVal (*pHostQueryEtryPt)(uchar*, rsRetVal (**)()), \
+modInfo_t __attribute__((unused)) *pModInfo)\
 {\
 	DEFiRet; \
 	rsRetVal (*pObjGetObjInterface)(obj_if_t *pIf);
@@ -1050,7 +1067,7 @@ static rsRetVal afterRun(void)\
  * This function is optional. Currently, it is available to output plugins
  * only, but may be made available to other types of plugins in the future.
  * A plugin does not need to define this entry point. If if does, it gets
- * called when a non-restart type of HUP is done. A plugin should register
+ * called when a HUP at the action level is to be done. A plugin should register
  * this function so that it can close files, connection or other ressources
  * on HUP - if it can be assume the user wanted to do this as a part of HUP
  * processing. Note that the name "HUP" has historical reasons, it stems back
@@ -1070,6 +1087,26 @@ static rsRetVal doHUP(instanceData __attribute__((unused)) *pData)\
 #define CODESTARTdoHUP 
 
 #define ENDdoHUP \
+	RETiRet;\
+}
+
+
+/* doHUPWrkr()
+ * This is like doHUP(), but on an action worker level.
+ * rgerhards, 2015-03-25
+ */
+#define CODEqueryEtryPt_doHUPWrkr \
+	else if(!strcmp((char*) name, "doHUPWrkr")) {\
+		*pEtryPoint = doHUPWrkr;\
+	}
+#define BEGINdoHUPWrkr \
+static rsRetVal doHUPWrkr(wrkrInstanceData_t __attribute__((unused)) *pWrkrData)\
+{\
+	DEFiRet;
+
+#define CODESTARTdoHUPWrkr 
+
+#define ENDdoHUPWrkr \
 	RETiRet;\
 }
 
@@ -1099,7 +1136,7 @@ static rsRetVal SetShutdownImmdtPtr(instanceData __attribute__((unused)) *pData,
 /* parse() - main entry point of parser modules (v1 config interface)
  */
 #define BEGINparse \
-static rsRetVal parse(msg_t *pMsg)\
+static rsRetVal parse(smsg_t *pMsg)\
 {\
 	DEFiRet;
 
@@ -1114,7 +1151,7 @@ static rsRetVal parse(msg_t *pMsg)\
 /* parse2() - main entry point of parser modules (v2+ config interface)
  */
 #define BEGINparse2 \
-static rsRetVal parse2(instanceConf_t *const pInst, msg_t *pMsg)\
+static rsRetVal parse2(instanceConf_t *const pInst, smsg_t *pMsg)\
 {\
 	DEFiRet;
 
@@ -1136,7 +1173,7 @@ static rsRetVal parse2(instanceConf_t *const pInst, msg_t *pMsg)\
  *         of the generated string on exit (this is cached)
  */
 #define BEGINstrgen \
-static rsRetVal strgen(msg_t *const pMsg, actWrkrIParams_t *const iparam) \
+static rsRetVal strgen(smsg_t *const pMsg, actWrkrIParams_t *const iparam) \
 {\
 	DEFiRet;
 
@@ -1169,7 +1206,6 @@ static rsRetVal GetStrgenName(uchar **ppSz)\
 	*ppSz = UCHAR_CONSTANT(x);\
 	return RS_RET_OK;\
 }
-
 
 #endif /* #ifndef MODULE_TEMPLATE_H_INCLUDED */
 

@@ -25,7 +25,13 @@
  */
 #ifndef INCLUDED_TYPEDEFS_H
 #define INCLUDED_TYPEDEFS_H
-#include <stdint.h>
+
+#ifndef _AIX
+ #include <stdint.h>
+#endif
+#ifdef _AIX
+#include "config.h"
+#endif
 #if defined(__FreeBSD__) || !defined(HAVE_LSEEK64)
 #include <sys/types.h>
 #endif
@@ -61,15 +67,18 @@ typedef struct nsdsel_gtls_s nsdsel_gtls_t;
 typedef struct nsdpoll_ptcp_s nsdpoll_ptcp_t;
 typedef struct wti_s wti_t;
 typedef struct msgPropDescr_s msgPropDescr_t;
-typedef struct msg msg_t;
+typedef struct msg smsg_t;
 typedef struct queue_s qqueue_t;
 typedef struct prop_s prop_t;
 typedef struct interface_s interface_t;
 typedef struct objInfo_s objInfo_t;
 typedef enum rsRetVal_ rsRetVal; /**< friendly type for global return value */
-typedef rsRetVal (*errLogFunc_t)(uchar*); /* this is a trick to store a function ptr to a function returning a function ptr... */
-typedef struct permittedPeers_s permittedPeers_t; /* this should go away in the long term -- rgerhards, 2008-05-19 */
-typedef struct permittedPeerWildcard_s permittedPeerWildcard_t; /* this should go away in the long term -- rgerhards, 2008-05-19 */
+typedef rsRetVal (*errLogFunc_t)(uchar*);
+/* this is a trick to store a function ptr to a function returning a function ptr... */
+typedef struct permittedPeers_s permittedPeers_t;
+/* this should go away in the long term -- rgerhards, 2008-05-19 */
+typedef struct permittedPeerWildcard_s permittedPeerWildcard_t;
+/* this should go away in the long term -- rgerhards, 2008-05-19 */
 typedef struct tcpsrv_s tcpsrv_t;
 typedef struct tcps_sess_s tcps_sess_t;
 typedef struct strmsrv_s strmsrv_t;
@@ -84,6 +93,7 @@ typedef struct parserList_s parserList_t;
 typedef struct strgen_s strgen_t;
 typedef struct strgenList_s strgenList_t;
 typedef struct statsobj_s statsobj_t;
+typedef void (*statsobj_read_notifier_t)(statsobj_t *, void *);
 typedef struct nsd_epworkset_s nsd_epworkset_t;
 typedef struct templates_s templates_t;
 typedef struct queuecnf_s queuecnf_t;
@@ -98,9 +108,16 @@ typedef struct outchannels_s outchannels_t;
 typedef struct modConfData_s modConfData_t;
 typedef struct instanceConf_s instanceConf_t;
 typedef struct ratelimit_s ratelimit_t;
-typedef struct lookup_string_tab_etry_s lookup_string_tab_etry_t;
+typedef struct lookup_string_tab_entry_s lookup_string_tab_entry_t;
+typedef struct lookup_string_tab_s lookup_string_tab_t;
+typedef struct lookup_array_tab_s lookup_array_tab_t;
+typedef struct lookup_sparseArray_tab_s lookup_sparseArray_tab_t;
+typedef struct lookup_sparseArray_tab_entry_s lookup_sparseArray_tab_entry_t;
 typedef struct lookup_tables_s lookup_tables_t;
+typedef union lookup_key_u lookup_key_t;
+
 typedef struct lookup_s lookup_t;
+typedef struct lookup_ref_s lookup_ref_t;
 typedef struct action_s action_t;
 typedef int rs_size_t; /* we do never need more than 2Gig strings, signed permits to
 			* use -1 as a special flag. */
@@ -110,6 +127,9 @@ typedef uint64 qDeqID;	/* queue Dequeue order ID. 32 bits is considered dangerou
 typedef struct tcpLstnPortList_s tcpLstnPortList_t; // TODO: rename?
 typedef struct strmLstnPortList_s strmLstnPortList_t; // TODO: rename?
 typedef struct actWrkrIParams actWrkrIParams_t;
+typedef struct dynstats_bucket_s dynstats_bucket_t;
+typedef struct dynstats_buckets_s dynstats_buckets_t;
+typedef struct dynstats_ctr_s dynstats_ctr_t;
 
 /* under Solaris (actually only SPARC), we need to redefine some types
  * to be void, so that we get void* pointers. Otherwise, we will see
@@ -194,6 +214,7 @@ typedef uintTiny	propid_t;
 #define PROP_MSGID			22
 #define PROP_PARSESUCCESS		23
 #define PROP_JSONMESG			24
+#define PROP_RAWMSG_AFTER_PRI		25
 #define PROP_SYS_NOW			150
 #define PROP_SYS_YEAR			151
 #define PROP_SYS_MONTH			152
@@ -206,10 +227,19 @@ typedef uintTiny	propid_t;
 #define PROP_SYS_BOM			159
 #define PROP_SYS_UPTIME			160
 #define PROP_UUID			161
+#define PROP_SYS_NOW_UTC		162
+#define PROP_SYS_YEAR_UTC		163
+#define PROP_SYS_MONTH_UTC		164
+#define PROP_SYS_DAY_UTC		165
+#define PROP_SYS_HOUR_UTC		166
+#define PROP_SYS_HHOUR_UTC		167
+#define PROP_SYS_QHOUR_UTC		168
+#define PROP_SYS_MINUTE_UTC		169
 #define PROP_CEE			200
 #define PROP_CEE_ALL_JSON		201
 #define PROP_LOCAL_VAR			202
 #define PROP_GLOBAL_VAR			203
+#define PROP_CEE_ALL_JSON_PLAIN		204
 
 /* types of configuration handlers
  */
@@ -258,7 +288,7 @@ typedef struct multi_submit_s multi_submit_t;
 struct multi_submit_s {
 	short	maxElem;	/* maximum number of Elements */
 	short	nElem;		/* current number of Elements, points to the next one FREE */
-	msg_t	**ppMsgs;
+	smsg_t	**ppMsgs;
 };
 
 /* the following structure is a helper to describe a message property */

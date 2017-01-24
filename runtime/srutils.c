@@ -7,7 +7,7 @@
  * \date    2003-09-09
  *          Coding begun.
  *
- * Copyright 2003-2008 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2003-2016 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
@@ -41,6 +41,7 @@
 #include <assert.h>
 #include <sys/wait.h>
 #include <ctype.h>
+#include <inttypes.h>
 #include "srUtils.h"
 #include "obj.h"
 
@@ -199,7 +200,6 @@ int makeFileParentDirs(const uchar *const szFile, size_t lenFile, mode_t mode,
         uchar *p;
         uchar *pszWork;
         size_t len;
-	int err;
 	int iTry = 0;
 	int bErr = 0;
 
@@ -207,16 +207,17 @@ int makeFileParentDirs(const uchar *const szFile, size_t lenFile, mode_t mode,
 	assert(lenFile > 0);
 
         len = lenFile + 1; /* add one for '\0'-byte */
-	if((pszWork = MALLOC(sizeof(uchar) * len)) == NULL)
+	if((pszWork = MALLOC(len)) == NULL)
 		return -1;
         memcpy(pszWork, szFile, len);
         for(p = pszWork+1 ; *p ; p++)
                 if(*p == '/') {
 			/* temporarily terminate string, create dir and go on */
                         *p = '\0';
+			iTry = 0;
 again:
                         if(access((char*)pszWork, F_OK)) {
-                                if((err = mkdir((char*)pszWork, mode)) == 0) {
+                                if(mkdir((char*)pszWork, mode) == 0) {
 					if(uid != (uid_t) -1 || gid != (gid_t) -1) {
 						/* we need to set owner/group */
 						if(chown((char*)pszWork, uid, gid) != 0)
@@ -227,7 +228,7 @@ again:
 							 */
 					}
 				} else {
-					if(err == EEXIST && iTry == 0) {
+					if(errno == EEXIST && iTry == 0) {
 						iTry = 1;
 						goto again;
 						}
@@ -333,8 +334,12 @@ void skipWhiteSpace(uchar **pp)
  * to use as few space as possible.
  * rgerhards, 2008-01-03
  */
+#if !defined(_AIX)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+#endif
 rsRetVal genFileName(uchar **ppName, uchar *pDirName, size_t lenDirName, uchar *pFName,
-		     size_t lenFName, long lNum, int lNumDigits)
+		     size_t lenFName, int64_t lNum, int lNumDigits)
 {
 	DEFiRet;
 	uchar *pName;
@@ -349,14 +354,14 @@ rsRetVal genFileName(uchar **ppName, uchar *pDirName, size_t lenDirName, uchar *
 		lenBuf = 0;
 	} else {
 		if(lNumDigits > 0) {
-			snprintf(szFmtBuf, sizeof(szFmtBuf), ".%%0%dld", lNumDigits);
+			snprintf(szFmtBuf, sizeof(szFmtBuf), ".%%0%d" PRId64, lNumDigits);
 			lenBuf = snprintf((char*)szBuf, sizeof(szBuf), szFmtBuf, lNum);
 		} else
-			lenBuf = snprintf((char*)szBuf, sizeof(szBuf), ".%ld", lNum);
+			lenBuf = snprintf((char*)szBuf, sizeof(szBuf), ".%" PRId64, lNum);
 	}
 
 	lenName = lenDirName + 1 + lenFName + lenBuf + 1; /* last +1 for \0 char! */
-	if((pName = MALLOC(sizeof(uchar) * lenName)) == NULL)
+	if((pName = MALLOC(lenName)) == NULL)
 		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
 	
 	/* got memory, now construct string */
@@ -376,6 +381,9 @@ rsRetVal genFileName(uchar **ppName, uchar *pDirName, size_t lenDirName, uchar *
 finalize_it:
 	RETiRet;
 }
+#if !defined(_AIX)
+#pragma GCC diagnostic pop
+#endif
 
 /* get the number of digits required to represent a given number. We use an
  * iterative approach as we do not like to draw in the floating point
@@ -426,6 +434,26 @@ timeoutComp(struct timespec *pt, long iTimeout)
 	}
 	ENDfunc
 	return RS_RET_OK; /* so far, this is static... */
+}
+
+long long
+currentTimeMills(void)
+{
+#	if _POSIX_TIMERS > 0
+	struct timespec tm;
+#   else
+	struct timeval tv;
+#	endif
+
+#	if _POSIX_TIMERS > 0
+	clock_gettime(CLOCK_REALTIME, &tm);
+#	else
+	gettimeofday(&tv, NULL);
+	tm.tv_sec = tv.tv_sec;
+	tm.tv_nsec = tv.tv_usec * 1000;
+#	endif
+
+	return ((long long) tm.tv_sec) * 1000 + (tm.tv_nsec / 1000000);
 }
 
 
@@ -645,16 +673,29 @@ containsGlobWildcard(char *str)
 		return 0;
 	}
 	/* From Linux Programmer's Guide:
-	 * "A string is a wildcard pattern if it contains one of the characters '?', '*' or '['"
-	 * "One can remove the special meaning of '?', '*' and '[' by preceding them by a backslash"
+	 * "A string is a wildcard pattern if it contains one of the characters '?', '*', '{' or '['"
+	 * "One can remove the special meaning of '?', '*', '{' and '[' by preceding them by a backslash"
 	 */
 	for(p = str; *p != '\0'; p++) {
-		if((*p == '?' || *p == '*' || *p == '[') &&
+		if((*p == '?' || *p == '*' || *p == '[' || *p == '{') &&
 				(p == str || *(p-1) != '\\')) {
 			return 1;
 		}
 	}
 	return 0;
+}
+
+void seedRandomNumber(void)
+{
+	struct timespec t;
+	timeoutComp(&t, 0);
+	long long x = t.tv_sec * 3 + t.tv_nsec * 2;
+	srandom((unsigned int) x);
+}
+
+long int randomNumber(void)
+{
+	return random();
 }
 
 /* vim:set ai:

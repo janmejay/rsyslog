@@ -356,7 +356,7 @@ actGSSListener(uchar *port)
 		CHKiRet(tcpsrv.SetInputName(pOurTcpsrv, UCHAR_CONSTANT("imgssapi")));
                 CHKiRet(tcpsrv.SetKeepAlive(pOurTcpsrv, bKeepAlive));
 		CHKiRet(tcpsrv.SetOrigin(pOurTcpsrv, UCHAR_CONSTANT("imgssapi")));
-		tcpsrv.configureTCPListen(pOurTcpsrv, port, 1);
+		tcpsrv.configureTCPListen(pOurTcpsrv, port, 1, NULL);
 		CHKiRet(tcpsrv.ConstructFinalize(pOurTcpsrv));
 	}
 
@@ -435,7 +435,7 @@ OnSessAcceptGSS(tcpsrv_t *pThis, tcps_sess_t *pSess)
 		 */
 		char *buf;
 		int ret = 0;
-		CHKmalloc(buf = (char*) MALLOC(sizeof(char) * (glbl.GetMaxLine() + 1)));
+		CHKmalloc(buf = (char*) MALLOC(glbl.GetMaxLine() + 1));
 
                 prop.GetString(pSess->fromHostIP, &pszPeer, &lenPeer);
                 
@@ -475,7 +475,8 @@ OnSessAcceptGSS(tcpsrv_t *pThis, tcps_sess_t *pSess)
 				if (ret == 0) {
 					dbgprintf("GSS-API Connection closed by peer %s\n", (char *)pszPeer);
                                 } else {
-					errmsg.LogError(0, RS_RET_ERR, "TCP(GSS) session %p from %s will be closed, error ignored\n", pSess, (char *)pszPeer);
+					errmsg.LogError(0, RS_RET_ERR, "TCP(GSS) session %p from %s will be closed, "
+					"error ignored\n", pSess, (char *)pszPeer);
                                 }
 				ABORT_FINALIZE(RS_RET_ERR); // TODO: define good error codes
 			}
@@ -496,7 +497,8 @@ OnSessAcceptGSS(tcpsrv_t *pThis, tcps_sess_t *pSess)
 					if (ret == 0) {
 						dbgprintf("GSS-API Connection closed by peer %s\n", (char *)pszPeer);
                                         } else {
-						errmsg.LogError(0, NO_ERRCODE, "TCP session %p from %s will be closed, error ignored\n", pSess, (char *)pszPeer);
+						errmsg.LogError(0, NO_ERRCODE, "TCP session %p from %s will be "
+						"closed, error ignored\n", pSess, (char *)pszPeer);
                                         }
 					ABORT_FINALIZE(RS_RET_ERR); // TODO: define good error codes
 				}

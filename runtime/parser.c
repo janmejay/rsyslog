@@ -4,7 +4,7 @@
  *
  * Module begun 2008-10-09 by Rainer Gerhards (based on previous code from syslogd.c)
  *
- * Copyright 2008-2014 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2008-2016 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
@@ -226,18 +226,6 @@ SetModPtr(parser_t *pThis, modInfo_t *pMod)
 }
 
 
-/* Specify if we should do standard message sanitazion before we pass the data
- * down to the parser.
- */
-static rsRetVal
-SetDoSanitazion(parser_t *pThis, int bDoIt)
-{
-	ISOBJ_TYPE_assert(pThis, parser);
-	pThis->bDoSanitazion = bDoIt;
-	return RS_RET_OK;
-}
-
-
 /* Specify if we should do standard PRI parsing before we pass the data
  * down to the parser module.
  */
@@ -259,7 +247,7 @@ ENDobjConstruct(parser)
  * to our global list of available parsers.
  * rgerhards, 2009-11-03
  */
-rsRetVal parserConstructFinalize(parser_t *pThis)
+static rsRetVal parserConstructFinalize(parser_t *pThis)
 {
 	DEFiRet;
 
@@ -280,7 +268,7 @@ rsRetVal
 parserConstructViaModAndName(modInfo_t *__restrict__ pMod, uchar *const __restrict__ pName, void *pInst)
 {
 	rsRetVal localRet;
-	parser_t *pParser;
+	parser_t *pParser = NULL;
 	DEFiRet;
 
 	if(pInst == NULL && pMod->mod.pm.newParserInst != NULL) {
@@ -291,7 +279,7 @@ parserConstructViaModAndName(modInfo_t *__restrict__ pMod, uchar *const __restri
 	/* check some features */
 	localRet = pMod->isCompatibleWithFeature(sFEATUREAutomaticSanitazion);
 	if(localRet == RS_RET_OK){
-		CHKiRet(SetDoSanitazion(pParser, RSTRUE));
+		pParser->bDoSanitazion = RSTRUE;
 	}
 	localRet = pMod->isCompatibleWithFeature(sFEATUREAutomaticPRIParsing);
 	if(localRet == RS_RET_OK){
@@ -303,6 +291,8 @@ parserConstructViaModAndName(modInfo_t *__restrict__ pMod, uchar *const __restri
 	pParser->pInst = pInst;
 	CHKiRet(parserConstructFinalize(pParser));
 finalize_it:
+	if(iRet != RS_RET_OK)
+		free(pParser);
 	RETiRet;
 }
 BEGINobjDestruct(parser) /* be sure to specify the object type also in END and CODESTART macros! */
@@ -319,7 +309,7 @@ ENDobjDestruct(parser)
  * pMsg->pszRawMsg buffer is updated.
  * rgerhards, 2008-10-09
  */
-static inline rsRetVal uncompressMessage(msg_t *pMsg)
+static rsRetVal uncompressMessage(smsg_t *pMsg)
 {
 	DEFiRet;
 	uchar *deflateBuf = NULL;
@@ -344,7 +334,7 @@ static inline rsRetVal uncompressMessage(msg_t *pMsg)
 		 */
 		int ret;
 		iLenDefBuf = glbl.GetMaxLine();
-		CHKmalloc(deflateBuf = MALLOC(sizeof(uchar) * (iLenDefBuf + 1)));
+		CHKmalloc(deflateBuf = MALLOC(iLenDefBuf + 1));
 		ret = uncompress((uchar *) deflateBuf, &iLenDefBuf, (uchar *) pszMsg+1, lenMsg-1);
 		DBGPRINTF("Compressed message uncompressed with status %d, length: new %ld, old %d.\n",
 		        ret, (long) iLenDefBuf, (int) (lenMsg-1));
@@ -386,8 +376,8 @@ finalize_it:
  * NULs in the debug log.
  * rgerhards, 2007-09-14
  */
-static inline rsRetVal
-SanitizeMsg(msg_t *pMsg)
+static rsRetVal
+SanitizeMsg(smsg_t *pMsg)
 {
 	DEFiRet;
 	uchar *pszMsg;
@@ -422,7 +412,8 @@ SanitizeMsg(msg_t *pMsg)
 	 * compatible to recent IETF developments, we allow the user to
 	 * turn on/off this handling.  rgerhards, 2007-07-23
 	 */
-	if(glbl.GetParserDropTrailingLFOnReception() && pszMsg[lenMsg-1] == '\n') {
+	if(glbl.GetParserDropTrailingLFOnReception()
+	   && lenMsg > 0 && pszMsg[lenMsg-1] == '\n') {
 		DBGPRINTF("dropped LF at very end of message (DropTrailingLF is set)\n");
 		lenMsg--;
 		pszMsg[lenMsg] = '\0';
@@ -473,7 +464,7 @@ SanitizeMsg(msg_t *pMsg)
 	if(maxDest < sizeof(szSanBuf))
 		pDst = szSanBuf;
 	else 
-		CHKmalloc(pDst = MALLOC(sizeof(uchar) * (iMaxLine + 1)));
+		CHKmalloc(pDst = MALLOC(iMaxLine + 1));
 	if(iSrc > 0) {
 		iSrc--; /* go back to where everything is OK */
 		memcpy(pDst, pszMsg, iSrc); /* fast copy known good */
@@ -576,8 +567,8 @@ finalize_it:
  * this module as it is expected that allmost all parsers will need
  * that functionality and so they do not need to implement it themsleves.
  */
-static inline rsRetVal
-ParsePRI(msg_t *pMsg)
+static rsRetVal
+ParsePRI(smsg_t *pMsg)
 {
 	syslog_pri_t pri;
 	uchar *msg;
@@ -618,7 +609,7 @@ ParsePRI(msg_t *pMsg)
  * rgerhards, 2008-10-09
  */
 static rsRetVal
-ParseMsg(msg_t *pMsg)
+ParseMsg(smsg_t *pMsg)
 {
 	rsRetVal localRet = RS_RET_ERR;
 	parserList_t *pParserList;
@@ -713,7 +704,6 @@ CODESTARTobjQueryInterface(parser)
 	pIf->Destruct = parserDestruct;
 	pIf->SetName = SetName;
 	pIf->SetModPtr = SetModPtr;
-	pIf->SetDoSanitazion = SetDoSanitazion;
 	pIf->SetDoPRIParsing = SetDoPRIParsing;
 	pIf->ParseMsg = ParseMsg;
 	pIf->SanitizeMsg = SanitizeMsg;

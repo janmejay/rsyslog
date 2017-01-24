@@ -6,7 +6,7 @@
  *
  * File begun on 2010-01-01 by RGerhards
  *
- * Copyright 2010-2013 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2010-2015 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of rsyslog.
  *
@@ -110,6 +110,13 @@ struct modConfData_s {
 static modConfData_t *loadModConf = NULL;/* modConf ptr to use for the current load process */
 static modConfData_t *runModConf = NULL;/* modConf ptr to use for the current exec process */
 
+/* callback for liblognorm error messages */
+static void
+errCallBack(void __attribute__((unused)) *cookie, const char *msg,
+	    size_t __attribute__((unused)) lenMsg)
+{
+	errmsg.LogError(0, RS_RET_ERR_LIBLOGNORM, "liblognorm error: %s", msg);
+}
 
 /* to be called to build the liblognorm part of the instance ONCE ALL PARAMETERS ARE CORRECT
  * (and set within pData!).
@@ -124,6 +131,7 @@ buildInstance(instanceData *pData)
 		ABORT_FINALIZE(RS_RET_ERR_LIBLOGNORM_INIT);
 	}
 	ln_setCtxOpts(pData->ctxln, loadModConf->allow_regex);
+	ln_setErrMsgCB(pData->ctxln, errCallBack, NULL);
 	if(ln_loadSamples(pData->ctxln, (char*) pData->rulebase) != 0) {
 		errmsg.LogError(0, RS_RET_NO_RULEBASE, "error: normalization rulebase '%s' "
 				"could not be loaded cannot activate action", pData->rulebase);
@@ -214,15 +222,15 @@ BEGINtryResume
 CODESTARTtryResume
 ENDtryResume
 
-BEGINdoAction
-	msg_t *pMsg;
+BEGINdoAction_NoStrings
+	smsg_t **ppMsg = (smsg_t **) pMsgData;
+	smsg_t *pMsg = ppMsg[0];
 	uchar *buf;
 	rs_size_t len;
 	int r;
 	struct json_object *json = NULL;
 	unsigned short freeBuf = 0;
 CODESTARTdoAction
-	pMsg = (msg_t*) ppString[0];
 	if(pWrkrData->pData->bUseRawMsg) {
 		getRawMsg(pMsg, &buf, &len);
 	} else if (pWrkrData->pData->varDescr) {
@@ -243,12 +251,12 @@ CODESTARTdoAction
 		MsgSetParseSuccess(pMsg, 1);
 	}
 
-	msgAddJSON(pMsg, (uchar*)pWrkrData->pData->pszPath + 1, json, 0);
+	msgAddJSON(pMsg, (uchar*)pWrkrData->pData->pszPath + 1, json, 0, 0);
 
 ENDdoAction
 
 
-static inline void
+static void
 setInstParamDefaults(instanceData *pData)
 {
 	pData->rulebase = NULL;

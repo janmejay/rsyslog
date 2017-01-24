@@ -1,8 +1,9 @@
 /* pmaixforwardedfrom.c
  *
  * this cleans up messages forwarded from AIX
- * 
- * instead of actually parsing the message, this modifies the message and then falls through to allow a later parser to handle the now modified message
+ *
+ * instead of actually parsing the message, this modifies the message and then falls through to allow a
+ * later parser to handle the now modified message
  *
  * created 2010-12-13 by David Lang based on pmlastmsg
  *
@@ -11,11 +12,11 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
+ *
  *       http://www.apache.org/licenses/LICENSE-2.0
  *       -or-
  *       see COPYING.ASL20 in the source distribution
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -41,7 +42,6 @@
 
 MODULE_TYPE_PARSER
 MODULE_TYPE_NOKEEP
-MODULE_CNFNAME("pmaixforwardedfrom")
 PARSER_NAME("rsyslog.aixforwardedfrom")
 
 /* internal structures
@@ -69,12 +69,15 @@ ENDisCompatibleWithFeature
 BEGINparse
 	uchar *p2parse;
 	int lenMsg;
+	int skipLen = 0;
 #define OpeningText "Message forwarded from "
+#define OpeningText2 "From "
 CODESTARTparse
 	dbgprintf("Message will now be parsed by fix AIX Forwarded From parser.\n");
 	assert(pMsg != NULL);
 	assert(pMsg->pszRawMsg != NULL);
-	lenMsg = pMsg->iLenRawMsg - pMsg->offAfterPRI; /* note: offAfterPRI is already the number of PRI chars (do not add one!) */
+	lenMsg = pMsg->iLenRawMsg - pMsg->offAfterPRI;
+	/* note: offAfterPRI is already the number of PRI chars (do not add one!) */
 	p2parse = pMsg->pszRawMsg + pMsg->offAfterPRI; /* point to start of text, after PRI */
 
 	/* check if this message is of the type we handle in this (very limited) parser */
@@ -83,37 +86,43 @@ CODESTARTparse
 		--lenMsg;
 		++p2parse;
 	}
-dbgprintf("pmaixforwardedfrom: msg to look at: [%d]'%s'\n", lenMsg, p2parse);
-	if((unsigned) lenMsg < 42) {
+	if((unsigned) lenMsg < 24) {
 		/* too short, can not be "our" message */
-                /* minimum message, 16 character timestamp, 'Message forwarded from ", 1 character name, ': '*/
-dbgprintf("msg too short!\n");
+                /* minimum message, 16 character timestamp, 'From ", 1 character name, ': '*/
 		ABORT_FINALIZE(RS_RET_COULD_NOT_PARSE);
 	}
 
 	/* skip over timestamp */
 	lenMsg -=16;
 	p2parse +=16;
-        /* if there is the string "Message forwarded from " were the hostname should be */
-	if(strncasecmp((char*) p2parse, OpeningText, sizeof(OpeningText)-1) != 0) {
+	/* if there is the string "Message forwarded from " were the hostname should be */
+	if(!strncasecmp((char*) p2parse, OpeningText, sizeof(OpeningText)-1))
+		skipLen = 23;
+	/* or "From " */
+	if(!strncasecmp((char*) p2parse, OpeningText2, sizeof(OpeningText2)-1))
+		skipLen = 5;
+	DBGPRINTF("pmaixforwardedfrom: skipLen %d\n", skipLen);
+	if(!skipLen) {
 		/* wrong opening text */
-dbgprintf("not a AIX message forwarded from mangled log!\n");
+	DBGPRINTF("not a AIX message forwarded from mangled log!\n");
 		ABORT_FINALIZE(RS_RET_COULD_NOT_PARSE);
 	}
-	/* bump the message portion up by 23 characters to overwrite the "Message forwarded from " with the hostname */
-	lenMsg -=23;
-	memmove(p2parse, p2parse + 23, lenMsg);
+	/* bump the message portion up by skipLen(23 or 5) characters to overwrite the "Message forwarded from
+" or "From " with the hostname */
+	lenMsg -=skipLen;
+	memmove(p2parse, p2parse + skipLen, lenMsg);
 	*(p2parse + lenMsg) = '\n';
 	*(p2parse + lenMsg + 1)  = '\0';
-	pMsg->iLenRawMsg -=23;
-	pMsg->iLenMSG -=23;
-	/* now look for the : after the hostname to walk past the hostname, also watch for a space in case this isn't really an AIX log, but has a similar preamble */
+	pMsg->iLenRawMsg -=skipLen;
+	pMsg->iLenMSG -=skipLen;
+	/* now look for the : after the hostname to walk past the hostname, also watch for a space in case this isn't
+really an AIX log, but has a similar preamble */
 	while(lenMsg && *p2parse != ' ' && *p2parse != ':') {
 		--lenMsg;
 		++p2parse;
 	}
 	if (lenMsg && *p2parse != ':') {
-dbgprintf("not a AIX message forwarded from mangled log but similar enough that the preamble has been removed\n");
+	DBGPRINTF("not a AIX message forwarded from mangled log but similar enough that the preamble has been removed\n");
 		ABORT_FINALIZE(RS_RET_COULD_NOT_PARSE);
 	}
 	/* bump the message portion up by one character to overwrite the extra : */
@@ -158,7 +167,8 @@ CODEmodInit_QueryRegCFSLineHdlr
 	CHKiRet(objUse(datetime, CORE_COMPONENT));
 
 	DBGPRINTF("aixforwardedfrom parser init called, compiled with version %s\n", VERSION);
- 	bParseHOSTNAMEandTAG = glbl.GetParseHOSTNAMEandTAG(); /* cache value, is set only during rsyslogd option processing */
+ 	bParseHOSTNAMEandTAG = glbl.GetParseHOSTNAMEandTAG();
+	/* cache value, is set only during rsyslogd option processing */
 
 
 ENDmodInit

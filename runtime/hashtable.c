@@ -1,12 +1,20 @@
 /* Copyright (C) 2004 Christopher Clark <firstname.lastname@cl.cam.ac.uk> */
 /* taken from http://www.cl.cam.ac.uk/~cwc22/hashtable/ */
 
-#include "hashtable.h"
 #include "hashtable_private.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+
+/* this code has several warnings, but we ignore them because
+ * this seems to work and we do not want to engage in that code body. If
+ * we really run into troubles, it is better to change to libfastjson, which
+ * we should do in the medium to long term anyhow...
+ */
+#if !defined(_AIX)
+#pragma GCC diagnostic ignored "-Wredundant-decls"
+#endif
 
 /*
 Credit for primes table: Aaron Krowne
@@ -266,15 +274,13 @@ hashtable_destroy(struct hashtable *h, int free_values)
 /* one provided by Aaaron Wiebe based on perl's hashing algorithm 
  * (so probably pretty generic). Not for excessively large strings!
  */
-unsigned int
+unsigned __attribute__((nonnull(1))) int
 hash_from_string(void *k) 
 {
-    int len;
     char *rkey = (char*) k;
     unsigned hashval = 1;
 
-    len = (int) strlen(rkey);
-    while (len--)
+    while (*rkey)
         hashval = hashval * 33 + *rkey++;
 
     return hashval;

@@ -8,7 +8,7 @@
  * PRI filter) are very hard to beat in ease of use, at least for simpler
  * cases.
  *
- * Copyright 2011-2014 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2011-2016 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
@@ -27,6 +27,15 @@
  * limitations under the License.
  */
 %{
+#if !defined(_AIX)
+/* shut off warnings that we can't change anyhow */
+#pragma GCC diagnostic ignored "-Wpragmas"
+#pragma GCC diagnostic ignored "-Wincompatible-pointer-types-discards-qualifiers"
+#pragma GCC diagnostic ignored "-Wredundant-decls"
+#pragma GCC diagnostic ignored "-Wdiscarded-qualifiers"
+#pragma GCC diagnostic ignored "-Wswitch-default"
+#endif
+
 #include "config.h"
 #include <stdio.h>
 #include <libestr.h>
@@ -34,10 +43,11 @@
 #include "parserif.h"
 #define YYDEBUG 1
 extern int yylineno;
+extern char *yytext;
 
 /* keep compile rule clean of errors */
 extern int yylex(void);
-extern int yyerror(char*);
+extern int yyerror(const char*);
 %}
 
 %union {
@@ -71,12 +81,14 @@ extern int yyerror(char*);
 %token UNSET
 %token CONTINUE
 %token <cnfstmt> CALL
+%token <cnfstmt> CALL_INDIRECT
 %token <s> LEGACY_ACTION
 %token <s> LEGACY_RULESET
 %token <s> PRIFILT
 %token <s> PROPFILT
 %token <s> BSD_TAG_SELECTOR
 %token <s> BSD_HOST_SELECTOR
+%token <s> RELOAD_LOOKUP_TABLE_PROCEDURE
 %token IF
 %token THEN
 %token ELSE
@@ -173,6 +185,8 @@ stmt:	  actlst			{ $$ = $1; }
 	| UNSET VAR ';'			{ $$ = cnfstmtNewUnset($2); }
 	| PRIFILT block			{ $$ = cnfstmtNewPRIFILT($1, $2); }
 	| PROPFILT block		{ $$ = cnfstmtNewPROPFILT($1, $2); }
+	| RELOAD_LOOKUP_TABLE_PROCEDURE '(' fparams ')' { $$ = cnfstmtNewReloadLookupTable($3);}
+	| BEGINOBJ			{ $$ = NULL; parser_errmsg("declarative object '%s' not permitted in action block [stmt]", yytext);}
 block:    stmt				{ $$ = $1; }
 	| '{' script '}'		{ $$ = $2; }
 actlst:	  s_act				{ $$ = $1; }
@@ -182,6 +196,9 @@ s_act:	  BEGIN_ACTION nvlst ENDOBJ	{ $$ = cnfstmtNewAct($2); }
 	| LEGACY_ACTION			{ $$ = cnfstmtNewLegaAct($1); }
 	| STOP				{ $$ = cnfstmtNew(S_STOP); }
 	| CALL NAME			{ $$ = cnfstmtNewCall($2); }
+	| CALL_INDIRECT expr ';'	{ $$ = cnfstmtNew(S_CALL_INDIRECT);
+					  $$->d.s_call_ind.expr = $2;
+					}
 	| CONTINUE			{ $$ = cnfstmtNewContinue(); }
 expr:	  expr AND expr			{ $$ = cnfexprNew(AND, $1, $3); }
 	| expr OR expr			{ $$ = cnfexprNew(OR, $1, $3); }

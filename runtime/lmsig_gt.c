@@ -2,7 +2,7 @@
  *
  * An implementation of the sigprov interface for GuardTime.
  * 
- * Copyright 2013 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2013-2015 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
@@ -82,7 +82,7 @@ ENDobjDestruct(lmsig_gt)
  * after construction, but before the OnFileOpen() entry point.
  * Defaults are expected to have been set during construction.
  */
-rsRetVal
+static rsRetVal
 SetCnfParam(void *pT, struct nvlst *lst)
 {
 	lmsig_gt_t *pThis = (lmsig_gt_t*) pT;
@@ -202,7 +202,7 @@ BEGINObjClassInit(lmsig_gt, 1, OBJ_IS_LOADABLE_MODULE) /* class, version */
 	CHKiRet(objUse(errmsg, CORE_COMPONENT));
 	CHKiRet(objUse(glbl, CORE_COMPONENT));
 
-	if(rsgtInit("rsyslogd " VERSION) != 0) {
+	if(rsgtInit((char*)"rsyslogd " VERSION) != 0) {
 		errmsg.LogError(0, RS_RET_SIGPROV_ERR, "error initializing "
 			"signature provider - cannot sign");
 		ABORT_FINALIZE(RS_RET_SIGPROV_ERR);

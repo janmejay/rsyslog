@@ -3,7 +3,7 @@
  *
  * File begun on 2007-07-30 by RGerhards
  *
- * Copyright (C) 2007-2015 Adiscon GmbH.
+ * Copyright (C) 2007-2016 Adiscon GmbH.
  *
  * This file is part of rsyslog.
  *
@@ -161,7 +161,7 @@ finalize_it:
  * param value must be int64!
  * rgerhards, 2008-01-09
  */
-static rsRetVal doGetSize(uchar **pp, rsRetVal (*pSetHdlr)(void*, uid_t), void *pVal)
+static rsRetVal doGetSize(uchar **pp, rsRetVal (*pSetHdlr)(void*, int64), void *pVal)
 {
 	DEFiRet;
 	int64 i;
@@ -216,7 +216,6 @@ static rsRetVal doGetInt(uchar **pp, rsRetVal (*pSetHdlr)(void*, uid_t), void *p
 	uchar *p;
 	DEFiRet;
 	int64 i;	
-	uchar errMsg[256];	/* for dynamic error messages */
 
 	assert(pp != NULL);
 	assert(*pp != NULL);
@@ -260,7 +259,6 @@ static rsRetVal doFileCreateMode(uchar **pp, rsRetVal (*pSetHdlr)(void*, uid_t),
 {
 	uchar *p;
 	DEFiRet;
-	uchar errMsg[128];	/* for dynamic error messages */
 	int iVal;	
 
 	assert(pp != NULL);
@@ -321,7 +319,7 @@ static int doParseOnOffOption(uchar **pp)
 	pOptStart = *pp;
 	skipWhiteSpace(pp); /* skip over any whitespace */
 
-	if(getSubString(pp, (char*) szOpt, sizeof(szOpt) / sizeof(uchar), ' ')  != 0) {
+	if(getSubString(pp, (char*) szOpt, sizeof(szOpt), ' ')  != 0) {
 		errmsg.LogError(0, NO_ERRCODE, "Invalid $-configline - could not extract on/off option");
 		return -1;
 	}
@@ -353,7 +351,7 @@ static rsRetVal doGetGID(uchar **pp, rsRetVal (*pSetHdlr)(void*, uid_t), void *p
 	assert(pp != NULL);
 	assert(*pp != NULL);
 
-	if(getSubString(pp, (char*) szName, sizeof(szName) / sizeof(uchar), ' ')  != 0) {
+	if(getSubString(pp, (char*) szName, sizeof(szName), ' ')  != 0) {
 		errmsg.LogError(0, RS_RET_NOT_FOUND, "could not extract group name");
 		ABORT_FINALIZE(RS_RET_NOT_FOUND);
 	}
@@ -409,7 +407,7 @@ static rsRetVal doGetUID(uchar **pp, rsRetVal (*pSetHdlr)(void*, uid_t), void *p
 	assert(pp != NULL);
 	assert(*pp != NULL);
 
-	if(getSubString(pp, (char*) szName, sizeof(szName) / sizeof(uchar), ' ')  != 0) {
+	if(getSubString(pp, (char*) szName, sizeof(szName), ' ')  != 0) {
 		errmsg.LogError(0, RS_RET_NOT_FOUND, "could not extract user name");
 		ABORT_FINALIZE(RS_RET_NOT_FOUND);
 	}
@@ -493,7 +491,7 @@ getWord(uchar **pp, cstr_t **ppStrB)
 	while(*p && !isspace((int) *p)) {
 		CHKiRet(cstrAppendChar(*ppStrB, *p++));
 	}
-	CHKiRet(cstrFinalize(*ppStrB));
+	cstrFinalize(*ppStrB);
 
 	*pp = p;
 
@@ -571,7 +569,7 @@ doSyslogName(uchar **pp, rsRetVal (*pSetHdlr)(void*, int),
 	ASSERT(*pp != NULL);
 
 	CHKiRet(getWord(pp, &pStrB)); /* get word */
-	iNewVal = decodeSyslogName(cstrGetSzStr(pStrB), pNameTable);
+	iNewVal = decodeSyslogName(cstrGetSzStrNoNULL(pStrB), pNameTable);
 
 	if(pSetHdlr == NULL) {
 		/* we should set value directly to var */
@@ -685,7 +683,8 @@ static int cslchKeyCompare(void *pKey1, void *pKey2)
 
 /* set data members for this object
  */
-rsRetVal cslchSetEntry(cslCmdHdlr_t *pThis, ecslCmdHdrlType eType, rsRetVal (*pHdlr)(), void *pData, int *permitted)
+static rsRetVal cslchSetEntry(cslCmdHdlr_t *pThis, ecslCmdHdrlType eType, rsRetVal (*pHdlr)(), void *pData,
+int *permitted)
 {
 	assert(pThis != NULL);
 	assert(eType != eCmdHdlrInvalid);
@@ -745,6 +744,13 @@ static rsRetVal cslchCallHdlr(cslCmdHdlr_t *pThis, uchar **ppConfLine)
 	case eCmdHdlrGoneAway:
 		pHdlr = doGoneAway;
 		break;
+	/* some non-legacy handler (used in v6+ solely) */
+	case eCmdHdlrInvalid:
+	case eCmdHdlrNonNegInt:
+	case eCmdHdlrPositiveInt:
+	case eCmdHdlrString:
+	case eCmdHdlrArray:
+	case eCmdHdlrQueueType:
 	default:
 		iRet = RS_RET_NOT_IMPLEMENTED;
 		goto finalize_it;
@@ -810,7 +816,8 @@ finalize_it:
 
 /* add a handler entry to a known command
  */
-static rsRetVal cslcAddHdlr(cslCmd_t *pThis, ecslCmdHdrlType eType, rsRetVal (*pHdlr)(), void *pData, void *pOwnerCookie, int *permitted)
+static rsRetVal cslcAddHdlr(cslCmd_t *pThis, ecslCmdHdrlType eType, rsRetVal (*pHdlr)(), void *pData,
+void *pOwnerCookie, int *permitted)
 {
 	DEFiRet;
 	cslCmdHdlr_t *pCmdHdlr = NULL;
@@ -839,13 +846,14 @@ finalize_it:
  * Parameter permitted has been added to support the v2 config system. With it,
  * we can tell the legacy system (us here!) to check if a config directive is
  * still permitted. For example, the v2 system will disable module global
- * paramters if the are supplied via the native v2 callbacks. In order not
+ * parameters if the are supplied via the native v2 callbacks. In order not
  * to break exisiting modules, we have renamed the rgCfSysLinHdlr routine to
  * version 2 and added a new one with the original name. It just calls the
  * v2 function and supplies a "don't care (NULL)" pointer as this argument.
  * rgerhards, 2012-06-26
  */
-rsRetVal regCfSysLineHdlr2(uchar *pCmdName, int bChainingPermitted, ecslCmdHdrlType eType, rsRetVal (*pHdlr)(), void *pData, void *pOwnerCookie, int *permitted)
+rsRetVal regCfSysLineHdlr2(const uchar *pCmdName, int bChainingPermitted, ecslCmdHdrlType eType, rsRetVal (*pHdlr)(),
+void *pData, void *pOwnerCookie, int *permitted)
 {
 	DEFiRet;
 	cslCmd_t *pThis;
@@ -885,7 +893,8 @@ finalize_it:
 	RETiRet;
 }
 
-rsRetVal regCfSysLineHdlr(uchar *pCmdName, int bChainingPermitted, ecslCmdHdrlType eType, rsRetVal (*pHdlr)(), void *pData, void *pOwnerCookie)
+rsRetVal regCfSysLineHdlr(const uchar *pCmdName, int bChainingPermitted, ecslCmdHdrlType eType, rsRetVal (*pHdlr)(),
+void *pData, void *pOwnerCookie)
 {
 	DEFiRet;
 	iRet = regCfSysLineHdlr2(pCmdName, bChainingPermitted, eType, pHdlr, pData, pOwnerCookie, NULL);
@@ -938,6 +947,11 @@ rsRetVal unregCfSysLineHdlrs4Owner(void *pOwnerCookie)
 	 * class does not provide a way to just search the lower-level handlers.
 	 */
 	iRet = llExecFunc(&llCmdList, unregHdlrsHeadExec, pOwnerCookie);
+	if(iRet == RS_RET_NOT_FOUND) {
+		/* It is not considered an error if a module had no
+		   hanlers registered. */
+		iRet = RS_RET_OK;
+	}
 
 	RETiRet;
 }
@@ -1038,7 +1052,8 @@ void dbgPrintCfSysLineHandlers(void)
 
 /* our init function. TODO: remove once converted to a class
  */
-rsRetVal cfsyslineInit()
+rsRetVal
+cfsyslineInit(void)
 {
 	DEFiRet;
 	CHKiRet(objGetObjInterface(&obj));

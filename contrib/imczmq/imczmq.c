@@ -1,5 +1,5 @@
 /* imczmq.c
- * Copyright (C) 2014 Brian Knox
+ * Copyright (C) 2016 Brian Knox
  * Copyright (C) 2014 Rainer Gerhards
  *
  * Author: Brian Knox <bknox@digitalocean.com>
@@ -48,49 +48,11 @@ DEFobjCurrIf(glbl)
 DEFobjCurrIf(prop)
 DEFobjCurrIf(ruleset)
 
- 
-typedef struct _pollerData_t {
-	ruleset_t *ruleset;
-	thrdInfo_t *thread;
-} pollerData_t;
-
-
-struct instanceConf_s {
-	int sockType;
-	char *sockEndpoints;
-	char *topicList;
-	char *connType;
-	char *clientCertPath;
-	char *serverCertPath;
-	uchar *pszBindRuleset;
-	ruleset_t *pBindRuleset;
-	struct instanceConf_s *next;
-};
-
-struct modConfData_s {
-	rsconf_t *pConf;
-	instanceConf_t *root;
-	instanceConf_t *tail;
-	int io_threads;
-};
-
-struct lstn_s {
-	zsock_t *sock;
-	zcert_t *clientCert;
-	zcert_t *serverCert;
-	ruleset_t *pRuleset;
-	struct lstn_s *next;
-};
-
-static modConfData_t *runModConf = NULL;
-static struct lstn_s *lcnfRoot = NULL;
-static struct lstn_s *lcnfLast = NULL;
-static prop_t *s_namep = NULL;
-static zloop_t *zloopHandle = NULL;
-static zactor_t *authActor = NULL;
-
 static struct cnfparamdescr modpdescr[] = {
-	{ "ioThreads", eCmdHdlrInt, 0 },
+	{ "authenticator", eCmdHdlrBinary, 0 },
+	{ "authtype", eCmdHdlrString, 0 },
+	{ "servercertpath", eCmdHdlrString, 0 },
+	{ "clientcertpath", eCmdHdlrString, 0 },
 };
 
 static struct cnfparamblk modpblk = {
@@ -99,14 +61,40 @@ static struct cnfparamblk modpblk = {
 	modpdescr
 };
 
+struct modConfData_s {
+	rsconf_t *pConf;
+	instanceConf_t *root;
+	instanceConf_t *tail;
+	int authenticator;
+	char *authType;
+	char *serverCertPath;
+	char *clientCertPath;
+};
+
+struct instanceConf_s {
+	bool serverish;
+	int sockType;
+	char *sockEndpoints;
+	char *topics;
+	uchar *pszBindRuleset;
+	ruleset_t *pBindRuleset;
+	struct instanceConf_s *next;
+};
+
+struct listener_t {
+	zsock_t *sock;
+	ruleset_t *ruleset;
+};
+
+static zlist_t *listenerList;
+static modConfData_t *runModConf = NULL;
+static prop_t *s_namep = NULL;
+
 static struct cnfparamdescr inppdescr[] = {
 	{ "endpoints", eCmdHdlrGetWord, 1 },
 	{ "socktype", eCmdHdlrGetWord, 1 },
-	{ "conntype", eCmdHdlrGetWord, 0 },
-	{ "topics", eCmdHdlrGetWord, 0 },
-	{ "clientcertpath", eCmdHdlrGetWord, 0 },
-	{ "servercertpath", eCmdHdlrGetWord, 0 },
 	{ "ruleset", eCmdHdlrGetWord, 0 },
+	{ "topics", eCmdHdlrGetWord, 0 },
 };
 
 #include "im-helper.h"
@@ -118,12 +106,10 @@ static struct cnfparamblk inppblk = {
 };
 
 static void setDefaults(instanceConf_t* iconf) {
+	iconf->serverish = true;
 	iconf->sockType = -1;
 	iconf->sockEndpoints = NULL;
-	iconf->topicList = NULL;
-	iconf->connType = NULL;
-	iconf->clientCertPath = NULL;
-	iconf->serverCertPath = NULL;
+	iconf->topics = NULL;
 	iconf->pszBindRuleset = NULL;
 	iconf->pBindRuleset = NULL;
 	iconf->next = NULL;
@@ -136,10 +122,9 @@ static rsRetVal createInstance(instanceConf_t** pinst) {
 	
 	setDefaults(inst);
 	
-	if (runModConf->root == NULL || runModConf->tail == NULL) {
+	if(runModConf->root == NULL || runModConf->tail == NULL) {
 		runModConf->tail = runModConf->root = inst;
 	}
-
 	else {
 		runModConf->tail->next = inst;
 		runModConf->tail = inst;
@@ -149,333 +134,238 @@ finalize_it:
 	RETiRet;
 }
 
-static rsRetVal createListener(struct cnfparamvals* pvals) {
-	instanceConf_t* inst;
-	int i;
-	DEFiRet;
-	
-	CHKiRet(createInstance(&inst));
-	for(i = 0 ; i < inppblk.nParams ; ++i) {
-		if(!pvals[i].bUsed) {
-			continue;
-		}
-
-		/* get the ruleset to bind to */
-		if(!strcmp(inppblk.descr[i].name, "ruleset")) {
-			inst->pszBindRuleset = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} 
-	
-		/* get the socket endpoints to use */
-		else if(!strcmp(inppblk.descr[i].name, "endpoints")) {
-			inst->sockEndpoints = es_str2cstr(pvals[i].val.d.estr, NULL);
-		} 
-
-		/* get the socket type */
-		else if(!strcmp(inppblk.descr[i].name, "socktype")){
-			char *stringType = es_str2cstr(pvals[i].val.d.estr, NULL);
-			
-			if (!strcmp("SUB", stringType)) {
-				inst->sockType = ZMQ_SUB;
-			}
-
-			else if (!strcmp("PULL", stringType)) {
-				inst->sockType = ZMQ_PULL;
-			}
-
-			else if (!strcmp("ROUTER", stringType)) {
-				inst->sockType = ZMQ_ROUTER;
-			}
-
-			else {
-				errmsg.LogError(0, RS_RET_CONFIG_ERROR,
-						"imczmq: invalid sockType");
-				ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
-			}
-		} 
-	
-		/* get the subscription topics */
-		else if(!strcmp(inppblk.descr[i].name, "topics")) {
-			if (inst->sockType != ZMQ_SUB) {
-				errmsg.LogError(0, RS_RET_CONFIG_ERROR,
-						"topics is invalid unless socktype is SUB");
-				ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
-			}
-
-			inst->topicList = es_str2cstr(pvals[i].val.d.estr, NULL);
-		} 
-	
-		/* get the authentication type to use */
-		else if(!strcmp(inppblk.descr[i].name, "conntype")) {
-			inst->connType = es_str2cstr(pvals[i].val.d.estr, NULL);
-
-			/* make sure defined type is supported */
-			if ((inst->connType != NULL) && 
-					strcmp("CURVESERVER", inst->connType) &&
-					strcmp("CURVECLIENT", inst->connType) &&
-					strcmp("CLIENT", inst->connType) &&
-					strcmp("SERVER", inst->connType))
-			{
-				errmsg.LogError(0, RS_RET_CONFIG_ERROR,
-						"imczmq: %s is not a valid connType",
-						inst->connType);
-				ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
-			}
-		} 
-
-		/* get client cert argument */
-		else if(!strcmp(inppblk.descr[i].name, "clientcertpath")) {
-			inst->clientCertPath = es_str2cstr(pvals[i].val.d.estr, NULL);
-		} 
-
-		/* get server cert argument */
-		else if(!strcmp(inppblk.descr[i].name, "servercertpath")) {
-			inst->serverCertPath = es_str2cstr(pvals[i].val.d.estr, NULL);
-		} 
-
-		/* the config has a bad option */
-		else {
-			errmsg.LogError(0, NO_ERRCODE,
-					"imczmq: program error, non-handled "
-					"param '%s'\n", inppblk.descr[i].name);
-		}
-	
-	}
-finalize_it:
-	RETiRet;
-}
-
 static rsRetVal addListener(instanceConf_t* iconf){
-	struct lstn_s* pData;
 	DEFiRet;
+	
+	DBGPRINTF("imczmq: addListener called..\n");	
+	struct listener_t* pData;
+	CHKmalloc(pData=(struct listener_t*)MALLOC(sizeof(struct listener_t)));
+	pData->ruleset = iconf->pBindRuleset;
 
-	CHKmalloc(pData=(struct lstn_s*)MALLOC(sizeof(struct lstn_s)));
-	pData->next = NULL;
-	pData->pRuleset = iconf->pBindRuleset;
-
-	/* create our zeromq socket */
 	pData->sock = zsock_new(iconf->sockType);
-   	if (!pData->sock) {
+	if(!pData->sock) {
 		errmsg.LogError(0, RS_RET_NO_ERRCODE,
 				"imczmq: new socket failed for endpoints: %s",
 				iconf->sockEndpoints);
 		ABORT_FINALIZE(RS_RET_NO_ERRCODE);
 	}
 
-	bool is_server = false;
+	DBGPRINTF("imczmq: created socket of type %d..\n", iconf->sockType);	
 
-	DBGPRINTF("imczmq: conntype is: %s\n", iconf->connType);
-
-	if (!strcmp(iconf->connType, "CURVESERVER") || 
-			!stcmp(iconf->connType, "SERVER"))
-	{
-		is_server = true;
-		
-		/* set global auth domain */
-		zsock_set_zap_domain(pData->sock, "global");
-	}
-
-	/* if we are a CURVE server */
-	if (!strcmp(iconf->connType, "CURVESERVER")) {
-
-				/* set that we are a curve server */
-		zsock_set_curve_server(pData->sock, 1);
-
-		/* get and set our server cert */
-		DBGPRINTF("imczmq: server cert is %s...\n", iconf->serverCertPath);
-		pData->serverCert = zcert_load(iconf->serverCertPath);
-		if (!pData->serverCert) {
-			errmsg.LogError(0, NO_ERRCODE, "could not load server cert");
-			ABORT_FINALIZE(RS_RET_ERR);
-		}
-
-		zcert_apply(pData->serverCert, pData->sock);
-
-		/* set allowed clients */
-		DBGPRINTF("imczmq: allowed clients are %s...\n", iconf->clientCertPath);
-		zstr_sendx(authActor, "CURVE", iconf->clientCertPath, NULL);
-		zsock_wait(authActor);
-	}
-
-	/* if we are a CURVE client */
-	if (!strcmp(iconf->connType, "CURVECLIENT")) {
-		DBGPRINTF("imczmq: we are a curve client...\n");
-
-		is_server = false;
-
-		/* get our client cert */
-		pData->clientCert = zcert_load(iconf->clientCertPath);
-		if (!pData->clientCert) {
-			errmsg.LogError(0, NO_ERRCODE, "could not load client cert");
-			ABORT_FINALIZE(RS_RET_ERR);
-		}
-
-		/* apply the client cert to the socket */
-		zcert_apply(pData->clientCert, pData->sock);
-
-		/* get the server cert */
-		DBGPRINTF("imczmq: server cert is %s...\n", iconf->serverCertPath);
-		pData->serverCert = zcert_load(iconf->serverCertPath);
-		if (!pData->serverCert) {
-			errmsg.LogError(0, NO_ERRCODE, "could not load server cert");
-			ABORT_FINALIZE(RS_RET_ERR);
-		}
-
-		/* get the server public key and set it for the socket */
-		char *server_key = zcert_public_txt(pData->serverCert);
-		DBGPRINTF("imczmq: server public key is %s...\n", server_key);
-		zsock_set_curve_serverkey (pData->sock, server_key);
-	}
-
-	/* if we have a ZMQ_SUB sock, subscribe to topics */
-	if (iconf->sockType == ZMQ_SUB) {
-		char topic[256];
-		while (iconf->topicList) {
-			char *delimiter = strchr(iconf->topicList, ',');
-			if (!delimiter) {
-				delimiter = iconf->topicList + strlen (iconf->topicList);
-			}
-
-			if (delimiter - iconf->topicList > 255) {
-				errmsg.LogError(0, NO_ERRCODE,
-						"iconf->topicList must be under 256 characters");
+	if(runModConf->authType) {	
+		if(!strcmp(runModConf->authType, "CURVESERVER")) {
+			DBGPRINTF("imczmq: we are a CURVESERVER\n");	
+			zcert_t *serverCert = zcert_load(runModConf->serverCertPath);
+			if(!serverCert) {
+				errmsg.LogError(0, NO_ERRCODE, "could not load cert %s",
+					runModConf->serverCertPath);
 				ABORT_FINALIZE(RS_RET_ERR);
 			}
-		
-			memcpy(topic, iconf->topicList, delimiter - iconf->topicList);
-			topic[delimiter - iconf->topicList] = 0;
+			zsock_set_zap_domain(pData->sock, "global");
+			zsock_set_curve_server(pData->sock, 1);
+			zcert_apply(serverCert, pData->sock);
+			zcert_destroy(&serverCert);
+		}
+		else if(!strcmp(runModConf->authType, "CURVECLIENT")) {
+			DBGPRINTF("imczmq: we are a CURVECLIENT\n");	
+			zcert_t *serverCert = zcert_load(runModConf->serverCertPath);
+			if(!serverCert) {
+				errmsg.LogError(0, NO_ERRCODE, "could not load cert %s",
+					runModConf->serverCertPath);
+				ABORT_FINALIZE(RS_RET_ERR);
+			}
+			const char *server_key = zcert_public_txt(serverCert);
+			zcert_destroy(&serverCert);
+			zsock_set_curve_serverkey(pData->sock, server_key);
+			
+			zcert_t *clientCert = zcert_load(runModConf->clientCertPath);
+			if(!clientCert) {
+				errmsg.LogError(0, NO_ERRCODE, "could not load cert %s",
+					runModConf->clientCertPath);
+				ABORT_FINALIZE(RS_RET_ERR);
+			}
+			
+			zcert_apply(clientCert, pData->sock);
+			zcert_destroy(&clientCert);
+		}
 
-			zsock_set_subscribe(pData->sock, topic);
+	}
 
-			if (*delimiter == 0) {
+	switch(iconf->sockType) {
+		case ZMQ_SUB:
+#if defined(ZMQ_DISH)
+		case ZMQ_DISH:
+#endif
+			iconf->serverish = true;
+			break;
+		case ZMQ_PULL:
+#if defined(ZMQ_GATHER)
+		case ZMQ_GATHER:
+#endif
+		case ZMQ_ROUTER:
+#if defined(ZMQ_SERVER)
+		case ZMQ_SERVER:
+#endif
+			iconf->serverish = true;
+			break;
+	}
+
+	if(iconf->topics) {
+		char topic[256];
+		while(*iconf->topics) {
+			char *delimiter = strchr(iconf->topics, ',');
+			if(!delimiter) {
+				delimiter = iconf->topics + strlen(iconf->topics);
+			}
+			memcpy (topic, iconf->topics, delimiter - iconf->topics);
+			topic[delimiter-iconf->topics] = 0;
+			DBGPRINTF("imczmq: subscribing to %s\n", topic);
+			if(iconf->sockType == ZMQ_SUB) {
+				zsock_set_subscribe (pData->sock, topic);
+			}
+#if defined(ZMQ_DISH)
+			else if(iconf->sockType == ZMQ_DISH) {
+				int rc = zsock_join (pData->sock, topic);
+				if(rc != 0) {
+					errmsg.LogError(0, NO_ERRCODE, "could not join group %s", topic);
+					ABORT_FINALIZE(RS_RET_ERR);
+				}
+			}
+#endif
+			if(*delimiter == 0) {
 				break;
 			}
-
-			iconf->topicList = delimiter + 1;
+			iconf->topics = delimiter + 1;
 		}
 	}
 
-	/* FIXME: currently hard coded to bind */
-	int rc = zsock_attach(pData->sock, (const char*)iconf->sockEndpoints, true);
+	int rc = zsock_attach(pData->sock, (const char*)iconf->sockEndpoints,
+			iconf->serverish);
 	if (rc == -1) {
-		errmsg.LogError(0, NO_ERRCODE, "zsock_attach to %s",
+		errmsg.LogError(0, NO_ERRCODE, "zsock_attach to %s failed",
 				iconf->sockEndpoints);
 		ABORT_FINALIZE(RS_RET_ERR);
 	}
 
-	/* add this struct to the global */
-	if(lcnfRoot == NULL) {
-		lcnfRoot = pData;
-	} 
-	if(lcnfLast == NULL) {
-		lcnfLast = pData;
-	} else {
-		lcnfLast->next = pData;
-		lcnfLast = pData;
-	}
+	DBGPRINTF("imczmq: attached socket to %s\n", iconf->sockEndpoints);
 
+	rc = zlist_append(listenerList, (void *)pData);
+	if(rc != 0) {
+		errmsg.LogError(0, NO_ERRCODE, "could not append listener");
+		ABORT_FINALIZE(RS_RET_ERR);
+	}
 finalize_it:
 	RETiRet;
 }
 
-static int handlePoll(zloop_t __attribute__((unused)) *loop, zmq_pollitem_t *poller, void* args) {
-	msg_t* pMsg;
-	pollerData_t *pollerData = (pollerData_t *)args;
-
-	zmsg_t *msg = zmsg_recv(poller->socket);
-	zframe_t *payload = zmsg_last(msg);
-	char* buf = zframe_strdup(payload);
-	
-	if (msgConstruct(&pMsg) == RS_RET_OK) {
-		MsgSetRawMsg(pMsg, buf, strlen(buf));
-		MsgSetInputName(pMsg, s_namep);
-		MsgSetHOSTNAME(pMsg, glbl.GetLocalHostName(), ustrlen(glbl.GetLocalHostName()));
-		MsgSetRcvFrom(pMsg, glbl.GetLocalHostNameProp());
-		MsgSetRcvFromIP(pMsg, glbl.GetLocalHostIP());
-		MsgSetMSGoffs(pMsg, 0);
-		MsgSetFlowControlType(pMsg, eFLOWCTL_NO_DELAY);
-		MsgSetRuleset(pMsg, pollerData->ruleset);
-		pMsg->msgFlags = NEEDS_PARSING | PARSE_HOSTNAME;
-		submitMsg2(pMsg);
-	}
-	
-	free(buf);
-	zmsg_destroy(&msg);
-	
-	if( pollerData->thread->bShallStop == TRUE) {
-		return -1; 
-	}
-	
-	return 0;
-}
-
-static rsRetVal rcvData(thrdInfo_t* pThrd){
+static rsRetVal rcvData(){
 	DEFiRet;
-
-	DBGPRINTF("imczmq: starting auth actor...\n");
-	authActor = zactor_new(zauth, NULL);
-	if (!authActor) {
-		errmsg.LogError(0, RS_RET_NO_ERRCODE,
-				"imczmq: could not create auth service");
-		ABORT_FINALIZE(RS_RET_NO_ERRCODE);
+	
+	if(!listenerList) {
+		listenerList = zlist_new();
+		if(!listenerList) {
+			errmsg.LogError(0, NO_ERRCODE, "could not allocate list");
+			ABORT_FINALIZE(RS_RET_ERR);
+		}
 	}
+
+	zactor_t *authActor;
+	zcert_t *serverCert;
+
+	if(runModConf->authenticator == 1) {
+		authActor = zactor_new(zauth, NULL);
+		zstr_sendx(authActor, "CURVE", runModConf->clientCertPath, NULL);
+		zsock_wait(authActor);
+	} 
 
 	instanceConf_t *inst;
-	for (inst = runModConf->root; inst != NULL; inst=inst->next) {
-		addListener(inst);
+	for(inst = runModConf->root; inst != NULL; inst=inst->next) {
+		CHKiRet(addListener(inst));
 	}
+	
+	zpoller_t *poller = zpoller_new(NULL);
+	if(!poller) {
+		errmsg.LogError(0, NO_ERRCODE, "could not create poller");
+			ABORT_FINALIZE(RS_RET_ERR);
+	}
+	DBGPRINTF("imczmq: created poller\n");
 
-	if (lcnfRoot == NULL) {
+	struct listener_t *pData;
+
+	pData = zlist_first(listenerList);
+	if(!pData) {
 		errmsg.LogError(0, NO_ERRCODE, "imczmq: no listeners were "
 						"started, input not activated.\n");
 		ABORT_FINALIZE(RS_RET_NO_RUN);
 	}
 
-	size_t n_items = 0;
-	struct lstn_s *current;
-	for(current=lcnfRoot;current!=NULL;current=current->next) {
-		n_items++;
+	while(pData) {
+		int rc = zpoller_add(poller, pData->sock);
+		if(rc != 0) {
+			errmsg.LogError(0, NO_ERRCODE, "imczmq: could not add "
+						"socket to poller, input not activated.\n");
+			ABORT_FINALIZE(RS_RET_NO_RUN);
+		}
+		pData = zlist_next(listenerList);
 	}
 
-	zmq_pollitem_t *items = NULL;
-	CHKmalloc(items = (zmq_pollitem_t*)MALLOC(sizeof(zmq_pollitem_t)*n_items));
+	zframe_t *frame;
+	zsock_t *which = (zsock_t *)zpoller_wait(poller, -1);
+	while(which) {
+		if (zpoller_terminated(poller)) {
+				break;
+		}
+		pData = zlist_first(listenerList);
+		while(pData->sock != which) {
+			pData = zlist_next(listenerList);
+		}
+	
+		if(which == pData->sock) {
+			DBGPRINTF("imczmq: found matching socket\n");
+		}
 
-	pollerData_t *pollerData = NULL;
-	CHKmalloc(pollerData = (pollerData_t *)MALLOC(sizeof(pollerData_t)*n_items));
+		frame = zframe_recv(which);
+		char *buf = zframe_strdup(frame);
 
-	size_t i;
-	for(i=0, current = lcnfRoot; current != NULL; current = current->next, i++) {
-		items[i].socket=zsock_resolve(current->sock);
-		items[i].events = ZMQ_POLLIN;
-		
-		pollerData[i].thread  = pThrd;
-		pollerData[i].ruleset = current->pRuleset;
+		if(buf == NULL) {
+			DBGPRINTF("imczmq: null buffer\n");
+			continue;
+		}
+		smsg_t *pMsg;
+		if(msgConstruct(&pMsg) == RS_RET_OK) {
+			MsgSetRawMsg(pMsg, buf, strlen(buf));
+			MsgSetInputName(pMsg, s_namep);
+			MsgSetHOSTNAME(pMsg, glbl.GetLocalHostName(), ustrlen(glbl.GetLocalHostName()));
+			MsgSetRcvFrom(pMsg, glbl.GetLocalHostNameProp());
+			MsgSetRcvFromIP(pMsg, glbl.GetLocalHostIP());
+			MsgSetMSGoffs(pMsg, 0);
+			MsgSetFlowControlType(pMsg, eFLOWCTL_NO_DELAY);
+			MsgSetRuleset(pMsg, pData->ruleset);
+			pMsg->msgFlags = NEEDS_PARSING | PARSE_HOSTNAME;
+			submitMsg2(pMsg);
+		}
+
+		free(buf);
+		which = (zsock_t *)zpoller_wait(poller, -1);
 	}
-
-	zloopHandle = zloop_new();
-	int rc;
-	for(i=0; i<n_items; ++i) {
-		
-		rc = zloop_poller(zloopHandle, &items[i], handlePoll, &pollerData[i]);
-		if (rc) {
-			errmsg.LogError(0, NO_ERRCODE,
-					"imczmq: zloop_poller failed for item %zu: %s",
-					i, zmq_strerror(errno));
-		} 
-	}
-	DBGPRINTF("imczmq: zloop_poller starting...");
-	zloop_start(zloopHandle);   
-	zloop_destroy(&zloopHandle);
-	DBGPRINTF("imczmq: zloop_poller stopped.");
 finalize_it:
-	free(items);
-	free(pollerData);
+	zframe_destroy(&frame);
+	zpoller_destroy(&poller);
+	pData = zlist_first(listenerList);
+	while(pData) {
+		zsock_destroy(&pData->sock);
+		free(pData->ruleset);
+		pData = zlist_next(listenerList);
+	}
+	zlist_destroy(&listenerList);
 	zactor_destroy(&authActor);
+	zcert_destroy(&serverCert);
 	RETiRet;
 }
 
 BEGINrunInput
 CODESTARTrunInput
-	CHKiRet(rcvData(pThrd));
+	CHKiRet(rcvData());
 finalize_it:
 	RETiRet;
 ENDrunInput
@@ -485,8 +375,8 @@ BEGINwillRun
 CODESTARTwillRun
 	CHKiRet(prop.Construct(&s_namep));
 	CHKiRet(prop.SetString(s_namep,
-				UCHAR_CONSTANT("imczmq"),
-				   sizeof("imczmq") - 1));
+		UCHAR_CONSTANT("imczmq"),
+		sizeof("imczmq") - 1));
 
 	CHKiRet(prop.ConstructFinalize(s_namep));
 
@@ -496,7 +386,7 @@ ENDwillRun
 
 BEGINafterRun
 CODESTARTafterRun
-	if (s_namep != NULL) {
+	if(s_namep != NULL) {
 		prop.Destruct(&s_namep);
 	}
 ENDafterRun
@@ -513,7 +403,7 @@ ENDmodExit
 
 BEGINisCompatibleWithFeature
 CODESTARTisCompatibleWithFeature
-	if (eFeat == sFEATURENonCancelInputTermination) {
+	if(eFeat == sFEATURENonCancelInputTermination) {
 		iRet = RS_RET_OK;
 	}
 ENDisCompatibleWithFeature
@@ -523,7 +413,10 @@ BEGINbeginCnfLoad
 CODESTARTbeginCnfLoad
 	runModConf = pModConf;
 	runModConf->pConf = pConf;
-	runModConf->io_threads = 0;
+	runModConf->authenticator = 0;
+	runModConf->authType = NULL;
+	runModConf->serverCertPath = NULL;
+	runModConf->clientCertPath = NULL;
 ENDbeginCnfLoad
 
 
@@ -532,23 +425,30 @@ BEGINsetModCnf
 	int i;
 CODESTARTsetModCnf
 	pvals = nvlstGetParams(lst, &modpblk, NULL);
-	if (NULL == pvals) {
-		 errmsg.LogError(0, RS_RET_MISSING_CNFPARAMS,
+	if(NULL == pvals) {
+		errmsg.LogError(0, RS_RET_MISSING_CNFPARAMS,
 				"imczmq: error processing module "
 				"config parameters ['module(...)']");
 
-		 ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
 	}
  
-	for (i=0; i < modpblk.nParams; ++i) {
-		if (!pvals[i].bUsed) {
+	for(i=0; i < modpblk.nParams; ++i) {
+		if(!pvals[i].bUsed) {
 			continue;
 		}
-
-		if (!strcmp(modpblk.descr[i].name, "ioThreads")) {
-			runModConf->io_threads = (int)pvals[i].val.d.n;
+		if(!strcmp(modpblk.descr[i].name, "authenticator")) {
+			runModConf->authenticator = (int)pvals[i].val.d.n;
 		}
-
+		else if(!strcmp(modpblk.descr[i].name, "authtype")) {
+			runModConf->authType = es_str2cstr(pvals[i].val.d.estr, NULL);
+		}
+		else if(!strcmp(modpblk.descr[i].name, "servercertpath")) {
+			runModConf->serverCertPath = es_str2cstr(pvals[i].val.d.estr, NULL);
+		}
+		else if(!strcmp(modpblk.descr[i].name, "clientcertpath")) {
+			runModConf->clientCertPath = es_str2cstr(pvals[i].val.d.estr, NULL);
+		}
 		else {
 			errmsg.LogError(0, RS_RET_INVALID_PARAMS, 
 						"imczmq: config error, unknown "
@@ -556,9 +456,14 @@ CODESTARTsetModCnf
 						modpblk.descr[i].name);
 		}   
 	}
- 
+
+	DBGPRINTF("imczmq: authenticator set to %d\n", runModConf->authenticator);
+	DBGPRINTF("imczmq: authType set to %s\n", runModConf->authType);
+	DBGPRINTF("imczmq: serverCertPath set to %s\n", runModConf->serverCertPath);
+	DBGPRINTF("imczmq: clientCertPath set to %s\n", runModConf->clientCertPath);
+
 finalize_it:
-	if (pvals != NULL) {
+	if(pvals != NULL) {
 		cnfparamvalsDestruct(pvals, &modpblk);
 	}
 ENDsetModCnf
@@ -569,13 +474,13 @@ CODESTARTendCnfLoad
 ENDendCnfLoad
 
 
-/* function to generate error message if framework does not find requested ruleset */
 static inline void
 std_checkRuleset_genErrMsg(__attribute__((unused)) modConfData_t *modConf, instanceConf_t *inst)
 {
-	errmsg.LogError(0, NO_ERRCODE, "imczmq: ruleset '%s' for socket %s not found - "
-					"using default ruleset instead", inst->pszBindRuleset,
-					inst->sockEndpoints);
+	errmsg.LogError(0, NO_ERRCODE,
+			"imczmq: ruleset '%s' for socket %s not found - "
+			"using default ruleset instead", inst->pszBindRuleset,
+			inst->sockEndpoints);
 }
 
 
@@ -591,8 +496,6 @@ ENDcheckCnf
 BEGINactivateCnfPrePrivDrop
 CODESTARTactivateCnfPrePrivDrop
 	runModConf = pModConf;
-
-	/* tell czmq to not use it's own signal handler */
 	putenv("ZSYS_SIGHANDLER=false");
 ENDactivateCnfPrePrivDrop
 
@@ -603,25 +506,14 @@ ENDactivateCnf
 
 
 BEGINfreeCnf
-	struct lstn_s *lstn, *lstn_r;
 	instanceConf_t *inst, *inst_r;
 CODESTARTfreeCnf
-	DBGPRINTF("imczmq: BEGINfreeCnf ...\n");
-	for (lstn = lcnfRoot; lstn != NULL; ) {
-		lstn_r = lstn;
-		zcert_destroy(&lstn->clientCert);
-		zcert_destroy(&lstn->serverCert);
-		lstn = lstn_r->next;
-		free(lstn_r);
-	}
-
+	free(pModConf->authType);
+	free(pModConf->serverCertPath);
+	free(pModConf->clientCertPath);
 	for (inst = pModConf->root ; inst != NULL ; ) {
 		free(inst->pszBindRuleset);
 		free(inst->sockEndpoints);
-		free(inst->topicList);
-		free(inst->connType);
-		free(inst->clientCertPath);
-		free(inst->serverCertPath);
 		inst_r = inst;
 		inst = inst->next;
 		free(inst_r);
@@ -632,22 +524,80 @@ ENDfreeCnf
 
 BEGINnewInpInst
 	struct cnfparamvals* pvals;
+	instanceConf_t* inst;
+	int i;
 CODESTARTnewInpInst
-
 	DBGPRINTF("newInpInst (imczmq)\n");
-	pvals = nvlstGetParams(lst, &inppblk, NULL);
 	
+	pvals = nvlstGetParams(lst, &inppblk, NULL);
 	if(NULL==pvals) {
 		errmsg.LogError(0, RS_RET_MISSING_CNFPARAMS,
 						"imczmq: required parameters are missing\n");
 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
 	}
 
-	DBGPRINTF("imczmq: input param blk:\n");
-	cnfparamsPrint(&inppblk, pvals);
+	if(Debug) {
+		DBGPRINTF("imczmq: input param blk:\n");
+		cnfparamsPrint(&inppblk, pvals);
+	}
 	
-	CHKiRet(createListener(pvals));
+	CHKiRet(createInstance(&inst));
+	
+	for(i = 0 ; i < inppblk.nParams ; ++i) {
+		if(!pvals[i].bUsed) {
+			continue;
+		}
 
+		if(!strcmp(inppblk.descr[i].name, "ruleset")) {
+			inst->pszBindRuleset = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+		} 
+		else if(!strcmp(inppblk.descr[i].name, "endpoints")) {
+			inst->sockEndpoints = es_str2cstr(pvals[i].val.d.estr, NULL);
+		} 
+		else if(!strcmp(inppblk.descr[i].name, "topics")) {
+			inst->topics = es_str2cstr(pvals[i].val.d.estr, NULL);
+		}
+		else if(!strcmp(inppblk.descr[i].name, "socktype")){
+			char *stringType = es_str2cstr(pvals[i].val.d.estr, NULL);
+			if( NULL == stringType ){
+				errmsg.LogError(0, RS_RET_CONFIG_ERROR,
+					"imczmq: '%s' is invalid sockType", stringType);
+				ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+			}
+
+			if(!strcmp("PULL", stringType)) {
+				inst->sockType = ZMQ_PULL;
+			}
+#if defined(ZMQ_GATHER)
+			else if(!strcmp("GATHER", stringType)) {
+				inst->sockType = ZMQ_GATHER;
+			}
+#endif
+			else if(!strcmp("SUB", stringType)) {
+				inst->sockType = ZMQ_SUB;
+			}
+#if defined(ZMQ_DISH)
+			else if(!strcmp("DISH", stringType)) {
+				inst->sockType = ZMQ_DISH;
+			}
+#endif
+			else if(!strcmp("ROUTER", stringType)) {
+				inst->sockType = ZMQ_ROUTER;
+			}
+#if defined(ZMQ_SERVER)
+			else if(!strcmp("SERVER", stringType)) {
+				inst->sockType = ZMQ_SERVER;
+			}
+#endif
+			free(stringType);
+
+		} 
+		else {
+			errmsg.LogError(0, NO_ERRCODE,
+					"imczmq: program error, non-handled "
+					"param '%s'\n", inppblk.descr[i].name);
+		}
+	}
 finalize_it:
 CODE_STD_FINALIZERnewInpInst
 	cnfparamvalsDestruct(pvals, &inppblk);
@@ -674,3 +624,4 @@ CODEmodInit_QueryRegCFSLineHdlr
 	CHKiRet(objUse(prop, CORE_COMPONENT));
 	CHKiRet(objUse(ruleset, CORE_COMPONENT));
 ENDmodInit
+

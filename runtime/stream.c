@@ -16,7 +16,7 @@
  * it turns out to be problematic. Then, we need to quasi-refcount the number of accesses
  * to the object.
  *
- * Copyright 2008-2013 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2008-2016 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
@@ -49,6 +49,7 @@
 #include <sys/stat.h>	 /* required for HP UX */
 #include <errno.h>
 #include <pthread.h>
+#include <poll.h>
 
 #include "rsyslog.h"
 #include "stringbuf.h"
@@ -57,8 +58,10 @@
 #include "stream.h"
 #include "unicode-helper.h"
 #include "module-template.h"
+#include "errmsg.h"
 #include "cryprov.h"
-#if HAVE_SYS_PRCTL_H
+#include "datetime.h"
+#ifdef HAVE_SYS_PRCTL_H
 #  include <sys/prctl.h>
 #endif
 
@@ -72,11 +75,13 @@
 
 /* static data */
 DEFobjStaticHelpers
+DEFobjCurrIf(errmsg)
 DEFobjCurrIf(zlibw)
 
 /* forward definitions */
 static rsRetVal strmFlushInternal(strm_t *pThis, int bFlushZip);
-static rsRetVal strmWrite(strm_t *__restrict__ const pThis, const uchar *__restrict__ const pBuf, const size_t lenBuf);
+static rsRetVal strmWrite(strm_t *__restrict__ const pThis, const uchar *__restrict__ const pBuf,
+	const size_t lenBuf);
 static rsRetVal strmCloseFile(strm_t *pThis);
 static void *asyncWriterThread(void *pPtr);
 static rsRetVal doZipWrite(strm_t *pThis, uchar *pBuf, size_t lenBuf, int bFlush);
@@ -86,6 +91,17 @@ static rsRetVal strmSeekCurrOffs(strm_t *pThis);
 
 
 /* methods */
+
+/* output (current) file name for debug log purposes. Falls back to various
+ * levels of impreciseness if more precise name is not known.
+ */
+static const char *
+getFileDebugName(const strm_t *const pThis)
+{
+	  return (pThis->pszCurrFName == NULL) ?
+		  ((pThis->pszFName == NULL) ? "N/A" : (char*)pThis->pszFName)
+		: (const char*) pThis->pszCurrFName;
+}
 
 /* Try to resolve a size limit situation. This is used to support custom-file size handlers
  * for omfile. It first runs the command, and then checks if we are still above the size
@@ -217,6 +233,7 @@ doPhysOpen(strm_t *pThis)
 		case STREAMMODE_WRITE_APPEND:
 			iFlags = O_CLOEXEC | O_NOCTTY | O_WRONLY | O_CREAT | O_APPEND;
 			break;
+		case STREAMMMODE_INVALID:
 		default:assert(0);
 			break;
 	}
@@ -236,7 +253,7 @@ doPhysOpen(strm_t *pThis)
 		if(err == ENOENT)
 			ABORT_FINALIZE(RS_RET_FILE_NOT_FOUND);
 		else
-			ABORT_FINALIZE(RS_RET_IO_ERROR);
+			ABORT_FINALIZE(RS_RET_FILE_OPEN_ERROR);
 	}
 
 	if(pThis->tOperationsMode == STREAMMODE_READ) {
@@ -322,6 +339,7 @@ finalize_it:
 static rsRetVal strmOpenFile(strm_t *pThis)
 {
 	DEFiRet;
+	off_t offset;
 
 	ASSERT(pThis != NULL);
 
@@ -337,11 +355,22 @@ static rsRetVal strmOpenFile(strm_t *pThis)
 	CHKiRet(doPhysOpen(pThis));
 
 	pThis->iCurrOffs = 0;
+	CHKiRet(getFileSize(pThis->pszCurrFName, &offset));
 	if(pThis->tOperationsMode == STREAMMODE_WRITE_APPEND) {
-		/* we need to obtain the current offset */
-		off_t offset;
-		CHKiRet(getFileSize(pThis->pszCurrFName, &offset));
 		pThis->iCurrOffs = offset;
+	} else if(pThis->tOperationsMode == STREAMMODE_WRITE) {
+		if(offset != 0) {
+			// TODO: check the exact condition under which this occurs. It
+			// looks OK, seems like the queue code uses a side-effect that makes
+			// this a valid sequence!
+			/*errmsg.LogError(0, 0, "queue '%s', file '%s' opened for non-append write, but "
+				"already contains %zd bytes\n",
+				obj.GetName((obj_t*) pThis), pThis->pszCurrFName, offset);
+			*/
+			DBGPRINTF("queue '%s', file '%s' opened for non-append write, but "
+				"already contains %lld bytes\n",
+				obj.GetName((obj_t*) pThis), pThis->pszCurrFName, (long long) offset);
+		}
 	}
 
 	DBGOPRINT((obj_t*) pThis, "opened file '%s' for %s as %d\n", pThis->pszCurrFName,
@@ -354,7 +383,6 @@ finalize_it:
 			pThis->pszCurrFName = NULL; /* just to prevent mis-adressing down the road... */
 		}
 		if(pThis->fd != -1) {
-dbgprintf("DDDD: strmOpenFile closes: %d\n", pThis->fd);
 			close(pThis->fd);
 			pThis->fd = -1;
 		}
@@ -367,7 +395,7 @@ dbgprintf("DDDD: strmOpenFile closes: %d\n", pThis->fd);
  * that require data to be persisted. May be called in non-async mode and is a null
  * operation than. Must be called with the mutex locked.
  */
-static inline void
+static void
 strmWaitAsyncWriterDone(strm_t *pThis)
 {
 	BEGINfunc
@@ -396,8 +424,8 @@ static rsRetVal strmCloseFile(strm_t *pThis)
 	DEFiRet;
 
 	ASSERT(pThis != NULL);
-	DBGOPRINT((obj_t*) pThis, "file %d(%s) closing\n", pThis->fd,
-		  (pThis->pszFName == NULL) ? "N/A" : (char*)pThis->pszFName);
+	DBGOPRINT((obj_t*) pThis, "file %d(%s) closing, bDeleteOnClose %d\n", pThis->fd,
+		getFileDebugName(pThis), pThis->bDeleteOnClose);
 
 	if(pThis->tOperationsMode != STREAMMODE_READ) {
 		strmFlushInternal(pThis, 0);
@@ -420,7 +448,6 @@ static rsRetVal strmCloseFile(strm_t *pThis)
 	 */
 	if(pThis->fd != -1) {
 		currOffs = lseek64(pThis->fd, 0, SEEK_CUR);
-dbgprintf("DDDD: strmCloseFile: %d\n", pThis->fd);
 		close(pThis->fd);
 		pThis->fd = -1;
 		pThis->inode = 0;
@@ -450,13 +477,13 @@ dbgprintf("DDDD: strmCloseFile: %d\n", pThis->fd);
 			DBGPRINTF("error %d unlinking '%s' - ignored: %s\n",
 				   errno, pThis->pszCurrFName, errStr);
 		}
-		free(pThis->pszCurrFName);
-		pThis->pszCurrFName = NULL;
 	}
 
 	pThis->iCurrOffs = 0;	/* we are back at begin of file */
 
 finalize_it:
+	free(pThis->pszCurrFName);
+	pThis->pszCurrFName = NULL;
 	RETiRet;
 }
 
@@ -469,9 +496,10 @@ strmNextFile(strm_t *pThis)
 {
 	DEFiRet;
 
-	ASSERT(pThis != NULL);
-	ASSERT(pThis->iMaxFiles != 0);
-	ASSERT(pThis->fd != -1);
+	assert(pThis != NULL);
+	assert(pThis->sType == STREAMTYPE_FILE_CIRCULAR);
+	assert(pThis->iMaxFiles != 0);
+	assert(pThis->fd != -1);
 
 	CHKiRet(strmCloseFile(pThis));
 
@@ -511,13 +539,17 @@ strmHandleEOFMonitor(strm_t *pThis)
 	DBGPRINTF("stream checking for file change on '%s', inode %u/%u\n",
 	  pThis->pszCurrFName, (unsigned) pThis->inode,
 	  (unsigned) statName.st_ino);
-	if(pThis->inode == statName.st_ino) {
-		ABORT_FINALIZE(RS_RET_EOF);
-	} else {
-		/* we had a file change! */
+
+	/* Inode unchanged but file size on disk is less than current offset
+	 * means file was truncated, we also reopen if 'reopenOnTruncate' is on
+	 */
+	if (pThis->inode != statName.st_ino
+		  || (pThis->bReopenOnTruncate && statName.st_size < pThis->iCurrOffs)) {
 		DBGPRINTF("we had a file change on '%s'\n", pThis->pszCurrFName);
 		CHKiRet(strmCloseFile(pThis));
 		CHKiRet(strmOpenFile(pThis));
+	} else {
+		ABORT_FINALIZE(RS_RET_EOF);
 	}
 
 finalize_it:
@@ -621,6 +653,18 @@ finalize_it:
 }
 
 
+/* debug output of current buffer */
+void
+strmDebugOutBuf(const strm_t *const pThis)
+{
+	int strtIdx = pThis->iBufPtr - 50;
+	if(strtIdx < 0)
+		strtIdx = 0;
+	DBGOPRINT((obj_t*) pThis, "strmRead index %zd, max %zd, buf '%.*s'\n",
+		pThis->iBufPtr, pThis->iBufPtrMax, (int) pThis->iBufPtrMax - strtIdx,
+		pThis->pIOBuf+strtIdx);
+}
+
 /* logically "read" a character from a file. What actually happens is that
  * data is taken from the buffer. Only if the buffer is full, data is read 
  * directly from file. In that case, a read is performed blockwise.
@@ -636,7 +680,7 @@ static rsRetVal strmReadChar(strm_t *pThis, uchar *pC)
 	ASSERT(pThis != NULL);
 	ASSERT(pC != NULL);
 
-	/* DEV debug only: DBGOPRINT((obj_t*) pThis, "strmRead index %d, max %d\n", pThis->iBufPtr, pThis->iBufPtrMax); */
+	/* DEV debug only: DBGOPRINT((obj_t*) pThis, "strmRead index %zd, max %zd\n", pThis->iBufPtr, pThis->iBufPtrMax); */
 	if(pThis->iUngetC != -1) {	/* do we have an "unread" char that we need to provide? */
 		*pC = pThis->iUngetC;
 		++pThis->iCurrOffs; /* one more octet read */
@@ -682,19 +726,19 @@ static rsRetVal strmUnreadChar(strm_t *pThis, uchar c)
  * The termination LF characters are read, but are
  * not returned in the buffer (it is discared). The caller is responsible for
  * destruction of the returned CStr object! -- dlang 2010-12-13
+ *
+ * Parameter mode controls legacy multi-line processing:
+ * mode = 0 single line mode (equivalent to ReadLine)
+ * mode = 1 LFLF mode (paragraph, blank line between entries)
+ * mode = 2 LF <not whitespace> mode, a log line starts at the beginning of
+ * a line, but following lines that are indented are part of the same log entry
  */
 static rsRetVal
-strmReadLine(strm_t *pThis, cstr_t **ppCStr, uint8_t mode, sbool bEscapeLF)
+strmReadLine(strm_t *pThis, cstr_t **ppCStr, uint8_t mode, sbool bEscapeLF, uint32_t trimLineOverBytes)
 {
-	/* mode = 0 single line mode (equivalent to ReadLine)
-         * mode = 1 LFLF mode (paragraph, blank line between entries)
-         * mode = 2 LF <not whitespace> mode, a log line starts at the beginning of a line, but following lines that are indented are part of the same log entry
-	 *  This modal interface is not nearly as flexible as being able to define a regex for when a new record starts, but it's also not nearly as hard (or as slow) to implement
-         */
         uchar c;
 	uchar finished;
 	rsRetVal readCharRet;
-	sbool bPrevWasNL;
         DEFiRet;
 
         ASSERT(pThis != NULL);
@@ -703,32 +747,40 @@ strmReadLine(strm_t *pThis, cstr_t **ppCStr, uint8_t mode, sbool bEscapeLF)
         CHKiRet(cstrConstruct(ppCStr));
         CHKiRet(strmReadChar(pThis, &c));
 
+	/* append previous message to current message if necessary */
+	if(pThis->prevLineSegment != NULL) {
+		dbgprintf("readLine: have previous line segment: '%s'\n",
+			rsCStrGetSzStrNoNULL(pThis->prevLineSegment));
+		CHKiRet(cstrAppendCStr(*ppCStr, pThis->prevLineSegment));
+		cstrDestruct(&pThis->prevLineSegment);
+	}
         if(mode == 0) {
-		/* append previous message to current message if necessary */
-		if(pThis->prevLineSegment != NULL) {
-			CHKiRet(cstrAppendCStr(*ppCStr, pThis->prevLineSegment));
-			cstrDestruct(&pThis->prevLineSegment);
-		}
 		while(c != '\n') {
-                	CHKiRet(cstrAppendChar(*ppCStr, c));
-                	readCharRet = strmReadChar(pThis, &c);
-                	if(readCharRet == RS_RET_EOF) {/* end of file reached without \n? */
+			CHKiRet(cstrAppendChar(*ppCStr, c));
+			readCharRet = strmReadChar(pThis, &c);
+			if((readCharRet == RS_RET_TIMED_OUT) ||
+			   (readCharRet == RS_RET_EOF) ) { /* end reached without \n? */
 				CHKiRet(rsCStrConstructFromCStr(&pThis->prevLineSegment, *ppCStr));
                 	}
                 	CHKiRet(readCharRet);
         	}
-        	CHKiRet(cstrFinalize(*ppCStr));
+		if (trimLineOverBytes > 0 && (uint32_t) cstrLen(*ppCStr) > trimLineOverBytes) {
+			/* Truncate long line at trimLineOverBytes position */
+			dbgprintf("Truncate long line at %u, mode %d\n", trimLineOverBytes, mode);
+			rsCStrTruncate(*ppCStr, cstrLen(*ppCStr) - trimLineOverBytes);
+			cstrAppendChar(*ppCStr, '\n');
+		}
+		cstrFinalize(*ppCStr);
 	} else if(mode == 1) {
 		finished=0;
-		bPrevWasNL = 0;
 		while(finished == 0){
         		if(c != '\n') {
                 		CHKiRet(cstrAppendChar(*ppCStr, c));
                 		CHKiRet(strmReadChar(pThis, &c));
-				bPrevWasNL = 0;
+				pThis->bPrevWasNL = 0;
 			} else {
 				if ((((*ppCStr)->iStrLen) > 0) ){
-					if(bPrevWasNL) {
+					if(pThis->bPrevWasNL) {
 						rsCStrTruncate(*ppCStr, (bEscapeLF) ? 4 : 1); /* remove the prior newline */
 						finished=1;
 					} else {
@@ -738,18 +790,18 @@ strmReadLine(strm_t *pThis, cstr_t **ppCStr, uint8_t mode, sbool bEscapeLF)
 							CHKiRet(cstrAppendChar(*ppCStr, c));
 						}
                					CHKiRet(strmReadChar(pThis, &c));
-						bPrevWasNL = 1;
+						pThis->bPrevWasNL = 1;
 					}
 				} else {
 					finished=1;  /* this is a blank line, a \n with nothing since the last complete record */
 				}
 			}
 		}
-        	CHKiRet(cstrFinalize(*ppCStr));
+		cstrFinalize(*ppCStr);
+		pThis->bPrevWasNL = 0;
 	} else if(mode == 2) {
 		/* indented follow-up lines */
 		finished=0;
-		bPrevWasNL = 0;
 		while(finished == 0){
 			if ((*ppCStr)->iStrLen == 0){
         			if(c != '\n') {
@@ -760,11 +812,11 @@ strmReadLine(strm_t *pThis, cstr_t **ppCStr, uint8_t mode, sbool bEscapeLF)
 					finished=1;  /* this is a blank line, a \n with nothing since the last complete record */
 				}
 			} else {
-				if(bPrevWasNL) {
+				if(pThis->bPrevWasNL) {
 					if ((c == ' ') || (c == '\t')){
                					CHKiRet(cstrAppendChar(*ppCStr, c));
                					CHKiRet(strmReadChar(pThis, &c));
-						bPrevWasNL = 0;
+						pThis->bPrevWasNL = 0;
 					} else {
 						/* clean things up by putting the character we just read back into
 						 * the input buffer and removing the LF character that is currently at the
@@ -775,7 +827,7 @@ strmReadLine(strm_t *pThis, cstr_t **ppCStr, uint8_t mode, sbool bEscapeLF)
 					}
 				} else { /* not the first character after a newline, add it to the buffer */
 					if(c == '\n') {
-						bPrevWasNL = 1;
+						pThis->bPrevWasNL = 1;
 						if(bEscapeLF) {
 							CHKiRet(rsCStrAppendStrWithLen(*ppCStr, (uchar*)"#012", sizeof("#012")-1));
 						} else {
@@ -788,16 +840,126 @@ strmReadLine(strm_t *pThis, cstr_t **ppCStr, uint8_t mode, sbool bEscapeLF)
 				}
 			}
 		}
-       		CHKiRet(cstrFinalize(*ppCStr));
+		if (trimLineOverBytes > 0 && (uint32_t) cstrLen(*ppCStr) > trimLineOverBytes) {
+			/* Truncate long line at trimLineOverBytes position */
+			dbgprintf("Truncate long line at %u, mode %d\n", trimLineOverBytes, mode);
+			rsCStrTruncate(*ppCStr, cstrLen(*ppCStr) - trimLineOverBytes);
+			cstrAppendChar(*ppCStr, '\n');
+		}
+		cstrFinalize(*ppCStr);
+		pThis->bPrevWasNL = 0;
 	}
 
 finalize_it:
-        if(iRet != RS_RET_OK && *ppCStr != NULL)
+        if(iRet != RS_RET_OK && *ppCStr != NULL) {
+		if(cstrLen(*ppCStr) > 0) {
+		/* we may have an empty string in an unsuccsfull poll or after restart! */
+			rsCStrConstructFromCStr(&pThis->prevLineSegment, *ppCStr);
+		}
                 cstrDestruct(ppCStr);
+	}
 
         RETiRet;
 }
 
+/* check if the current multi line read is timed out
+ * @return 0 - no timeout, something else - timeout
+ */
+int
+strmReadMultiLine_isTimedOut(const strm_t *const __restrict__ pThis)
+{
+	/* note: order of evaluation is choosen so that the most inexpensive
+	 * processing flow is used.
+	 */
+	return(   (pThis->readTimeout)
+	       && (pThis->prevMsgSegment != NULL)
+	       && (getTime(NULL) > pThis->lastRead + pThis->readTimeout) );
+}
+
+/* read a multi-line message from a strm file.
+ * The multi-line message is terminated based on the user-provided
+ * startRegex (Posix ERE). For performance reasons, the regex
+ * must already have been compiled by the user.
+ * added 2015-05-12 rgerhards
+ */
+rsRetVal
+strmReadMultiLine(strm_t *pThis, cstr_t **ppCStr, regex_t *preg, const sbool bEscapeLF)
+{
+        uchar c;
+	uchar finished = 0;
+	cstr_t *thisLine = NULL;
+	rsRetVal readCharRet;
+	const time_t tCurr = pThis->readTimeout ? getTime(NULL) : 0;
+        DEFiRet;
+
+	do {
+		CHKiRet(strmReadChar(pThis, &c)); /* immediately exit on EOF */
+		pThis->lastRead = tCurr;
+		CHKiRet(cstrConstruct(&thisLine));
+		/* append previous message to current message if necessary */
+		if(pThis->prevLineSegment != NULL) {
+			CHKiRet(cstrAppendCStr(thisLine, pThis->prevLineSegment));
+			cstrDestruct(&pThis->prevLineSegment);
+		}
+
+		while(c != '\n') {
+			CHKiRet(cstrAppendChar(thisLine, c));
+			readCharRet = strmReadChar(pThis, &c);
+			if(readCharRet == RS_RET_EOF) {/* end of file reached without \n? */
+				CHKiRet(rsCStrConstructFromCStr(&pThis->prevLineSegment, thisLine));
+			}
+			CHKiRet(readCharRet);
+		}
+		cstrFinalize(thisLine);
+
+		/* we have a line, now let's assemble the message */
+		const int isMatch = !regexec(preg, (char*)rsCStrGetSzStrNoNULL(thisLine), 0, NULL, 0);
+
+		if(isMatch) {
+			/* in this case, the *previous* message is complete and we are
+			 * at the start of a new one.
+			 */
+			if(pThis->prevMsgSegment != NULL) {
+				/* may be NULL in initial poll! */
+				finished = 1;
+				*ppCStr = pThis->prevMsgSegment;
+			}
+			CHKiRet(rsCStrConstructFromCStr(&pThis->prevMsgSegment, thisLine));
+			
+		} else {
+			if(pThis->prevMsgSegment == NULL) {
+				/* may be NULL in initial poll or after timeout! */
+				CHKiRet(rsCStrConstructFromCStr(&pThis->prevMsgSegment, thisLine));
+			} else {
+				if(bEscapeLF) {
+					rsCStrAppendStrWithLen(pThis->prevMsgSegment, (uchar*)"\\n", 2);
+				} else {
+					cstrAppendChar(pThis->prevMsgSegment, '\n');
+				}
+				if(cstrLen(thisLine) > 0) {
+					CHKiRet(cstrAppendCStr(pThis->prevMsgSegment, thisLine));
+					/* we could do this faster, but for now keep it simple */
+				}
+
+			}
+		}
+		cstrDestruct(&thisLine);
+	} while(finished == 0);
+
+finalize_it:
+	if(   pThis->readTimeout
+	   && (iRet != RS_RET_OK)
+	   && (pThis->prevMsgSegment != NULL)
+	   && (tCurr > pThis->lastRead + pThis->readTimeout)) {
+		CHKiRet(rsCStrConstructFromCStr(ppCStr, pThis->prevMsgSegment));
+		cstrDestruct(&pThis->prevMsgSegment);
+		pThis->lastRead = tCurr;
+		dbgprintf("stream: generated msg based on timeout: %s\n", cstrGetSzStrNoNULL(*ppCStr));
+			FINALIZE;
+		iRet = RS_RET_OK;
+	}
+        RETiRet;
+}
 
 /* Standard-Constructor for the strm object
  */
@@ -812,6 +974,8 @@ BEGINobjConstruct(strm) /* be sure to specify the object type also in END macro!
 	pThis->tOpenMode = 0600;
 	pThis->pszSizeLimitCmd = NULL;
 	pThis->prevLineSegment = NULL;
+	pThis->prevMsgSegment = NULL;
+	pThis->bPrevWasNL = 0;
 ENDobjConstruct(strm)
 
 
@@ -838,12 +1002,12 @@ static rsRetVal strmConstructFinalize(strm_t *pThis)
 			 * to make sure we can write out everything with a SINGLE api call!
 			 * We add another 128 bytes to take care of the gzip header and "all eventualities".
 			 */
-			CHKmalloc(pThis->pZipBuf = (Bytef*) MALLOC(sizeof(uchar) * (pThis->sIOBufSize + 128)));
+			CHKmalloc(pThis->pZipBuf = (Bytef*) MALLOC(pThis->sIOBufSize + 128));
 		}
 	}
 
 	/* if we are set to sync, we must obtain a file handle to the directory for fsync() purposes */
-	if(pThis->bSync && !pThis->bIsTTY) {
+	if(pThis->bSync && !pThis->bIsTTY && pThis->pszDir != NULL) {
 		pThis->fdDir = open((char*)pThis->pszDir, O_RDONLY | O_CLOEXEC | O_NOCTTY);
 		if(pThis->fdDir == -1) {
 			char errStr[1024];
@@ -854,13 +1018,14 @@ static rsRetVal strmConstructFinalize(strm_t *pThis)
 		}
 	}
 
-	DBGPRINTF("file stream %s params: flush interval %d, async write %d\n",
-		  (pThis->pszFName == NULL) ? "N/A" : (char*)pThis->pszFName,
-		  pThis->iFlushInterval, pThis->bAsyncWrite);
 	/* if we have a flush interval, we need to do async writes in any case */
 	if(pThis->iFlushInterval != 0) {
 		pThis->bAsyncWrite = 1;
 	}
+
+	DBGPRINTF("file stream %s params: flush interval %d, async write %d\n",
+		  getFileDebugName(pThis),
+		  pThis->iFlushInterval, pThis->bAsyncWrite);
 
 	/* if we work asynchronously, we need a couple of synchronization objects */
 	if(pThis->bAsyncWrite) {
@@ -870,21 +1035,17 @@ static rsRetVal strmConstructFinalize(strm_t *pThis)
 		pthread_cond_init(&pThis->isEmpty, 0);
 		pThis->iCnt = pThis->iEnq = pThis->iDeq = 0;
 		for(i = 0 ; i < STREAM_ASYNC_NUMBUFS ; ++i) {
-			CHKmalloc(pThis->asyncBuf[i].pBuf = (uchar*) MALLOC(sizeof(uchar) * pThis->sIOBufSize));
+			CHKmalloc(pThis->asyncBuf[i].pBuf = (uchar*) MALLOC(pThis->sIOBufSize));
 		}
 		pThis->pIOBuf = pThis->asyncBuf[0].pBuf;
 		pThis->bStopWriter = 0;
 		if(pthread_create(&pThis->writerThreadID,
-#ifdef HAVE_PTHREAD_SETSCHEDPARAM
 			    	  &default_thread_attr,
-#else
-				  NULL,
-#endif
 				  asyncWriterThread, pThis) != 0)
 			DBGPRINTF("ERROR: stream %p cold not create writer thread\n", pThis);
 	} else {
 		/* we work synchronously, so we need to alloc a fixed pIOBuf */
-		CHKmalloc(pThis->pIOBuf = (uchar*) MALLOC(sizeof(uchar) * pThis->sIOBufSize));
+		CHKmalloc(pThis->pIOBuf = (uchar*) MALLOC(pThis->sIOBufSize));
 	}
 
 finalize_it:
@@ -895,7 +1056,7 @@ finalize_it:
 /* stop the writer thread (we MUST be runnnig asynchronously when this method
  * is called!). Note that the mutex must be locked! -- rgerhards, 2009-07-06
  */
-static inline void
+static void
 stopWriter(strm_t *pThis)
 {
 	BEGINfunc
@@ -938,6 +1099,10 @@ CODESTARTobjDestruct(strm)
 	 * IMPORTANT: we MUST free this only AFTER the ansyncWriter has been stopped, else
 	 * we get random errors...
 	 */
+	if(pThis->prevLineSegment)
+		cstrDestruct(&pThis->prevLineSegment);
+	if(pThis->prevMsgSegment)
+		cstrDestruct(&pThis->prevMsgSegment);
 	free(pThis->pszDir);
 	free(pThis->pZipBuf);
 	free(pThis->pszCurrFName);
@@ -956,7 +1121,7 @@ static rsRetVal strmCheckNextOutputFile(strm_t *pThis)
 {
 	DEFiRet;
 
-	if(pThis->fd == -1)
+	if(pThis->fd == -1 || pThis->sType != STREAMTYPE_FILE_CIRCULAR)
 		FINALIZE;
 
 	/* wait for output to be empty, so that our counts are correct */
@@ -986,7 +1151,14 @@ tryTTYRecover(strm_t *pThis, int err)
 {
 	DEFiRet;
 	ISOBJ_TYPE_assert(pThis, strm);
+#ifndef __FreeBSD__
 	if(err == ERR_TTYHUP) {
+#else
+	/* Try to reopen our file descriptor even on errno 6, FreeBSD bug 200429
+	 * Also try on errno 5, FreeBSD bug 211033
+	 */
+	if(err == ERR_TTYHUP || err == ENXIO || err == EIO) {
+#endif /* __FreeBSD__ */
 		close(pThis->fd);
 		CHKiRet(doPhysOpen(pThis));
 	}
@@ -1012,11 +1184,28 @@ doWriteCall(strm_t *pThis, uchar *pBuf, size_t *pLenBuf)
 	char *pWriteBuf;
 	DEFiRet;
 	ISOBJ_TYPE_assert(pThis, strm);
+#ifdef __FreeBSD__
+	sbool crnlNow = 0;
+#endif /* __FreeBSD__ */
 
 	lenBuf = *pLenBuf;
 	pWriteBuf = (char*) pBuf;
 	iTotalWritten = 0;
 	do {
+#ifdef __FreeBSD__
+		if (pThis->bIsTTY && !pThis->iZipLevel && !pThis->cryprov) {
+			char *pNl = NULL;
+			if (crnlNow == 0) pNl = strchr(pWriteBuf, '\n');
+			else crnlNow = 0;
+			if (pNl == pWriteBuf) {
+				iWritten = write(pThis->fd, "\r", 1);
+				if (iWritten > 0) {
+					crnlNow = 1;
+					iWritten = 0;
+				}
+			} else iWritten = write(pThis->fd, pWriteBuf, pNl ? pNl - pWriteBuf : lenBuf);
+		} else
+#endif /* __FreeBSD__ */
 		iWritten = write(pThis->fd, pWriteBuf, lenBuf);
 		if(iWritten < 0) {
 			char errStr[1024];
@@ -1026,6 +1215,10 @@ doWriteCall(strm_t *pThis, uchar *pBuf, size_t *pLenBuf)
 			DBGPRINTF("log file (%d) write error %d: %s\n", pThis->fd, err, errStr);
 			if(err == EINTR) {
 				/*NO ERROR, just continue */;
+			} else if( !pThis->bIsTTY && ( err == ENOTCONN  || err == EIO )) {
+				/* Failure for network file system, thus file needs to be closed and reopened. */
+				close(pThis->fd);
+				CHKiRet(doPhysOpen(pThis));
 			} else {
 				if(pThis->bIsTTY) {
 					CHKiRet(tryTTYRecover(pThis, err));
@@ -1054,12 +1247,13 @@ finalize_it:
 
 /* write memory buffer to a stream object.
  */
-static inline rsRetVal
-doWriteInternal(strm_t *pThis, uchar *pBuf, size_t lenBuf, int bFlush)
+static rsRetVal
+doWriteInternal(strm_t *pThis, uchar *pBuf, const size_t lenBuf, const int bFlush)
 {
 	DEFiRet;
 
-	ASSERT(pThis != NULL);
+	DBGOPRINT((obj_t*) pThis, "file %d(%s) doWriteInternal: bFlush %d\n",
+		pThis->fd, getFileDebugName(pThis), bFlush);
 
 	if(pThis->iZipLevel) {
 		CHKiRet(doZipWrite(pThis, pBuf, lenBuf, bFlush));
@@ -1081,22 +1275,34 @@ finalize_it:
  * the very some producer comes back in sequence to submit the then-filled buffers.
  * This also enables us to timout on partially written buffers. -- rgerhards, 2009-07-06
  */
-static inline rsRetVal
-doAsyncWriteInternal(strm_t *pThis, size_t lenBuf)
+static rsRetVal
+doAsyncWriteInternal(strm_t *pThis, size_t lenBuf, const int bFlushZip)
 {
 	DEFiRet;
 	ISOBJ_TYPE_assert(pThis, strm);
 
+	DBGOPRINT((obj_t*) pThis, "file %d(%s) doAsyncWriteInternal at begin: "
+		"iCnt %d, iEnq %d, bFlushZip %d\n",
+		pThis->fd, getFileDebugName(pThis),
+		pThis->iCnt, pThis->iEnq, bFlushZip);
 	/* the -1 below is important, because we need one buffer for the main thread! */
 	while(pThis->iCnt >= STREAM_ASYNC_NUMBUFS - 1)
 		d_pthread_cond_wait(&pThis->notFull, &pThis->mut);
 
 	pThis->asyncBuf[pThis->iEnq % STREAM_ASYNC_NUMBUFS].lenBuf = lenBuf;
 	pThis->pIOBuf = pThis->asyncBuf[++pThis->iEnq % STREAM_ASYNC_NUMBUFS].pBuf;
+	if(!pThis->bFlushNow) /* if we already need to flush, do not overwrite */
+		pThis->bFlushNow = bFlushZip;
 
 	pThis->bDoTimedWait = 0; /* everything written, no need to timeout partial buffer writes */
-	if(++pThis->iCnt == 1)
+	if(++pThis->iCnt == 1) {
 		pthread_cond_signal(&pThis->notEmpty);
+		DBGOPRINT((obj_t*) pThis, "doAsyncWriteInternal signaled notEmpty\n");
+	}
+	DBGOPRINT((obj_t*) pThis, "file %d(%s) doAsyncWriteInternal at exit: "
+		"iCnt %d, iEnq %d, bFlushZip %d\n",
+		pThis->fd, getFileDebugName(pThis),
+		pThis->iCnt, pThis->iEnq, bFlushZip);
 
 	RETiRet;
 }
@@ -1107,7 +1313,7 @@ doAsyncWriteInternal(strm_t *pThis, size_t lenBuf)
  * the background thread. -- rgerhards, 2009-07-07
  */
 static rsRetVal
-strmSchedWrite(strm_t *pThis, uchar *pBuf, size_t lenBuf, int bFlushZip)
+strmSchedWrite(strm_t *pThis, uchar *pBuf, size_t lenBuf, const int bFlushZip)
 {
 	DEFiRet;
 
@@ -1124,7 +1330,7 @@ strmSchedWrite(strm_t *pThis, uchar *pBuf, size_t lenBuf, int bFlushZip)
 	 */
 	pThis->iBufPtr = 0; /* we are at the begin of a new buffer */
 	if(pThis->bAsyncWrite) {
-		CHKiRet(doAsyncWriteInternal(pThis, lenBuf));
+		CHKiRet(doAsyncWriteInternal(pThis, lenBuf, bFlushZip));
 	} else {
 		CHKiRet(doWriteInternal(pThis, pBuf, lenBuf, bFlushZip));
 	}
@@ -1153,7 +1359,7 @@ asyncWriterThread(void *pPtr)
 	BEGINfunc
 	ustrncpy(thrdName+3, pThis->pszFName, sizeof(thrdName)-4);
 	dbgOutputTID((char*)thrdName);
-#	if HAVE_PRCTL && defined PR_SET_NAME
+#	if defined(HAVE_PRCTL) && defined(PR_SET_NAME)
 	if(prctl(PR_SET_NAME, (char*)thrdName, 0, 0, 0) != 0) {
 		DBGPRINTF("prctl failed, not setting thread name for '%s'\n", "stream writer");
 	}
@@ -1162,6 +1368,10 @@ asyncWriterThread(void *pPtr)
 	d_pthread_mutex_lock(&pThis->mut);
 	while(1) { /* loop broken inside */
 		while(pThis->iCnt == 0) {
+			DBGOPRINT((obj_t*) pThis, "file %d(%s) asyncWriterThread new iteration, "
+				  "iCnt %d, bTimedOut %d, iFlushInterval %d\n", pThis->fd,
+				  getFileDebugName(pThis),
+				  pThis->iCnt, bTimedOut, pThis->iFlushInterval);
 			if(pThis->bStopWriter) {
 				pthread_cond_broadcast(&pThis->isEmpty);
 				d_pthread_mutex_unlock(&pThis->mut);
@@ -1169,15 +1379,18 @@ asyncWriterThread(void *pPtr)
 			}
 			if(bTimedOut && pThis->iBufPtr > 0) {
 				/* if we timed out, we need to flush pending data */
-				strmFlushInternal(pThis, 0);
-				bTimedOut = 0;
 				d_pthread_mutex_unlock(&pThis->mut);
+				strmFlushInternal(pThis, 1);
+				bTimedOut = 0;
+				d_pthread_mutex_lock(&pThis->mut); 
 				continue;
 			}
 			bTimedOut = 0;
-			timeoutComp(&t, pThis->iFlushInterval * 1000); /* *1000 millisconds */
 			if(pThis->bDoTimedWait) {
+				timeoutComp(&t, pThis->iFlushInterval * 1000); /* 1000 *millisconds* */
 				if((err = pthread_cond_timedwait(&pThis->notEmpty, &pThis->mut, &t)) != 0) {
+					DBGOPRINT((obj_t*) pThis, "file %d(%s) asyncWriterThread timed out\n",
+						  pThis->fd, getFileDebugName(pThis));
 					bTimedOut = 1; /* simulate in any case */
 					if(err != ETIMEDOUT) {
 						char errStr[1024];
@@ -1191,13 +1404,18 @@ asyncWriterThread(void *pPtr)
 			}
 		}
 
+		DBGOPRINT((obj_t*) pThis, "file %d(%s) asyncWriterThread awoken, "
+			  "iCnt %d, bTimedOut %d\n", pThis->fd, getFileDebugName(pThis),
+			  pThis->iCnt, bTimedOut);
 		bTimedOut = 0; /* we may have timed out, but there *is* work to do... */
 
 		iDeq = pThis->iDeq++ % STREAM_ASYNC_NUMBUFS;
+		const int bFlush = (pThis->bFlushNow || bTimedOut) ? 1 : 0;
+		pThis->bFlushNow = 0;
 
 		/* now we can do the actual write in parallel */
 		d_pthread_mutex_unlock(&pThis->mut);
-		doWriteInternal(pThis, pThis->asyncBuf[iDeq].pBuf, pThis->asyncBuf[iDeq].lenBuf, 0); // TODO: flush state
+		doWriteInternal(pThis, pThis->asyncBuf[iDeq].pBuf, pThis->asyncBuf[iDeq].lenBuf, bFlush);
 		// TODO: error check????? 2009-07-06
 		d_pthread_mutex_lock(&pThis->mut);
 
@@ -1208,7 +1426,7 @@ asyncWriterThread(void *pPtr)
 				pthread_cond_broadcast(&pThis->isEmpty);
 		}
 	}
-	d_pthread_mutex_unlock(&pThis->mut);
+	/* Not reached */	
 
 finalize_it:
 	ENDfunc
@@ -1224,7 +1442,7 @@ finalize_it:
  * have it). -- rgerhards, 2009-06-08
  */
 #undef SYNCCALL
-#if HAVE_FDATASYNC
+#ifdef HAVE_FDATASYNC
 #	define SYNCCALL(x) fdatasync(x)
 #else
 #	define SYNCCALL(x) fsync(x)
@@ -1249,7 +1467,8 @@ syncFile(strm_t *pThis)
 	}
 	
 	if(pThis->fdDir != -1) {
-		ret = fsync(pThis->fdDir);
+		if(fsync(pThis->fdDir) != 0)
+			DBGPRINTF("stream/syncFile: fsync returned error, ignoring\n");
 	}
 
 finalize_it:
@@ -1315,7 +1534,7 @@ finalize_it:
  * rgerhards, 2009-06-04
  */
 static rsRetVal
-doZipWrite(strm_t *pThis, uchar *pBuf, size_t lenBuf, int bFlush)
+doZipWrite(strm_t *pThis, uchar *pBuf, size_t lenBuf, const int bFlush)
 {
 	int zRet;	/* zlib return state */
 	DEFiRet;
@@ -1342,12 +1561,14 @@ doZipWrite(strm_t *pThis, uchar *pBuf, size_t lenBuf, int bFlush)
 	pThis->zstrm.avail_in = lenBuf;
 	/* run deflate() on buffer until everything has been compressed */
 	do {
-		DBGPRINTF("in deflate() loop, avail_in %d, total_in %ld\n", pThis->zstrm.avail_in, pThis->zstrm.total_in);
+		DBGPRINTF("in deflate() loop, avail_in %d, total_in %ld, bFlush %d\n",
+			pThis->zstrm.avail_in, pThis->zstrm.total_in, bFlush);
 		pThis->zstrm.avail_out = pThis->sIOBufSize;
 		pThis->zstrm.next_out = pThis->pZipBuf;
 		zRet = zlibw.Deflate(&pThis->zstrm, bFlush ? Z_SYNC_FLUSH : Z_NO_FLUSH);    /* no bad return value */
-		DBGPRINTF("after deflate, ret %d, avail_out %d\n", zRet, pThis->zstrm.avail_out);
 		outavail =pThis->sIOBufSize - pThis->zstrm.avail_out;
+		DBGPRINTF("after deflate, ret %d, avail_out %d, to write %d\n",
+			zRet, pThis->zstrm.avail_out, outavail);
 		if(outavail != 0) {
 			CHKiRet(strmPhysWrite(pThis, (uchar*)pThis->pZipBuf, outavail));
 		}
@@ -1410,8 +1631,8 @@ strmFlushInternal(strm_t *pThis, int bFlushZip)
 	DEFiRet;
 
 	ASSERT(pThis != NULL);
-	DBGOPRINT((obj_t*) pThis, "file %d(%s) flush, buflen %ld%s\n", pThis->fd,
-		  (pThis->pszFName == NULL) ? "N/A" : (char*)pThis->pszFName,
+	DBGOPRINT((obj_t*) pThis, "strmFlushinternal: file %d(%s) flush, buflen %ld%s\n", pThis->fd,
+		  getFileDebugName(pThis),
 		  (long) pThis->iBufPtr, (pThis->iBufPtr == 0) ? " (no need to flush)" : "");
 
 	if(pThis->tOperationsMode != STREAMMODE_READ && pThis->iBufPtr > 0) {
@@ -1487,7 +1708,7 @@ finalize_it:
  * rgerhards, 2012-11-07
  */
 rsRetVal
-strmMultiFileSeek(strm_t *pThis, int FNum, off64_t offs, off64_t *bytesDel)
+strmMultiFileSeek(strm_t *pThis, unsigned int FNum, off64_t offs, off64_t *bytesDel)
 {
 	struct stat statBuf;
 	DEFiRet;
@@ -1509,7 +1730,7 @@ strmMultiFileSeek(strm_t *pThis, int FNum, off64_t offs, off64_t *bytesDel)
 				    pThis->iFileNumDigits));
 		stat((char*)pThis->pszCurrFName, &statBuf);
 		*bytesDel = statBuf.st_size;
-		DBGPRINTF("strmMultiFileSeek: detected new filenum, was %d, new %d, "
+		DBGPRINTF("strmMultiFileSeek: detected new filenum, was %u, new %u, "
 			  "deleting '%s' (%lld bytes)\n", pThis->iCurrFNum, FNum,
 			  pThis->pszCurrFName, (long long) *bytesDel);
 		unlink((char*)pThis->pszCurrFName);
@@ -1633,7 +1854,9 @@ strmWrite(strm_t *__restrict__ const pThis, const uchar *__restrict__ const pBuf
 	ASSERT(pThis != NULL);
 	ASSERT(pBuf != NULL);
 
-	/* DEV DEBUG ONLY DBGPRINTF("strmWrite(%p[%s], '%65.65s', %ld);, disabled %d, sizelim %ld, size %lld\n", pThis, pThis->pszCurrFName, pBuf,(long) lenBuf, pThis->bDisabled, (long) pThis->iSizeLimit, (long long) pThis->iCurrOffs); */
+/* DEV DEBUG ONLY DBGPRINTF("strmWrite(%p[%s], '%65.65s', %ld);,
+disabled %d, sizelim %ld, size %lld\n", pThis, pThis->pszCurrFName, pBuf,(long) lenBuf,
+pThis->bDisabled, (long) pThis->iSizeLimit, (long long) pThis->iCurrOffs); */
 	if(pThis->bDisabled)
 		ABORT_FINALIZE(RS_RET_STREAM_DISABLED);
 
@@ -1687,12 +1910,20 @@ DEFpropSetMeth(strm, sType, strmType_t)
 DEFpropSetMeth(strm, iZipLevel, int)
 DEFpropSetMeth(strm, bVeryReliableZip, int)
 DEFpropSetMeth(strm, bSync, int)
+DEFpropSetMeth(strm, bReopenOnTruncate, int)
 DEFpropSetMeth(strm, sIOBufSize, size_t)
 DEFpropSetMeth(strm, iSizeLimit, off_t)
 DEFpropSetMeth(strm, iFlushInterval, int)
 DEFpropSetMeth(strm, pszSizeLimitCmd, uchar*)
 DEFpropSetMeth(strm, cryprov, cryprov_if_t*)
 DEFpropSetMeth(strm, cryprovData, void*)
+
+/* sets timeout in seconds */
+void
+strmSetReadTimeout(strm_t *const __restrict__ pThis, const int val)
+{
+	pThis->readTimeout = val;
+}
 
 static rsRetVal strmSetbDeleteOnClose(strm_t *pThis, int val)
 {
@@ -1730,7 +1961,7 @@ strmSetFName(strm_t *pThis, uchar *pszName, size_t iLenName)
 	if(pThis->pszFName != NULL)
 		free(pThis->pszFName);
 
-	if((pThis->pszFName = MALLOC(sizeof(uchar) * (iLenName + 1))) == NULL)
+	if((pThis->pszFName = MALLOC(iLenName + 1)) == NULL)
 		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
 
 	memcpy(pThis->pszFName, pszName, iLenName + 1); /* always think about the \0! */
@@ -1757,7 +1988,7 @@ strmSetDir(strm_t *pThis, uchar *pszDir, size_t iLenDir)
 	if(iLenDir < 1)
 		ABORT_FINALIZE(RS_RET_FILE_PREFIX_MISSING);
 
-	CHKmalloc(pThis->pszDir = MALLOC(sizeof(uchar) * (iLenDir + 1)));
+	CHKmalloc(pThis->pszDir = MALLOC(iLenDir + 1));
 
 	memcpy(pThis->pszDir, pszDir, iLenDir + 1); /* always think about the \0! */
 	pThis->lenDir = iLenDir;
@@ -1831,7 +2062,7 @@ static rsRetVal strmSerialize(strm_t *pThis, strm_t *pStrm)
 	strmFlushInternal(pThis, 0);
 	CHKiRet(obj.BeginSerialize(pStrm, (obj_t*) pThis));
 
-	objSerializeSCALAR(pStrm, iCurrFNum, INT);
+	objSerializeSCALAR(pStrm, iCurrFNum, INT); /* implicit cast is OK for persistance */
 	objSerializePTR(pStrm, pszFName, PSZ);
 	objSerializeSCALAR(pStrm, iMaxFiles, INT);
 	objSerializeSCALAR(pStrm, bDeleteOnClose, INT);
@@ -1851,7 +2082,18 @@ static rsRetVal strmSerialize(strm_t *pThis, strm_t *pStrm)
 	l = pThis->inode;
 	objSerializeSCALAR_VAR(pStrm, inode, INT64, l);
 
-	objSerializePTR(pStrm, prevLineSegment, PSZ);
+	if(pThis->prevLineSegment != NULL) {
+		cstrFinalize(pThis->prevLineSegment);
+		objSerializePTR(pStrm, prevLineSegment, CSTR);
+	}
+
+	if(pThis->prevMsgSegment != NULL) {
+		cstrFinalize(pThis->prevMsgSegment);
+		objSerializePTR(pStrm, prevMsgSegment, CSTR);
+	}
+
+	i = pThis->bPrevWasNL;
+	objSerializeSCALAR_VAR(pStrm, bPrevWasNL, INT, i);
 
 	CHKiRet(obj.EndSerialize(pStrm));
 
@@ -1867,8 +2109,8 @@ finalize_it:
  * properties before finalizing things.
  * rgerhards, 2009-05-26
  */
-rsRetVal
-strmDup(strm_t *pThis, strm_t **ppNew)
+static rsRetVal
+strmDup(strm_t *const pThis, strm_t **ppNew)
 {
 	strm_t *pNew = NULL;
 	DEFiRet;
@@ -1941,7 +2183,7 @@ static rsRetVal strmSetProperty(strm_t *pThis, var_t *pProp)
  	if(isProp("sType")) {
 		CHKiRet(strmSetsType(pThis, (strmType_t) pProp->val.num));
  	} else if(isProp("iCurrFNum")) {
-		pThis->iCurrFNum = pProp->val.num;
+		pThis->iCurrFNum = (unsigned) pProp->val.num;
  	} else if(isProp("pszFName")) {
 		CHKiRet(strmSetFName(pThis, rsCStrGetSzStrNoNULL(pProp->val.pStr), rsCStrLen(pProp->val.pStr)));
  	} else if(isProp("tOperationsMode")) {
@@ -1962,6 +2204,10 @@ static rsRetVal strmSetProperty(strm_t *pThis, var_t *pProp)
 		CHKiRet(strmSetbDeleteOnClose(pThis, pProp->val.num));
  	} else if(isProp("prevLineSegment")) {
 		CHKiRet(rsCStrConstructFromCStr(&pThis->prevLineSegment, pProp->val.pStr));
+ 	} else if(isProp("prevMsgSegment")) {
+		CHKiRet(rsCStrConstructFromCStr(&pThis->prevMsgSegment, pProp->val.pStr));
+ 	} else if(isProp("bPrevWasNL")) {
+		pThis->bPrevWasNL = (sbool) pProp->val.num;
 	}
 
 finalize_it:
@@ -2033,6 +2279,7 @@ CODESTARTobjQueryInterface(strm)
 	pIf->SetiZipLevel = strmSetiZipLevel;
 	pIf->SetbVeryReliableZip = strmSetbVeryReliableZip;
 	pIf->SetbSync = strmSetbSync;
+	pIf->SetbReopenOnTruncate = strmSetbReopenOnTruncate;
 	pIf->SetsIOBufSize = strmSetsIOBufSize;
 	pIf->SetiSizeLimit = strmSetiSizeLimit;
 	pIf->SetiFlushInterval = strmSetiFlushInterval;
@@ -2049,6 +2296,7 @@ ENDobjQueryInterface(strm)
  */
 BEGINObjClassInit(strm, 1, OBJ_IS_CORE_MODULE)
 	/* request objects we use */
+	CHKiRet(objUse(errmsg, CORE_COMPONENT));
 
 	OBJSetMethodHandler(objMethod_SERIALIZE, strmSerialize);
 	OBJSetMethodHandler(objMethod_SETPROPERTY, strmSetProperty);

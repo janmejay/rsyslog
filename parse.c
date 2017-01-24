@@ -247,7 +247,8 @@ rsRetVal parsSkipWhitespace(rsParsObj *pThis)
  * Output:
  * ppCStr Pointer to the parsed string - must be freed by caller!
  */
-rsRetVal parsDelimCStr(rsParsObj *pThis, cstr_t **ppCStr, char cDelim, int bTrimLeading, int bTrimTrailing, int bConvLower)
+rsRetVal parsDelimCStr(rsParsObj *pThis, cstr_t **ppCStr, char cDelim, int bTrimLeading, int bTrimTrailing,
+	int bConvLower)
 {
 	DEFiRet;
 	register unsigned char *pC;
@@ -275,10 +276,10 @@ rsRetVal parsDelimCStr(rsParsObj *pThis, cstr_t **ppCStr, char cDelim, int bTrim
 	/* We got the string, now take it and see if we need to
 	 * remove anything at its end.
 	 */
-	CHKiRet(cstrFinalize(pCStr));
+	cstrFinalize(pCStr);
 
 	if(bTrimTrailing) {
-		CHKiRet(cstrTrimTrailingWhiteSpace(pCStr));
+		cstrTrimTrailingWhiteSpace(pCStr);
 	}
 
 	/* done! */
@@ -350,8 +351,7 @@ rsRetVal parsQuotedCStr(rsParsObj *pThis, cstr_t **ppCStr)
 		ABORT_FINALIZE(RS_RET_MISSING_TRAIL_QUOTE);
 	}
 
-	/* We got the string, let's finish it...  */
-	CHKiRet(cstrFinalize(pCStr));
+	cstrFinalize(pCStr);
 
 	/* done! */
 	*ppCStr = pCStr;
@@ -405,11 +405,7 @@ rsRetVal parsAddrWithBits(rsParsObj *pThis, struct NetAddr **pIP, int *pBits)
 		++pC;
 	}
 	
-	/* We got the string, let's finish it...  */
-	if((iRet = cstrFinalize(pCStr)) != RS_RET_OK) {
-		cstrDestruct(&pCStr);
-		FINALIZE;
-	}
+	cstrFinalize(pCStr);
 
 	/* now we have the string and must check/convert it to
 	 * an NetAddr structure.
@@ -453,6 +449,8 @@ rsRetVal parsAddrWithBits(rsParsObj *pThis, struct NetAddr **pIP, int *pBits)
 			/* mask bits follow, let's parse them! */
 			++pThis->iCurrPos; /* eat slash */
 			if((iRet = parsInt(pThis, pBits)) != RS_RET_OK) {
+				free((*pIP)->addr.NetAddr);
+				free((*pIP)->addr.HostWildcard);
 				free (pszIP);
 				free (*pIP);
 				FINALIZE;
@@ -489,6 +487,8 @@ rsRetVal parsAddrWithBits(rsParsObj *pThis, struct NetAddr **pIP, int *pBits)
 			/* mask bits follow, let's parse them! */
 			++pThis->iCurrPos; /* eat slash */
 			if((iRet = parsInt(pThis, pBits)) != RS_RET_OK) {
+				free((*pIP)->addr.NetAddr);
+				free((*pIP)->addr.HostWildcard);
 				free (pszIP);
 				free (*pIP);
 				FINALIZE;

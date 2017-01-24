@@ -6,7 +6,7 @@
  * Please see syslogd.c for license information.
  * begun 2005-06-21 rgerhards
  *
- * Copyright (C) 2005-2012 Adiscon GmbH
+ * Copyright (C) 2005-2016 Adiscon GmbH
  *
  * This file is part of rsyslog.
  *
@@ -109,7 +109,7 @@ static rsRetVal get_Field(uchar **pp, uchar **pField)
 	}
 
 	*pp = p;
-	CHKiRet(cstrFinalize(pStrB));
+	cstrFinalize(pStrB);
 	CHKiRet(cstrConvSzStrAndDestruct(&pStrB, pField, 0));
 
 finalize_it:
@@ -156,7 +156,7 @@ static int get_off_t(uchar **pp, off_t *pOff_t)
  * to the caller. Leading white space is removed, but
  * not trailing.
  */
-static inline rsRetVal get_restOfLine(uchar **pp, uchar **pBuf)
+static rsRetVal get_restOfLine(uchar **pp, uchar **pBuf)
 {
 	DEFiRet;
 	register uchar *p;
@@ -177,7 +177,7 @@ static inline rsRetVal get_restOfLine(uchar **pp, uchar **pBuf)
 	}
 
 	*pp = p;
-	CHKiRet(cstrFinalize(pStrB));
+	cstrFinalize(pStrB);
 	CHKiRet(cstrConvSzStrAndDestruct(&pStrB, pBuf, 0));
 
 finalize_it:
@@ -208,7 +208,7 @@ struct outchannel *ochAddLine(char* pName, uchar** ppRestOfConfLine)
 		return NULL;
 	
 	pOch->iLenName = strlen(pName);
-	pOch->pszName = (char*) MALLOC(sizeof(char) * (pOch->iLenName + 1));
+	pOch->pszName = (char*) MALLOC(pOch->iLenName + 1);
 	if(pOch->pszName == NULL) {
 		dbgprintf("ochAddLine could not alloc memory for outchannel name!");
 		pOch->iLenName = 0;
@@ -235,7 +235,7 @@ struct outchannel *ochAddLine(char* pName, uchar** ppRestOfConfLine)
 
 
 /* Find a outchannel object based on name. Search
- * currently is case-senstive (should we change?).
+ * currently is case-sensitive (should we change?).
  * returns pointer to outchannel object if found and
  * NULL otherwise.
  * rgerhards 2004-11-17

@@ -7,18 +7,18 @@
  *
  * Module begun 2008-04-16 by Rainer Gerhards
  *
- * Copyright 2008-2015 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2008-2017 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
+ *
  *       http://www.apache.org/licenses/LICENSE-2.0
  *       -or-
  *       see COPYING.ASL20 in the source distribution
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -37,6 +37,7 @@
 #include <ctype.h>
 #include <assert.h>
 #include <stdint.h>
+#include <errno.h>
 
 #include "rsyslog.h"
 #include "obj.h"
@@ -49,7 +50,9 @@
 #include "action.h"
 #include "parserif.h"
 #include "rainerscript.h"
+#include "srUtils.h"
 #include "net.h"
+#include "rsconf.h"
 
 /* some defaults */
 #ifndef DFLT_NETSTRM_DRVR
@@ -72,9 +75,9 @@ stdlog_channel_t stdlog_hdl = NULL;	/* handle to be used for stdlog */
 #endif
 
 static struct cnfobj *mainqCnfObj = NULL;/* main queue object, to be used later in startup sequence */
-int bProcessInternalMessages = 1;	/* Should rsyslog itself process internal messages?
+int bProcessInternalMessages = 0;	/* Should rsyslog itself process internal messages?
 					 * 1 - yes
-					 * 0 - send them to libstdlog (e.g. to push to journal)
+					 * 0 - send them to libstdlog (e.g. to push to journal) or syslog()
 					 */
 static uchar *pszWorkDir = NULL;
 #ifdef HAVE_LIBLOGGING_STDLOG
@@ -84,7 +87,7 @@ static int bOptimizeUniProc = 1;	/* enable uniprocessor optimizations */
 static int bParseHOSTNAMEandTAG = 1;	/* parser modification (based on startup params!) */
 static int bPreserveFQDN = 0;		/* should FQDNs always be preserved? */
 static int iMaxLine = 8096;		/* maximum length of a syslog message */
-static int iGnuTLSLoglevel = 0;		
+static int iGnuTLSLoglevel = 0;
 static int iDefPFFamily = PF_UNSPEC;     /* protocol family (IPv4, IPv6 or both) */
 static int bDropMalPTRMsgs = 0;/* Drop messages which have malicious PTR records during DNS lookup */
 static int option_DisallowWarning = 1;	/* complain if message from disallowed sender is received */
@@ -96,8 +99,10 @@ static uchar *LocalHostName = NULL;/* our hostname  - read-only after startup, e
 static uchar *LocalHostNameOverride = NULL;/* user-overridden hostname - read-only after startup */
 static uchar *LocalFQDNName = NULL;/* our hostname as FQDN - read-only after startup, except HUP */
 static uchar *LocalDomain = NULL;/* our local domain name  - read-only after startup, except HUP */
-static char **StripDomains = NULL;/* these domains may be stripped before writing logs  - r/o after s.u., never touched by init */
-static char **LocalHosts = NULL;/* these hosts are logged with their hostname  - read-only after startup, never touched by init */
+static char **StripDomains = NULL;
+/* these domains may be stripped before writing logs  - r/o after s.u., never touched by init */
+static char **LocalHosts = NULL;
+/* these hosts are logged with their hostname  - read-only after startup, never touched by init */
 static uchar *pszDfltNetstrmDrvr = NULL; /* module name of default netstream driver */
 static uchar *pszDfltNetstrmDrvrCAF = NULL; /* default CA file for the netstrm driver */
 static uchar *pszDfltNetstrmDrvrKeyFile = NULL; /* default key file for the netstrm driver (server) */
@@ -111,6 +116,12 @@ static int bEscape8BitChars = 0; /* escape characters > 127 on reception: 0 - no
 static int bEscapeTab = 1; /* escape tab control character when doing CC escapes: 0 - no, 1 - yes */
 static int bParserEscapeCCCStyle = 0; /* escape control characters in c style: 0 - no, 1 - yes */
 short janitorInterval = 10; /* interval (in minutes) at which the janitor runs */
+int glblReportNewSenders = 0;
+int glblReportGoneAwaySenders = 0;
+int glblSenderStatsTimeout = 12 * 60 * 60; /* 12 hr timeout for senders */
+int glblSenderKeepTrack = 0;  /* keep track of known senders? */
+int glblUnloadModules = 1;
+int bPermitSlashInProgramname = 0;
 
 pid_t glbl_ourpid;
 #ifndef HAVE_ATOMIC_BUILTINS
@@ -133,6 +144,7 @@ static struct cnfparamdescr cnfparamdescr[] = {
 	{ "debug.onshutdown", eCmdHdlrBinary, 0 },
 	{ "debug.logfile", eCmdHdlrString, 0 },
 	{ "debug.gnutls", eCmdHdlrPositiveInt, 0 },
+	{ "debug.unloadmodules", eCmdHdlrBinary, 0 },
 	{ "defaultnetstreamdrivercafile", eCmdHdlrString, 0 },
 	{ "defaultnetstreamdriverkeyfile", eCmdHdlrString, 0 },
         { "defaultnetstreamdrivercertfile", eCmdHdlrString, 0 },
@@ -148,13 +160,20 @@ static struct cnfparamdescr cnfparamdescr[] = {
 	{ "parser.escapecontrolcharactertab", eCmdHdlrBinary, 0},
 	{ "parser.escapecontrolcharacterscstyle", eCmdHdlrBinary, 0 },
 	{ "parser.parsehostnameandtag", eCmdHdlrBinary, 0 },
+	{ "parser.permitslashinprogramname", eCmdHdlrBinary, 0 },
 	{ "stdlog.channelspec", eCmdHdlrString, 0 },
 	{ "janitor.interval", eCmdHdlrPositiveInt, 0 },
+	{ "senders.reportnew", eCmdHdlrBinary, 0 },
+	{ "senders.reportgoneaway", eCmdHdlrBinary, 0 },
+	{ "senders.timeoutafter", eCmdHdlrPositiveInt, 0 },
+	{ "senders.keeptrack", eCmdHdlrBinary, 0 },
+	{ "privdrop.group.keepsupplemental", eCmdHdlrBinary, 0 },
 	{ "net.ipprotocol", eCmdHdlrGetWord, 0 },
 	{ "net.acladdhostnameonfail", eCmdHdlrBinary, 0 },
 	{ "net.aclresolvehostname", eCmdHdlrBinary, 0 },
 	{ "net.enabledns", eCmdHdlrBinary, 0 },
 	{ "net.permitACLwarning", eCmdHdlrBinary, 0 },
+	{ "environment", eCmdHdlrArray, 0 },
 	{ "processinternalmessages", eCmdHdlrBinary, 0 }
 };
 static struct cnfparamblk paramblk =
@@ -164,8 +183,8 @@ static struct cnfparamblk paramblk =
 	};
 
 static struct cnfparamdescr timezonecnfparamdescr[] = {
-	{ "id", eCmdHdlrString, 0 },
-	{ "offset", eCmdHdlrGetWord, 0 }
+	{ "id", eCmdHdlrString, CNFPARAM_REQUIRED},
+	{ "offset", eCmdHdlrGetWord, CNFPARAM_REQUIRED }
 };
 static struct cnfparamblk timezonepblk =
 	{ CNFPARAMBLK_VERSION,
@@ -228,9 +247,12 @@ SIMP_PROP(FdSetSize, iFdSetSize, int)
 #endif
 
 SIMP_PROP_SET(DfltNetstrmDrvr, pszDfltNetstrmDrvr, uchar*) /* TODO: use custom function which frees existing value */
-SIMP_PROP_SET(DfltNetstrmDrvrCAF, pszDfltNetstrmDrvrCAF, uchar*) /* TODO: use custom function which frees existing value */
-SIMP_PROP_SET(DfltNetstrmDrvrKeyFile, pszDfltNetstrmDrvrKeyFile, uchar*) /* TODO: use custom function which frees existing value */
-SIMP_PROP_SET(DfltNetstrmDrvrCertFile, pszDfltNetstrmDrvrCertFile, uchar*) /* TODO: use custom function which frees existing value */
+SIMP_PROP_SET(DfltNetstrmDrvrCAF, pszDfltNetstrmDrvrCAF, uchar*)
+/* TODO: use custom function which frees existing value */
+SIMP_PROP_SET(DfltNetstrmDrvrKeyFile, pszDfltNetstrmDrvrKeyFile, uchar*)
+/* TODO: use custom function which frees existing value */
+SIMP_PROP_SET(DfltNetstrmDrvrCertFile, pszDfltNetstrmDrvrCertFile, uchar*)
+/* TODO: use custom function which frees existing value */
 
 #undef SIMP_PROP
 #undef SIMP_PROP_SET
@@ -260,7 +282,7 @@ static void SetGlobalInputTermination(void)
  * ok to call. Most importantly, the IP address must not already have 
  * been set. -- rgerhards, 2012-03-21
  */
-static inline rsRetVal
+static rsRetVal
 storeLocalHostIPIF(uchar *myIP)
 {
 	DEFiRet;
@@ -820,13 +842,17 @@ displayTzinfos(void)
  * This is currently not needed as used only during
  * initialization.
  */
-static inline rsRetVal
+static rsRetVal
 addTimezoneInfo(uchar *tzid, char offsMode, int8_t offsHour, int8_t offsMin)
 {
 	DEFiRet;
 	tzinfo_t *newti;
 	CHKmalloc(newti = realloc(tzinfos, (ntzinfos+1)*sizeof(tzinfo_t)));
-	CHKmalloc(newti[ntzinfos].id = strdup((char*)tzid));
+	if((newti[ntzinfos].id = strdup((char*)tzid)) == NULL) {
+		free(newti);
+		DBGPRINTF("addTimezoneInfo: strdup failed with OOM\n");
+		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+	}
 	newti[ntzinfos].offsMode = offsMode;
 	newti[ntzinfos].offsHour = offsHour;
 	newti[ntzinfos].offsMin = offsMin;
@@ -863,8 +889,10 @@ glblProcessTimezone(struct cnfobj *o)
 	int i;
 
 	pvals = nvlstGetParams(o->nvlst, &timezonepblk, NULL);
-	dbgprintf("timezone param blk after glblProcessTimezone:\n");
-	cnfparamsPrint(&timezonepblk, pvals);
+	if(Debug) {
+		dbgprintf("timezone param blk after glblProcessTimezone:\n");
+		cnfparamsPrint(&timezonepblk, pvals);
+	}
 
 	for(i = 0 ; i < timezonepblk.nParams ; ++i) {
 		if(!pvals[i].bUsed)
@@ -877,6 +905,20 @@ glblProcessTimezone(struct cnfobj *o)
 			dbgprintf("glblProcessTimezone: program error, non-handled "
 			  "param '%s'\n", timezonepblk.descr[i].name);
 		}
+	}
+
+	/* note: the following two checks for NULL are not strictly necessary
+	 * as these are required parameters for the config block. But we keep
+	 * them to make the clang static analyzer happy, which also helps
+	 * guard against logic errors.
+	 */
+	if(offset == NULL) {
+		parser_errmsg("offset parameter missing (logic error?), timezone config ignored");
+		goto done;
+	}
+	if(id == NULL) {
+		parser_errmsg("id parameter missing (logic error?), timezone config ignored");
+		goto done;
 	}
 
 	if(   strlen((char*)offset) != 6
@@ -917,8 +959,15 @@ glblProcessCnf(struct cnfobj *o)
 	int i;
 
 	cnfparamvals = nvlstGetParams(o->nvlst, &paramblk, cnfparamvals);
-	dbgprintf("glbl param blk after glblProcessCnf:\n");
-	cnfparamsPrint(&paramblk, cnfparamvals);
+	if(cnfparamvals == NULL) {
+		errmsg.LogError(0, RS_RET_MISSING_CNFPARAMS, "error processing global "
+				"config parameters [global(...)]");
+		goto done;
+	}
+	if(Debug) {
+		dbgprintf("glbl param blk after glblProcessCnf:\n");
+		cnfparamsPrint(&paramblk, cnfparamvals);
+	}
 
 	/* The next thing is a bit hackish and should be changed in higher
 	 * versions. There are a select few parameters which we need to
@@ -929,21 +978,12 @@ glblProcessCnf(struct cnfobj *o)
 			continue;
 		if(!strcmp(paramblk.descr[i].name, "processinternalmessages")) {
 			bProcessInternalMessages = (int) cnfparamvals[i].val.d.n;
-#ifndef HAVE_LIBLOGGING_STDLOG
-			if(bProcessInternalMessages != 1) {
-				bProcessInternalMessages = 1;
-				errmsg.LogError(0, RS_RET_ERR, "rsyslog wasn't "
-					"compiled with liblogging-stdlog support. "
-					"The 'ProcessInternalMessages' parameter "
-					"is ignored.\n");
-			}
-#endif
 		} else if(!strcmp(paramblk.descr[i].name, "stdlog.channelspec")) {
 #ifndef HAVE_LIBLOGGING_STDLOG
 			errmsg.LogError(0, RS_RET_ERR, "rsyslog wasn't "
 				"compiled with liblogging-stdlog support. "
 				"The 'stdlog.channelspec' parameter "
-				"is ignored.\n");
+				"is ignored. Note: the syslog API is used instead.\n");
 #else
 			stdlog_chanspec = (uchar*)
 				es_str2cstr(cnfparamvals[i].val.d.estr, NULL);
@@ -952,6 +992,7 @@ glblProcessCnf(struct cnfobj *o)
 #endif
 		}
 	}
+done:	return;
 }
 
 /* Set mainq parameters. Note that when this is not called, we'll use the
@@ -972,7 +1013,7 @@ glblProcessMainQCnf(struct cnfobj *o)
  * also used to do some final checks.
  */
 void
-glblDestructMainqCnfObj()
+glblDestructMainqCnfObj(void)
 {
 	/* Only destruct if not NULL! */
 	if (mainqCnfObj != NULL) {
@@ -990,6 +1031,47 @@ qs_arrcmp_tzinfo(const void *s1, const void *s2)
 {
 	return strcmp(((tzinfo_t*)s1)->id, ((tzinfo_t*)s2)->id);
 }
+
+/* set an environment variable */
+static rsRetVal
+do_setenv(const char *const var)
+{
+	char varname[128];
+	const char *val = var;
+	size_t i;
+	DEFiRet;
+
+	for(i = 0 ; *val != '=' ; ++i, ++val) {
+		if(i == sizeof(varname)-i) {
+			parser_errmsg("environment variable name too long "
+				"[max %zd chars] or malformed entry: '%s'",
+				sizeof(varname)-1, var);
+			ABORT_FINALIZE(RS_RET_ERR_SETENV);
+		}
+		if(*val == '\0') {
+			parser_errmsg("environment variable entry is missing "
+				"equal sign (for value): '%s'", var);
+			ABORT_FINALIZE(RS_RET_ERR_SETENV);
+		}
+		varname[i] = *val;
+	}
+	varname[i] = '\0';
+	++val;
+	DBGPRINTF("do_setenv, var '%s', val '%s'\n", varname, val);
+
+	if(setenv(varname, val, 1) != 0) {
+		char errStr[1024];
+		rs_strerror_r(errno, errStr, sizeof(errStr));
+		parser_errmsg("error setting environment variable "
+			"'%s' to '%s': %s", varname, val, errStr);
+		ABORT_FINALIZE(RS_RET_ERR_SETENV);
+	}
+
+
+finalize_it:
+	RETiRet;
+}
+
 
 /* This processes the "regular" parameters which are to be set after the
  * config has been fully loaded.
@@ -1049,6 +1131,8 @@ glblDoneLoadCnf(void)
 			errmsg.LogError(0, RS_RET_OK, "debug: onShutdown set to %d", glblDebugOnShutdown);
 		} else if(!strcmp(paramblk.descr[i].name, "debug.gnutls")) {
 			iGnuTLSLoglevel = (int) cnfparamvals[i].val.d.n;
+		} else if(!strcmp(paramblk.descr[i].name, "debug.unloadmodules")) {
+			glblUnloadModules = (int) cnfparamvals[i].val.d.n;
 		} else if(!strcmp(paramblk.descr[i].name, "parser.controlcharacterescapeprefix")) {
 			cCCEscapeChar = (uchar) *es_str2cstr(cnfparamvals[i].val.d.estr, NULL);
 		} else if(!strcmp(paramblk.descr[i].name, "parser.droptrailinglfonreception")) {
@@ -1065,6 +1149,8 @@ glblDoneLoadCnf(void)
 			bParserEscapeCCCStyle = (int) cnfparamvals[i].val.d.n;
 		} else if(!strcmp(paramblk.descr[i].name, "parser.parsehostnameandtag")) {
 			bParseHOSTNAMEandTAG = (int) cnfparamvals[i].val.d.n;
+		} else if(!strcmp(paramblk.descr[i].name, "parser.permitslashinprogramname")) {
+			bPermitSlashInProgramname = (int) cnfparamvals[i].val.d.n;
 		} else if(!strcmp(paramblk.descr[i].name, "debug.logfile")) {
 			if(pszAltDbgFileName == NULL) {
 				pszAltDbgFileName = es_str2cstr(cnfparamvals[i].val.d.estr, NULL);
@@ -1088,6 +1174,16 @@ glblDoneLoadCnf(void)
 					"parameter '%s' -- ignored", proto);
 			}
 			free(proto);
+		} else if(!strcmp(paramblk.descr[i].name, "senders.reportnew")) {
+		        glblReportNewSenders = (int) cnfparamvals[i].val.d.n;
+		} else if(!strcmp(paramblk.descr[i].name, "senders.reportgoneaway")) {
+		        glblReportGoneAwaySenders = (int) cnfparamvals[i].val.d.n;
+		} else if(!strcmp(paramblk.descr[i].name, "senders.timeoutafter")) {
+		        glblSenderStatsTimeout = (int) cnfparamvals[i].val.d.n;
+		} else if(!strcmp(paramblk.descr[i].name, "senders.keeptrack")) {
+		        glblSenderKeepTrack = (int) cnfparamvals[i].val.d.n;
+		} else if(!strcmp(paramblk.descr[i].name, "privdrop.group.keepsupplemental")) {
+		        loadConf->globals.gidDropPrivKeepSupplemental = (int) cnfparamvals[i].val.d.n;
 		} else if(!strcmp(paramblk.descr[i].name, "net.acladdhostnameonfail")) {
 		        *(net.pACLAddHostnameOnFail) = (int) cnfparamvals[i].val.d.n;
 		} else if(!strcmp(paramblk.descr[i].name, "net.aclresolvehostname")) {
@@ -1096,6 +1192,13 @@ glblDoneLoadCnf(void)
 		        setDisableDNS(!((int) cnfparamvals[i].val.d.n));
 		} else if(!strcmp(paramblk.descr[i].name, "net.permitwarning")) {
 		        setOption_DisallowWarning(!((int) cnfparamvals[i].val.d.n));
+		} else if(!strcmp(paramblk.descr[i].name, "environment")) {
+			for(int j = 0 ; j <  cnfparamvals[i].val.d.ar->nmemb ; ++j) {
+				char *const var =
+					es_str2cstr(cnfparamvals[i].val.d.ar->arr[j], NULL);
+				do_setenv(var);
+				free(var);
+			}
 		} else {
 			dbgprintf("glblDoneLoadCnf: program error, non-handled "
 			  "param '%s'\n", paramblk.descr[i].name);
@@ -1124,26 +1227,37 @@ BEGINAbstractObjClassInit(glbl, 1, OBJ_IS_CORE_MODULE) /* class, version */
 	CHKiRet(regCfSysLineHdlr((uchar *)"debugfile", 0, eCmdHdlrGetWord, setDebugFile, NULL, NULL));
 	CHKiRet(regCfSysLineHdlr((uchar *)"debuglevel", 0, eCmdHdlrInt, setDebugLevel, NULL, NULL));
 	CHKiRet(regCfSysLineHdlr((uchar *)"workdirectory", 0, eCmdHdlrGetWord, setWorkDir, NULL, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"dropmsgswithmaliciousdnsptrrecords", 0, eCmdHdlrBinary, NULL, &bDropMalPTRMsgs, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"defaultnetstreamdriver", 0, eCmdHdlrGetWord, NULL, &pszDfltNetstrmDrvr, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"defaultnetstreamdrivercafile", 0, eCmdHdlrGetWord, NULL, &pszDfltNetstrmDrvrCAF, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"defaultnetstreamdriverkeyfile", 0, eCmdHdlrGetWord, NULL, &pszDfltNetstrmDrvrKeyFile, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"defaultnetstreamdrivercertfile", 0, eCmdHdlrGetWord, NULL, &pszDfltNetstrmDrvrCertFile, NULL));
+	CHKiRet(regCfSysLineHdlr((uchar *)"dropmsgswithmaliciousdnsptrrecords", 0, eCmdHdlrBinary, NULL,
+	&bDropMalPTRMsgs, NULL));
+	CHKiRet(regCfSysLineHdlr((uchar *)"defaultnetstreamdriver", 0, eCmdHdlrGetWord, NULL, &pszDfltNetstrmDrvr,
+	NULL));
+	CHKiRet(regCfSysLineHdlr((uchar *)"defaultnetstreamdrivercafile", 0, eCmdHdlrGetWord, NULL,
+	&pszDfltNetstrmDrvrCAF, NULL));
+	CHKiRet(regCfSysLineHdlr((uchar *)"defaultnetstreamdriverkeyfile", 0, eCmdHdlrGetWord, NULL,
+	&pszDfltNetstrmDrvrKeyFile, NULL));
+	CHKiRet(regCfSysLineHdlr((uchar *)"defaultnetstreamdrivercertfile", 0, eCmdHdlrGetWord, NULL,
+	&pszDfltNetstrmDrvrCertFile, NULL));
 	CHKiRet(regCfSysLineHdlr((uchar *)"localhostname", 0, eCmdHdlrGetWord, NULL, &LocalHostNameOverride, NULL));
 	CHKiRet(regCfSysLineHdlr((uchar *)"localhostipif", 0, eCmdHdlrGetWord, setLocalHostIPIF, NULL, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"optimizeforuniprocessor", 0, eCmdHdlrBinary, NULL, &bOptimizeUniProc, NULL));
+	CHKiRet(regCfSysLineHdlr((uchar *)"optimizeforuniprocessor", 0, eCmdHdlrBinary, NULL,
+	&bOptimizeUniProc, NULL));
 	CHKiRet(regCfSysLineHdlr((uchar *)"preservefqdn", 0, eCmdHdlrBinary, NULL, &bPreserveFQDN, NULL));
 	CHKiRet(regCfSysLineHdlr((uchar *)"maxmessagesize", 0, eCmdHdlrSize, legacySetMaxMessageSize, NULL, NULL));
 
 	/* Deprecated parser config options */
-	CHKiRet(regCfSysLineHdlr((uchar *)"controlcharacterescapeprefix", 0, eCmdHdlrGetChar, NULL, &cCCEscapeChar, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"droptrailinglfonreception", 0, eCmdHdlrBinary, NULL, &bDropTrailingLF, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"escapecontrolcharactersonreceive", 0, eCmdHdlrBinary, NULL, &bEscapeCCOnRcv, NULL));
+	CHKiRet(regCfSysLineHdlr((uchar *)"controlcharacterescapeprefix", 0, eCmdHdlrGetChar, NULL,
+	&cCCEscapeChar, NULL));
+	CHKiRet(regCfSysLineHdlr((uchar *)"droptrailinglfonreception", 0, eCmdHdlrBinary, NULL,
+	&bDropTrailingLF, NULL));
+	CHKiRet(regCfSysLineHdlr((uchar *)"escapecontrolcharactersonreceive", 0, eCmdHdlrBinary, NULL,
+	&bEscapeCCOnRcv, NULL));
 	CHKiRet(regCfSysLineHdlr((uchar *)"spacelfonreceive", 0, eCmdHdlrBinary, NULL, &bSpaceLFOnRcv, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"escape8bitcharactersonreceive", 0, eCmdHdlrBinary, NULL, &bEscape8BitChars, NULL));
+	CHKiRet(regCfSysLineHdlr((uchar *)"escape8bitcharactersonreceive", 0, eCmdHdlrBinary, NULL,
+	&bEscape8BitChars, NULL));
 	CHKiRet(regCfSysLineHdlr((uchar *)"escapecontrolcharactertab", 0, eCmdHdlrBinary, NULL, &bEscapeTab, NULL));
 
-	CHKiRet(regCfSysLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler, resetConfigVariables, NULL, NULL));
+	CHKiRet(regCfSysLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler,
+	resetConfigVariables, NULL, NULL));
 
 	INIT_ATOMIC_HELPER_MUT(mutTerminateInputs);
 ENDObjClassInit(glbl)

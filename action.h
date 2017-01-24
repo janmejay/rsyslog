@@ -49,6 +49,7 @@ struct action_s {
 	sbool	bHadAutoCommit;	/* did an auto-commit happen during doAction()? */
 	sbool	bDisabled;
 	sbool	isTransactional;
+	sbool	bCopyMsg;
 	int	iSecsExecOnceInterval; /* if non-zero, minimum seconds to wait until action is executed again */
 	time_t	ttResumeRtry;	/* when is it time to retry the resume? */
 	int	iResumeInterval;/* resume interval for this action */
@@ -60,7 +61,7 @@ struct action_s {
 	struct modInfo_s *pMod;/* pointer to output module handling this selector */
 	void	*pModData;	/* pointer to module data - content is module-specific */
 	sbool	bRepMsgHasMsg;	/* "message repeated..." has msg fragment in it (0-no, 1-yes) */
-	rsRetVal (*submitToActQ)(action_t *, wti_t*, msg_t*);/* function submit message to action queue */
+	rsRetVal (*submitToActQ)(action_t *, wti_t*, smsg_t*);/* function submit message to action queue */
 	rsRetVal (*qConstruct)(struct queue_s *pThis);
 	sbool	bUsesMsgPassingMode;
 	sbool	bNeedReleaseBatch; /* do we need to release batch ressources? Depends on ParamPassig modes... */
@@ -72,6 +73,11 @@ struct action_s {
 	pthread_mutex_t mutAction; /* primary action mutex */
 	uchar *pszName;		/* action name */
 	DEF_ATOMIC_HELPER_MUT(mutCAS)
+	/* for per-worker HUP processing */
+	pthread_mutex_t mutWrkrDataTable; /* protects table structures */
+	void **wrkrDataTable;
+	int wrkrDataTableSize;
+	int nWrkr;
 	/* for statistics subsystem */
 	statsobj_t *statsobj;
 	STATSCOUNTER_DEF(ctrProcessed, mutCtrProcessed)
@@ -90,14 +96,17 @@ rsRetVal actionDestruct(action_t *pThis);
 //rsRetVal actionDbgPrint(action_t *pThis);
 rsRetVal actionSetGlobalResumeInterval(int iNewVal);
 rsRetVal actionDoAction(action_t *pAction);
-rsRetVal actionWriteToAction(action_t *pAction, msg_t *pMsg, wti_t*);
+rsRetVal actionWriteToAction(action_t *pAction, smsg_t *pMsg, wti_t*);
 rsRetVal actionCallHUPHdlr(action_t *pAction);
 rsRetVal actionClassInit(void);
-rsRetVal addAction(action_t **ppAction, modInfo_t *pMod, void *pModData, omodStringRequest_t *pOMSR, struct cnfparamvals *actParams, struct nvlst *lst);
+rsRetVal addAction(action_t **ppAction, modInfo_t *pMod, void *pModData, omodStringRequest_t *pOMSR,
+	struct cnfparamvals *actParams, struct nvlst *lst);
 rsRetVal activateActions(void);
 rsRetVal actionNewInst(struct nvlst *lst, action_t **ppAction);
 rsRetVal actionProcessCnf(struct cnfobj *o);
 void actionCommitAllDirect(wti_t *pWti);
+void actionRemoveWorker(action_t *const pAction, void *const actWrkrData);
+void releaseDoActionParams(action_t * const pAction, wti_t * const pWti, int action_destruct);
 
 /* external data */
 extern int iActionNbr;

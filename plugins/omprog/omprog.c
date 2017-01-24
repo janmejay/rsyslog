@@ -6,7 +6,7 @@
  *
  * File begun on 2009-04-01 by RGerhards
  *
- * Copyright 2009-2014 Adiscon GmbH.
+ * Copyright 2009-2015 Adiscon GmbH.
  *
  * This file is part of rsyslog.
  *
@@ -36,7 +36,15 @@
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#if defined(__FreeBSD__)
+#include <sys/wait.h>
+#else
 #include <wait.h>
+#endif
+#if defined(__linux__) && defined(_GNU_SOURCE)
+#include <sys/syscall.h>
+#include <sys/types.h>
+#endif
 #include <pthread.h>
 #include "conf.h"
 #include "syslogd-types.h"
@@ -55,13 +63,18 @@ MODULE_CNFNAME("omprog")
 DEF_OMOD_STATIC_DATA
 DEFobjCurrIf(errmsg)
 
+#define NO_HUP_FORWARD -1	/* indicates that HUP should NOT be forwarded */
+/* linux specific: how long to wait for process to terminate gracefully before issuing SIGKILL */
+#define DEFAULT_FORCED_TERMINATION_TIMEOUT_MS 5000
 typedef struct _instanceData {
 	uchar *szBinary;	/* name of binary to call */
 	char **aParams;		/* Optional Parameters for binary command */
 	uchar *tplName;		/* assigned output template */
 	int iParams;		/* Holds the count of parameters if set*/
 	int bForceSingleInst;	/* only a single wrkr instance of program permitted? */
+	int iHUPForward;	/* signal to forward on HUP (or NO_HUP_FORWARD) */
 	uchar *outputFileName;	/* name of file for std[out/err] or NULL if to discard */
+	int bSignalOnClose;  /* should signal process at shutdown */
 	pthread_mutex_t mut;	/* make sure only one instance is active */
 } instanceData;
 
@@ -86,7 +99,9 @@ static struct cnfparamdescr actpdescr[] = {
 	{ "binary", eCmdHdlrString, CNFPARAM_REQUIRED },
 	{ "output", eCmdHdlrString, 0 },
 	{ "forcesingleinstance", eCmdHdlrBinary, 0 },
-	{ "template", eCmdHdlrGetWord, 0 }
+	{ "hup.signal", eCmdHdlrGetWord, 0 },
+	{ "template", eCmdHdlrGetWord, 0 },
+	{ "signalOnClose", eCmdHdlrBinary, 0 }
 };
 static struct cnfparamblk actpblk =
 	{ CNFPARAMBLK_VERSION,
@@ -128,18 +143,14 @@ CODESTARTfreeInstance
 	pthread_mutex_destroy(&pData->mut);
 	free(pData->szBinary);
 	free(pData->outputFileName);
+	free(pData->tplName);
 	if(pData->aParams != NULL) {
 		for (i = 0; i < pData->iParams; i++) {
 			free(pData->aParams[i]);
 		}
-		free(pData->aParams); 
+		free(pData->aParams);
 	}
 ENDfreeInstance
-
-BEGINfreeWrkrInstance
-CODESTARTfreeWrkrInstance
-ENDfreeWrkrInstance
-
 
 BEGINdbgPrintInstInfo
 CODESTARTdbgPrintInstInfo
@@ -163,7 +174,6 @@ writeProgramOutput(wrkrInstanceData_t *__restrict__ const pWrkrData,
 	char errStr[1024];
 	ssize_t r;
 
-dbgprintf("omprog: writeProgramOutput, fd %d\n", pWrkrData->fdOutput);
 	if(pWrkrData->fdOutput == -1) {
 		pWrkrData->fdOutput = open((char*)pWrkrData->pData->outputFileName,
 				       O_WRONLY | O_APPEND | O_CREAT, 0600);
@@ -196,14 +206,11 @@ checkProgramOutput(wrkrInstanceData_t *__restrict__ const pWrkrData)
 	char buf[4096];
 	ssize_t r;
 
-dbgprintf("omprog: checking prog output, fd %d\n", pWrkrData->fdPipeIn);
 	if(pWrkrData->fdPipeIn == -1)
 		goto done;
 
 	do {
-memset(buf, 0, sizeof(buf));
 		r = read(pWrkrData->fdPipeIn, buf, sizeof(buf));
-dbgprintf("omprog: read state %lld, data '%s'\n", (long long) r, buf);
 		if(r > 0)
 			writeProgramOutput(pWrkrData, buf, r);
 	} while(r > 0);
@@ -216,7 +223,7 @@ done:	return;
 /* execute the child process (must be called in child context
  * after fork).
  */
-static void
+static __attribute__((noreturn)) void
 execBinary(wrkrInstanceData_t *pWrkrData, int fdStdin, int fdStdOutErr)
 {
 	int i, iRet;
@@ -278,10 +285,10 @@ execBinary(wrkrInstanceData_t *pWrkrData, int fdStdin, int fdStdOutErr)
 		 */
 		rs_strerror_r(errno, errStr, sizeof(errStr));
 		DBGPRINTF("omprog: failed to execute binary '%s': %s\n",
-			  pWrkrData->pData->szBinary, errStr); 
+			  pWrkrData->pData->szBinary, errStr);
 		openlog("rsyslogd", 0, LOG_SYSLOG);
 		syslog(LOG_ERR, "omprog: failed to execute binary '%s': %s\n",
-			  pWrkrData->pData->szBinary, errStr); 
+			  pWrkrData->pData->szBinary, errStr);
 	}
 	
 	/* we should never reach this point, but if we do, we terminate */
@@ -329,13 +336,14 @@ openPipe(wrkrInstanceData_t *pWrkrData)
 
 	DBGPRINTF("omprog: child has pid %d\n", (int) cpid);
 	if(pWrkrData->pData->outputFileName != NULL) {
-		pWrkrData->fdPipeIn = dup(pipestdout[0]);
+		pWrkrData->fdPipeIn = pipestdout[0];
 		/* we need to set our fd to be non-blocking! */
 		flags = fcntl(pWrkrData->fdPipeIn, F_GETFL);
 		flags |= O_NONBLOCK;
 		fcntl(pWrkrData->fdPipeIn, F_SETFL, flags);
 	} else {
 		pWrkrData->fdPipeIn = -1;
+		close(pipestdout[0]);
 	}
 	close(pipestdin[0]);
 	close(pipestdout[1]);
@@ -346,34 +354,142 @@ finalize_it:
 	RETiRet;
 }
 
+#if defined(__linux__) && defined(_GNU_SOURCE)
+typedef struct subprocess_timeout_desc_s {
+	pthread_attr_t thd_attr;
+	pthread_t thd;
+	pthread_mutex_t lock;
+	pthread_cond_t cond;
+	int timeout_armed;
+	pid_t waiter_tid;
+	long timeout_ms;
+	struct timespec timeout;
+} subprocess_timeout_desc_t;
 
-/* clean up after a terminated child
- */
-static inline rsRetVal
-cleanup(wrkrInstanceData_t *pWrkrData)
+static void * killSubprocessOnTimeout(void *_subpTimeOut_p) {
+	subprocess_timeout_desc_t *subpTimeOut = (subprocess_timeout_desc_t *) _subpTimeOut_p;
+	if (pthread_mutex_lock(&subpTimeOut->lock) == 0) {
+		while (subpTimeOut->timeout_armed) {
+			int ret = pthread_cond_timedwait(&subpTimeOut->cond, &subpTimeOut->lock, &subpTimeOut->timeout);
+			if (subpTimeOut->timeout_armed && ((ret == ETIMEDOUT) || (timeoutVal(&subpTimeOut->timeout) == 0))) {
+				errmsg.LogError(0, RS_RET_CONC_CTRL_ERR, "omprog: child-process wasn't reaped within timeout "
+								"(%ld ms) preparing to force-kill.", subpTimeOut->timeout_ms);
+				if (syscall(SYS_tgkill, getpid(), subpTimeOut->waiter_tid, SIGINT) != 0) {
+					errmsg.LogError(errno, RS_RET_SYS_ERR, "omprog: couldn't interrupt thread(%d) "
+									"which was waiting to reap child-process.", subpTimeOut->waiter_tid);
+				}
+			}
+		}
+		pthread_mutex_unlock(&subpTimeOut->lock);
+	}
+	return NULL;
+}
+
+static rsRetVal
+setupSubprocessTimeout(subprocess_timeout_desc_t *subpTimeOut, long timeout_ms)
+{
+	int attr_initialized = 0, mutex_initialized = 0, cond_initialized = 0;
+	DEFiRet;
+	CHKiConcCtrl(pthread_attr_init(&subpTimeOut->thd_attr));
+	attr_initialized = 1;
+	CHKiConcCtrl(pthread_mutex_init(&subpTimeOut->lock, NULL));
+	mutex_initialized = 1;
+	CHKiConcCtrl(pthread_cond_init(&subpTimeOut->cond, NULL));
+	cond_initialized = 1;
+	subpTimeOut->timeout_armed = 1;
+	subpTimeOut->waiter_tid = syscall(SYS_gettid);
+	subpTimeOut->timeout_ms = timeout_ms;
+	CHKiRet(timeoutComp(&subpTimeOut->timeout, timeout_ms));
+	CHKiConcCtrl(pthread_create(&subpTimeOut->thd, &subpTimeOut->thd_attr, killSubprocessOnTimeout, subpTimeOut));
+finalize_it:
+	if (iRet != RS_RET_OK) {
+		if (attr_initialized) pthread_attr_destroy(&subpTimeOut->thd_attr);
+		if (mutex_initialized) pthread_mutex_destroy(&subpTimeOut->lock);
+		if (cond_initialized) pthread_cond_destroy(&subpTimeOut->cond);
+	}
+	RETiRet;
+}
+
+static void
+doForceKillSubprocess(subprocess_timeout_desc_t *subpTimeOut, int do_kill, pid_t pid)
+{
+    if (pthread_mutex_lock(&subpTimeOut->lock) == 0) {
+        subpTimeOut->timeout_armed = 0;
+        pthread_cond_signal(&subpTimeOut->cond);
+        pthread_mutex_unlock(&subpTimeOut->lock);
+    }
+	pthread_join(subpTimeOut->thd, NULL);
+	if (do_kill) {
+		if (kill(pid, 9) == 0) {
+			errmsg.LogError(0, RS_RET_NO_ERRCODE, "omprog: child-process FORCE-killed");
+		} else {
+			errmsg.LogError(errno, RS_RET_SYS_ERR, "omprog: child-process cound't be FORCE-killed");
+		}
+	}
+	pthread_cond_destroy(&subpTimeOut->cond);
+	pthread_mutex_destroy(&subpTimeOut->lock);
+	pthread_attr_destroy(&subpTimeOut->thd_attr);
+}
+#endif
+
+static void
+waitForChild(wrkrInstanceData_t *pWrkrData, long timeout_ms)
 {
 	int status;
 	int ret;
-	char errStr[1024];
-	DEFiRet;
 
-	assert(pWrkrData->bIsRunning == 1);
+#if defined(__linux__) && defined(_GNU_SOURCE)
+	subprocess_timeout_desc_t subpTimeOut;
+	int timeoutSetupStatus;
+	int waitpid_interrupted;
+
+	if (timeout_ms > 0) timeoutSetupStatus = setupSubprocessTimeout(&subpTimeOut, timeout_ms);
+#endif
+
 	ret = waitpid(pWrkrData->pid, &status, 0);
+
+#if defined(__linux__) && defined(_GNU_SOURCE)
+	waitpid_interrupted = (ret != pWrkrData->pid) && (errno == EINTR);
+	if ((timeout_ms > 0) && (timeoutSetupStatus == RS_RET_OK))
+		doForceKillSubprocess(&subpTimeOut, waitpid_interrupted, pWrkrData->pid);
+	if (waitpid_interrupted) {
+		waitForChild(pWrkrData, -1);
+		return;
+	}
+#endif
+
 	if(ret != pWrkrData->pid) {
-		/* if waitpid() fails, we can not do much - try to ignore it... */
-		DBGPRINTF("omprog: waitpid() returned state %d[%s], future malfunction may happen\n", ret,
-			   rs_strerror_r(errno, errStr, sizeof(errStr)));
+		if (errno == ECHILD) {
+			errmsg.LogError(errno, RS_RET_OK_WARN, "Child %d doesn't seem to exist, "
+							"hence couldn't be reaped (reaped by main-loop?)", pWrkrData->pid);
+		} else {
+			errmsg.LogError(errno, RS_RET_SYS_ERR, "Cleanup failed for child %d", pWrkrData->pid);
+		}
 	} else {
 		/* check if we should print out some diagnostic information */
 		DBGPRINTF("omprog: waitpid status return for program '%s': %2.2x\n",
-			  pWrkrData->pData->szBinary, status);
+				  pWrkrData->pData->szBinary, status);
 		if(WIFEXITED(status)) {
 			errmsg.LogError(0, NO_ERRCODE, "program '%s' exited normally, state %d",
-					pWrkrData->pData->szBinary, WEXITSTATUS(status));
+							pWrkrData->pData->szBinary, WEXITSTATUS(status));
 		} else if(WIFSIGNALED(status)) {
 			errmsg.LogError(0, NO_ERRCODE, "program '%s' terminated by signal %d.",
-					pWrkrData->pData->szBinary, WTERMSIG(status));
+							pWrkrData->pData->szBinary, WTERMSIG(status));
 		}
+	}
+}
+
+/* clean up after a terminated child
+ */
+static rsRetVal
+cleanup(wrkrInstanceData_t *pWrkrData, long timeout_ms)
+{
+	DEFiRet;
+
+	assert(pWrkrData->bIsRunning == 1);
+
+	if (pWrkrData->pData->bSignalOnClose) {
+		waitForChild(pWrkrData, timeout_ms);
 	}
 
 	checkProgramOutput(pWrkrData); /* try to catch any late messages */
@@ -395,10 +511,20 @@ cleanup(wrkrInstanceData_t *pWrkrData)
 	RETiRet;
 }
 
+BEGINfreeWrkrInstance
+CODESTARTfreeWrkrInstance
+	if (pWrkrData->bIsRunning) {
+		if (pWrkrData->pData->bSignalOnClose) {
+			kill(pWrkrData->pid, SIGTERM);
+		}
+		CHKiRet(cleanup(pWrkrData, DEFAULT_FORCED_TERMINATION_TIMEOUT_MS));
+	}
+finalize_it:
+ENDfreeWrkrInstance
 
 /* try to restart the binary when it has stopped.
  */
-static inline rsRetVal
+static rsRetVal
 tryRestart(wrkrInstanceData_t *pWrkrData)
 {
 	DEFiRet;
@@ -427,14 +553,13 @@ writePipe(wrkrInstanceData_t *pWrkrData, uchar *szMsg)
 
 	do {
 		checkProgramOutput(pWrkrData);
-dbgprintf("omprog: writing to prog (fd %d): %s\n", pWrkrData->fdPipeOut, szMsg);
 		lenWritten = write(pWrkrData->fdPipeOut, ((char*)szMsg)+writeOffset, lenWrite);
 		if(lenWritten == -1) {
 			switch(errno) {
 			case EPIPE:
 				DBGPRINTF("omprog: program '%s' terminated, trying to restart\n",
 					  pWrkrData->pData->szBinary);
-				CHKiRet(cleanup(pWrkrData));
+				CHKiRet(cleanup(pWrkrData, 0));
 				CHKiRet(tryRestart(pWrkrData));
 				break;
 			default:
@@ -458,7 +583,6 @@ finalize_it:
 BEGINdoAction
 	instanceData *pData;
 CODESTARTdoAction
-dbgprintf("DDDD:omprog processing message\n");
 	pData = pWrkrData->pData;
 	if(pData->bForceSingleInst)
 		pthread_mutex_lock(&pData->mut);
@@ -475,7 +599,7 @@ dbgprintf("DDDD:omprog processing message\n");
 ENDdoAction
 
 
-static inline void
+static void
 setInstParamDefaults(instanceData *pData)
 {
 	pData->szBinary = NULL;
@@ -483,6 +607,8 @@ setInstParamDefaults(instanceData *pData)
 	pData->outputFileName = NULL;
 	pData->iParams = 0;
 	pData->bForceSingleInst = 0;
+	pData->bSignalOnClose = 0;
+	pData->iHUPForward = NO_HUP_FORWARD;
 }
 
 BEGINnewActInst
@@ -509,8 +635,8 @@ CODESTARTnewActInst
 		if(!pvals[i].bUsed)
 			continue;
 		if(!strcmp(actpblk.descr[i].name, "binary")) {
-			estrBinary = pvals[i].val.d.estr; 
-			estrParams = NULL; 
+			estrBinary = pvals[i].val.d.estr;
+			estrParams = NULL;
 
 			/* Search for space */
 			c = es_getBufAddr(pvals[i].val.d.estr);
@@ -518,18 +644,22 @@ CODESTARTnewActInst
 			while(iCnt < es_strlen(pvals[i].val.d.estr) ) {
 				if (c[iCnt] == ' ') {
 					/* Split binary name from parameters */
-					estrBinary = es_newStrFromSubStr ( pvals[i].val.d.estr, 0, iCnt ); 
-					estrParams = es_newStrFromSubStr ( pvals[i].val.d.estr, iCnt+1, es_strlen(pvals[i].val.d.estr)); 
+					estrBinary = es_newStrFromSubStr ( pvals[i].val.d.estr, 0, iCnt );
+					estrParams = es_newStrFromSubStr ( pvals[i].val.d.estr, iCnt+1, es_strlen(pvals[i].val.d.estr));
 					break;
 				}
 				iCnt++;
 			}	
 			/* Assign binary and params */
 			pData->szBinary = (uchar*)es_str2cstr(estrBinary, NULL);
-			dbgprintf("omprog: szBinary = '%s'\n", pData->szBinary); 
+			DBGPRINTF("omprog: szBinary = '%s'\n", pData->szBinary);
 			/* Check for Params! */
 			if (estrParams != NULL) {
-				dbgprintf("omprog: szParams = '%s'\n", es_str2cstr(estrParams, NULL) ); 
+				if(Debug) {
+					char *params = es_str2cstr(estrParams, NULL);
+					dbgprintf("omprog: szParams = '%s'\n", params);
+					free(params);
+				}
 				
 				/* Count parameters if set */
 				c = es_getBufAddr(estrParams); /* Reset to beginning */
@@ -537,10 +667,10 @@ CODESTARTnewActInst
 				iCnt = 0;
 				while(iCnt < es_strlen(estrParams) ) {
 					if (c[iCnt] == ' ' && c[iCnt-1] != '\\')
-						 pData->iParams++; 
+						 pData->iParams++;
 					iCnt++;
 				}
-				dbgprintf("omprog: iParams = '%d'\n", pData->iParams); 
+				DBGPRINTF("omprog: iParams = '%d'\n", pData->iParams);
 
 				/* Create argv Array */
 				CHKmalloc(pData->aParams = malloc( (pData->iParams+1) * sizeof(char*))); /* One more for first param */ 
@@ -548,32 +678,32 @@ CODESTARTnewActInst
 				/* Second Loop, create parameter array*/
 				c = es_getBufAddr(estrParams); /* Reset to beginning */
 				iCnt = iStr = iPrm = 0;
-				estrTmp = NULL; 
-				bInQuotes = FALSE; 
+				estrTmp = NULL;
+				bInQuotes = FALSE;
 				/* Set first parameter to binary */
-				pData->aParams[iPrm] = strdup((char*)pData->szBinary); 
-				dbgprintf("omprog: Param (%d): '%s'\n", iPrm, pData->aParams[iPrm]);
-				iPrm++; 
+				pData->aParams[iPrm] = strdup((char*)pData->szBinary);
+				DBGPRINTF("omprog: Param (%d): '%s'\n", iPrm, pData->aParams[iPrm]);
+				iPrm++;
 				while(iCnt < es_strlen(estrParams) ) {
 					if ( c[iCnt] == ' ' && !bInQuotes ) {
 						/* Copy into Param Array! */
-						estrTmp = es_newStrFromSubStr( estrParams, iStr, iCnt-iStr); 
+						estrTmp = es_newStrFromSubStr( estrParams, iStr, iCnt-iStr);
 					}
 					else if ( iCnt+1 >= es_strlen(estrParams) ) {
 						/* Copy rest of string into Param Array! */
-						estrTmp = es_newStrFromSubStr( estrParams, iStr, iCnt-iStr+1); 
+						estrTmp = es_newStrFromSubStr( estrParams, iStr, iCnt-iStr+1);
 					}
 					else if (c[iCnt] == '"') {
 						/* switch inQuotes Mode */
-						bInQuotes = !bInQuotes; 
+						bInQuotes = !bInQuotes;
 					}
 
 					if ( estrTmp != NULL ) {
-						pData->aParams[iPrm] = es_str2cstr(estrTmp, NULL); 
+						pData->aParams[iPrm] = es_str2cstr(estrTmp, NULL);
 						iStr = iCnt+1; /* Set new start */
-						dbgprintf("omprog: Param (%d): '%s'\n", iPrm, pData->aParams[iPrm]);
+						DBGPRINTF("omprog: Param (%d): '%s'\n", iPrm, pData->aParams[iPrm]);
 						es_deleteStr( estrTmp );
-						estrTmp = NULL; 
+						estrTmp = NULL;
 						iPrm++;
 					}
 
@@ -581,17 +711,37 @@ CODESTARTnewActInst
 					iCnt++;
 				}
 				/* NULL last parameter! */
-				pData->aParams[iPrm] = NULL; 
+				pData->aParams[iPrm] = NULL;
 
 			}
 		} else if(!strcmp(actpblk.descr[i].name, "output")) {
 			pData->outputFileName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
 		} else if(!strcmp(actpblk.descr[i].name, "forcesingleinstance")) {
 			pData->bForceSingleInst = (int) pvals[i].val.d.n;
+		} else if(!strcmp(actpblk.descr[i].name, "signalOnClose")) {
+			pData->bSignalOnClose = (int) pvals[i].val.d.n;
+		} else if(!strcmp(actpblk.descr[i].name, "hup.signal")) {
+			const char *const sig = es_str2cstr(pvals[i].val.d.estr, NULL);
+			if(!strcmp(sig, "HUP"))
+				pData->iHUPForward = SIGHUP;
+			else if(!strcmp(sig, "USR1"))
+				pData->iHUPForward = SIGUSR1;
+			else if(!strcmp(sig, "USR2"))
+				pData->iHUPForward = SIGUSR2;
+			else if(!strcmp(sig, "INT"))
+				pData->iHUPForward = SIGINT;
+			else if(!strcmp(sig, "TERM"))
+				pData->iHUPForward = SIGTERM;
+			else {
+				errmsg.LogError(0, RS_RET_CONF_PARAM_INVLD,
+					"omprog: hup.signal '%s' in hup.signal parameter", sig);
+				ABORT_FINALIZE(RS_RET_CONF_PARAM_INVLD);
+			}
+			free((void*)sig);
 		} else if(!strcmp(actpblk.descr[i].name, "template")) {
 			pData->tplName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
 		} else {
-			dbgprintf("omprog: program error, non-handled param '%s'\n", actpblk.descr[i].name);
+			DBGPRINTF("omprog: program error, non-handled param '%s'\n", actpblk.descr[i].name);
 		}
 	}
 
@@ -636,6 +786,15 @@ CODE_STD_FINALIZERparseSelectorAct
 ENDparseSelectorAct
 
 
+BEGINdoHUPWrkr
+CODESTARTdoHUPWrkr
+	DBGPRINTF("omprog: processing HUP for work instance %p, pid %d, forward: %d\n",
+		pWrkrData, (int) pWrkrData->pid, pWrkrData->pData->iHUPForward);
+	if(pWrkrData->pData->iHUPForward != NO_HUP_FORWARD)
+		kill(pWrkrData->pid, pWrkrData->pData->iHUPForward);
+ENDdoHUPWrkr
+
+
 BEGINmodExit
 CODESTARTmodExit
 	free(cs.szBinary);
@@ -651,6 +810,7 @@ CODEqueryEtryPt_STD_OMOD_QUERIES
 CODEqueryEtryPt_STD_OMOD8_QUERIES
 CODEqueryEtryPt_STD_CONF2_CNFNAME_QUERIES 
 CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
+CODEqueryEtryPt_doHUPWrkr
 ENDqueryEtryPt
 
 
@@ -672,8 +832,10 @@ INITLegCnfVars
 	*ipIFVersProvided = CURR_MOD_IF_VERSION; /* we only support the current interface specification */
 CODEmodInit_QueryRegCFSLineHdlr
 	CHKiRet(objUse(errmsg, CORE_COMPONENT));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"actionomprogbinary", 0, eCmdHdlrGetWord, NULL, &cs.szBinary, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler, resetConfigVariables, NULL, STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"actionomprogbinary", 0, eCmdHdlrGetWord, NULL, &cs.szBinary,
+	STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler, resetConfigVariables,
+	NULL, STD_LOADABLE_MODULE_ID));
 CODEmodInit_QueryRegCFSLineHdlr
 ENDmodInit
 

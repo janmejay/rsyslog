@@ -10,18 +10,18 @@
  *
  * File begun on 2010-08-10 by RGerhards
  *
- * Copyright 2007-2015 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2007-2016 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of rsyslog.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
+ *
  *       http://www.apache.org/licenses/LICENSE-2.0
  *       -or-
  *       see COPYING.ASL20 in the source distribution
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -48,7 +48,9 @@
 #include <netdb.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/epoll.h>
+#include <sys/queue.h>
 #include <netinet/tcp.h>
 #include <stdint.h>
 #include <zlib.h>
@@ -75,7 +77,6 @@
 /* the define is from tcpsrv.h, we need to find a new (but easier!!!) abstraction layer some time ... */
 #define TCPSRV_NO_ADDTL_DELIMITER -1 /* specifies that no additional delimiter is to be used in TCP framing */
 
-
 MODULE_TYPE_INPUT
 MODULE_TYPE_NOKEEP
 MODULE_CNFNAME("imptcp")
@@ -94,6 +95,7 @@ DEFobjCurrIf(statsobj)
 static void * wrkr(void *myself);
 
 #define DFLT_wrkrMax 2
+#define DFLT_inlineDispatchThreshold 1
 
 #define COMPRESS_NEVER 0
 #define COMPRESS_SINGLE_MSG 1	/* old, single-message compression */
@@ -128,10 +130,12 @@ struct instanceConf_s {
 	uint8_t compressionMode;
 	uchar *pszBindPort;		/* port to bind to */
 	uchar *pszBindAddr;		/* IP to bind socket to */
+	uchar *pszBindPath;     /* Path to bind socket to */
 	uchar *pszBindRuleset;		/* name of ruleset to bind to */
 	uchar *pszInputName;		/* value for inputname property, NULL is OK and handled by core engine */
 	ruleset_t *pBindRuleset;	/* ruleset to bind listener to (use system default if unspecified) */
 	uchar *dfltTZ;
+	sbool bUnlink;
 	int ratelimitInterval;
 	int ratelimitBurst;
 	struct instanceConf_s *next;
@@ -142,6 +146,7 @@ struct modConfData_s {
 	rsconf_t *pConf;		/* our overall config object */
 	instanceConf_t *root, *tail;
 	int wrkrMax;
+	int bProcessOnPoller;
 	sbool configSetViaV2Method;
 };
 
@@ -150,7 +155,8 @@ static modConfData_t *runModConf = NULL;/* modConf ptr to use for the current lo
 
 /* module-global parameters */
 static struct cnfparamdescr modpdescr[] = {
-	{ "threads", eCmdHdlrPositiveInt, 0 }
+	{ "threads", eCmdHdlrPositiveInt, 0 },
+	{ "processOnPoller", eCmdHdlrBinary, 0 }
 };
 static struct cnfparamblk modpblk =
 	{ CNFPARAMBLK_VERSION,
@@ -160,8 +166,10 @@ static struct cnfparamblk modpblk =
 
 /* input instance parameters */
 static struct cnfparamdescr inppdescr[] = {
-	{ "port", eCmdHdlrString, CNFPARAM_REQUIRED }, /* legacy: InputTCPServerRun */
+	{ "port", eCmdHdlrString, 0 }, /* legacy: InputTCPServerRun */
 	{ "address", eCmdHdlrString, 0 },
+	{ "path", eCmdHdlrString, 0 },
+	{ "unlink", eCmdHdlrBinary, 0 },
 	{ "name", eCmdHdlrString, 0 },
 	{ "ruleset", eCmdHdlrString, 0 },
 	{ "defaulttz", eCmdHdlrString, 0 },
@@ -200,6 +208,8 @@ struct ptcpsrv_s {
 	ptcpsrv_t *pNext;		/* linked list maintenance */
 	uchar *port;			/* Port to listen to */
 	uchar *lstnIP;			/* which IP we should listen on? */
+	uchar *path;            /* Use a unix socket instead */
+	sbool bUnixSocket;
 	int iAddtlFrameDelim;
 	int iKeepAliveIntvl;
 	int iKeepAliveProbes;
@@ -216,6 +226,7 @@ struct ptcpsrv_s {
 	sbool bEmitMsgOnClose;
 	sbool bSuppOctetFram;
 	sbool bSPFramingFix;
+	sbool bUnlink;
 	ratelimit_t *ratelimiter;
 };
 
@@ -270,12 +281,8 @@ struct ptcplstn_s {
  */
 static struct wrkrInfo_s {
 	pthread_t tid;	/* the worker's thread ID */
-	pthread_cond_t run;
-	struct epoll_event *event; /* event == NULL -> idle */
 	long long unsigned numCalled;	/* how often was this called */
-} wrkrInfo[16];
-static pthread_mutex_t wrkrMut;
-static pthread_cond_t wrkrIdle;
+} *wrkrInfo;
 static int wrkrRunning;
 
 
@@ -291,15 +298,31 @@ typedef enum {
 struct epolld_s {
 	epolld_type_t typ;
 	void *ptr;
+	int sock;
 	struct epoll_event ev;
 };
 
+typedef struct io_req_s {
+	STAILQ_ENTRY(io_req_s) link;
+	epolld_t *epd;
+} io_req_t;
+
+typedef struct io_q_s {
+	STAILQ_HEAD(ioq_s, io_req_s) q;
+	STATSCOUNTER_DEF(ctrEnq, mutCtrEnq);
+	int ctrMaxSz; //TODO: discuss potential problems around concurrent reads and writes
+	int sz; //current q size
+	statsobj_t *stats;
+	pthread_mutex_t mut;
+	pthread_cond_t wakeup_worker;
+} io_q_t;
 
 /* global data */
 pthread_attr_t wrkrThrdAttr;	/* Attribute for session threads; read only after startup */
 static ptcpsrv_t *pSrvRoot = NULL;
 static int epollfd = -1;			/* (sole) descriptor for epoll */
 static int iMaxLine; /* maximum size of a single message */
+static io_q_t io_q;
 
 /* forward definitions */
 static rsRetVal resetConfigVariables(uchar __attribute__((unused)) *pp, void __attribute__((unused)) *pVal);
@@ -332,6 +355,8 @@ destructSrv(ptcpsrv_t *pSrv)
 		free(pSrv->pszInputName);
 	if(pSrv->port != NULL)
 		free(pSrv->port);
+	if(pSrv->path != NULL)
+		free(pSrv->path);
 	if(pSrv->lstnIP != NULL)
 		free(pSrv->lstnIP);
 	free(pSrv);
@@ -342,6 +367,60 @@ destructSrv(ptcpsrv_t *pSrv)
  * so far was to keep everything related close togehter. -- rgerhards, 2010-08-10
  */
 
+static rsRetVal startupUXSrv(ptcpsrv_t *pSrv) {
+	DEFiRet;
+	int sock;
+	int sockflags;
+	struct sockaddr_un local;
+
+	uchar *path = pSrv->path == NULL ? UCHAR_CONSTANT("") : pSrv->path;
+	DBGPRINTF("imptcp: creating listen unix socket at %s\n", path);
+
+	sock = socket(AF_UNIX, SOCK_STREAM, 0);
+	if(sock < 0) {
+		errmsg.LogError(errno, RS_RET_ERR_CRE_AFUX, "imptcp: error creating unix socket");
+		ABORT_FINALIZE(RS_RET_ERR_CRE_AFUX);
+	}
+
+	local.sun_family = AF_UNIX;
+	strncpy(local.sun_path, (char*) path, sizeof(local.sun_path));
+	if (pSrv->bUnlink) {
+		unlink(local.sun_path);
+	}
+
+	/* We use non-blocking IO! */
+	if ((sockflags = fcntl(sock, F_GETFL)) != -1) {
+		sockflags |= O_NONBLOCK;
+		/* SETFL could fail too, so get it caught by the subsequent error check. */
+		sockflags = fcntl(sock, F_SETFL, sockflags);
+	}
+
+	if (sockflags == -1) {
+		errmsg.LogError(errno, RS_RET_ERR_CRE_AFUX, "imptcp: error setting fcntl(O_NONBLOCK) on unix socket");
+		ABORT_FINALIZE(RS_RET_ERR_CRE_AFUX);
+	}
+
+	if (bind(sock, (struct sockaddr *)&local, SUN_LEN(&local)) < 0) {
+		errmsg.LogError(errno, RS_RET_ERR_CRE_AFUX, "imptcp: error while binding unix socket");
+		ABORT_FINALIZE(RS_RET_ERR_CRE_AFUX);
+	}
+
+	if (listen(sock, 5) < 0) {
+		errmsg.LogError(errno, RS_RET_ERR_CRE_AFUX, "imptcp: unix socket listen error");
+		ABORT_FINALIZE(RS_RET_ERR_CRE_AFUX);
+	}
+
+	CHKiRet(addLstn(pSrv, sock, 0));
+
+finalize_it:
+	if (iRet != RS_RET_OK) {
+		if (sock != -1) {
+			close(sock);
+		}
+	}
+
+	RETiRet;
+}
 
 /* Start up a server. That means all of its listeners are created.
  * Does NOT yet accept/process any incoming data (but binds ports). Hint: this
@@ -351,62 +430,68 @@ static rsRetVal
 startupSrv(ptcpsrv_t *pSrv)
 {
 	DEFiRet;
-        int error, maxs, on = 1;
+	int error, maxs, on = 1;
 	int sock = -1;
 	int numSocks;
 	int sockflags;
-        struct addrinfo hints, *res = NULL, *r;
+	struct addrinfo hints, *res = NULL, *r;
 	uchar *lstnIP;
 	int isIPv6 = 0;
+
+	if (pSrv->bUnixSocket) {
+		return startupUXSrv(pSrv);
+	}
 
 	lstnIP = pSrv->lstnIP == NULL ? UCHAR_CONSTANT("") : pSrv->lstnIP;
 
 	DBGPRINTF("imptcp: creating listen socket on server '%s', port %s\n", lstnIP, pSrv->port);
 
-        memset(&hints, 0, sizeof(hints));
-        hints.ai_flags = AI_PASSIVE;
-        hints.ai_family = glbl.GetDefPFFamily();
-        hints.ai_socktype = SOCK_STREAM;
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_flags = AI_PASSIVE;
+	hints.ai_family = glbl.GetDefPFFamily();
+	hints.ai_socktype = SOCK_STREAM;
 
-        error = getaddrinfo((char*)pSrv->lstnIP, (char*) pSrv->port, &hints, &res);
-        if(error) {
+	error = getaddrinfo((char*)pSrv->lstnIP, (char*) pSrv->port, &hints, &res);
+	if(error) {
 		DBGPRINTF("error %d querying server '%s', port '%s'\n", error, pSrv->lstnIP, pSrv->port);
 		ABORT_FINALIZE(RS_RET_INVALID_PORT);
 	}
 
-        /* Count max number of sockets we may open */
-        for(maxs = 0, r = res; r != NULL ; r = r->ai_next, maxs++)
+	/* Count max number of sockets we may open */
+	for(maxs = 0, r = res; r != NULL ; r = r->ai_next, maxs++) {
 		/* EMPTY */;
+	}
 
-        numSocks = 0;   /* num of sockets counter at start of array */
+	numSocks = 0;   /* num of sockets counter at start of array */
 	for(r = res; r != NULL ; r = r->ai_next) {
-               sock = socket(r->ai_family, r->ai_socktype, r->ai_protocol);
-        	if(sock < 0) {
-			if(!(r->ai_family == PF_INET6 && errno == EAFNOSUPPORT))
+		sock = socket(r->ai_family, r->ai_socktype, r->ai_protocol);
+		if(sock < 0) {
+			if(!(r->ai_family == PF_INET6 && errno == EAFNOSUPPORT)) {
 				DBGPRINTF("error %d creating tcp listen socket", errno);
 				/* it is debatable if PF_INET with EAFNOSUPPORT should
 				 * also be ignored...
 				 */
-                        continue;
-                }
+				continue;
+			}
+		}
 
-                if(r->ai_family == AF_INET6) {
+		if(r->ai_family == AF_INET6) {
 			isIPv6 = 1;
 #ifdef IPV6_V6ONLY
-                	int iOn = 1;
-			if(setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY,
-			      (char *)&iOn, sizeof (iOn)) < 0) {
+			int iOn = 1;
+			if(setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, (char *)&iOn, sizeof (iOn)) < 0) {
 				close(sock);
 				sock = -1;
 				continue;
-                	}
+			}
 #endif
-                } else {
+		} else {
 			isIPv6 = 0;
 		}
-       		if(setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *) &on, sizeof(on)) < 0 ) {
+
+		if(setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *) &on, sizeof(on)) < 0 ) {
 			DBGPRINTF("error %d setting tcp socket option\n", errno);
-                        close(sock);
+			close(sock);
 			sock = -1;
 			continue;
 		}
@@ -421,7 +506,7 @@ startupSrv(ptcpsrv_t *pSrv)
 		}
 		if(sockflags == -1) {
 			DBGPRINTF("error %d setting fcntl(O_NONBLOCK) on tcp socket", errno);
-                        close(sock);
+            close(sock);
 			sock = -1;
 			continue;
 		}
@@ -431,6 +516,7 @@ startupSrv(ptcpsrv_t *pSrv)
 		/* We need to enable BSD compatibility. Otherwise an attacker
 		 * could flood our log files by sending us tons of ICMP errors.
 		 */
+#if !defined (_AIX)
 #ifndef BSD	
 		if(net.should_use_so_bsdcompat()) {
 			if (setsockopt(sock, SOL_SOCKET, SO_BSDCOMPAT,
@@ -442,20 +528,20 @@ startupSrv(ptcpsrv_t *pSrv)
 			}
 		}
 #endif
-
-	        if( (bind(sock, r->ai_addr, r->ai_addrlen) < 0)
+#endif 
+		if( (bind(sock, r->ai_addr, r->ai_addrlen) < 0)
 #ifndef IPV6_V6ONLY
 		     && (errno != EADDRINUSE)
 #endif
-	           ) {
+	    ) {
 			/* TODO: check if *we* bound the socket - else we *have* an error! */
 			char errStr[1024];
 			rs_strerror_r(errno, errStr, sizeof(errStr));
-                        dbgprintf("error %d while binding tcp socket: %s\n", errno, errStr);
-                	close(sock);
+			dbgprintf("error %d while binding tcp socket: %s\n", errno, errStr);
+			close(sock);
 			sock = -1;
-                        continue;
-                }
+			continue;
+		}
 
 		if(listen(sock, 511) < 0) {
 			DBGPRINTF("tcp listen error %d, suspending\n", errno);
@@ -471,22 +557,25 @@ startupSrv(ptcpsrv_t *pSrv)
 		++numSocks;
 	}
 
-	if(numSocks != maxs)
+	if(numSocks != maxs) {
 		DBGPRINTF("We could initialize %d TCP listen sockets out of %d we received "
 		 	  "- this may or may not be an error indication.\n", numSocks, maxs);
+	}
 
-        if(numSocks == 0) {
+	if(numSocks == 0) {
 		DBGPRINTF("No TCP listen sockets could successfully be initialized");
 		ABORT_FINALIZE(RS_RET_COULD_NOT_BIND);
 	}
 
 finalize_it:
-	if(res != NULL)
+	if(res != NULL) {
 		freeaddrinfo(res);
+	}
 
 	if(iRet != RS_RET_OK) {
-		if(sock != -1)
+		if(sock != -1) {
 			close(sock);
+		}
 	}
 
 	RETiRet;
@@ -503,7 +592,7 @@ finalize_it:
  * rgerhards, 2008-03-31
  */
 static rsRetVal
-getPeerNames(prop_t **peerName, prop_t **peerIP, struct sockaddr *pAddr)
+getPeerNames(prop_t **peerName, prop_t **peerIP, struct sockaddr *pAddr, sbool bUXServer)
 {
 	int error;
 	uchar szIP[NI_MAXHOST] = "";
@@ -516,36 +605,41 @@ getPeerNames(prop_t **peerName, prop_t **peerIP, struct sockaddr *pAddr)
 	*peerName = NULL;
 	*peerIP = NULL;
 
-	error = getnameinfo(pAddr, SALEN(pAddr), (char*)szIP, sizeof(szIP), NULL, 0, NI_NUMERICHOST);
-        if(error) {
-                DBGPRINTF("Malformed from address %s\n", gai_strerror(error));
-		strcpy((char*)szHname, "???");
-		strcpy((char*)szIP, "???");
-		ABORT_FINALIZE(RS_RET_INVALID_HNAME);
-	}
+	if (bUXServer) {
+		strcpy((char *) szHname, (char *) glbl.GetLocalHostName());
+		strcpy((char *) szIP, (char *) glbl.GetLocalHostIP());
+	} else {
+		error = getnameinfo(pAddr, SALEN(pAddr), (char *) szIP, sizeof(szIP), NULL, 0, NI_NUMERICHOST);
+		if (error) {
+			DBGPRINTF("Malformed from address %s\n", gai_strerror(error));
+			strcpy((char *) szHname, "???");
+			strcpy((char *) szIP, "???");
+			ABORT_FINALIZE(RS_RET_INVALID_HNAME);
+		}
 
-	if(!glbl.GetDisableDNS()) {
-		error = getnameinfo(pAddr, SALEN(pAddr), (char*)szHname, NI_MAXHOST, NULL, 0, NI_NAMEREQD);
-		if(error == 0) {
-			memset (&hints, 0, sizeof (struct addrinfo));
-			hints.ai_flags = AI_NUMERICHOST;
-			hints.ai_socktype = SOCK_STREAM;
-			/* we now do a lookup once again. This one should fail,
-			 * because we should not have obtained a non-numeric address. If
-			 * we got a numeric one, someone messed with DNS!
-			 */
-			if(getaddrinfo((char*)szHname, NULL, &hints, &res) == 0) {
-				freeaddrinfo (res);
-				/* OK, we know we have evil, so let's indicate this to our caller */
-				snprintf((char*)szHname, NI_MAXHOST, "[MALICIOUS:IP=%s]", szIP);
-				DBGPRINTF("Malicious PTR record, IP = \"%s\" HOST = \"%s\"", szIP, szHname);
-				bMaliciousHName = 1;
+		if (!glbl.GetDisableDNS()) {
+			error = getnameinfo(pAddr, SALEN(pAddr), (char *) szHname, NI_MAXHOST, NULL, 0, NI_NAMEREQD);
+			if (error == 0) {
+				memset(&hints, 0, sizeof(struct addrinfo));
+				hints.ai_flags = AI_NUMERICHOST;
+				hints.ai_socktype = SOCK_STREAM;
+				/* we now do a lookup once again. This one should fail,
+				 * because we should not have obtained a non-numeric address. If
+				 * we got a numeric one, someone messed with DNS!
+				 */
+				if (getaddrinfo((char *) szHname, NULL, &hints, &res) == 0) {
+					freeaddrinfo(res);
+					/* OK, we know we have evil, so let's indicate this to our caller */
+					snprintf((char *) szHname, NI_MAXHOST, "[MALICIOUS:IP=%s]", szIP);
+					DBGPRINTF("Malicious PTR record, IP = \"%s\" HOST = \"%s\"", szIP, szHname);
+					bMaliciousHName = 1;
+				}
+			} else {
+				strcpy((char *) szHname, (char *) szIP);
 			}
 		} else {
-			strcpy((char*)szHname, (char*)szIP);
+			strcpy((char *) szHname, (char *) szIP);
 		}
-	} else {
-		strcpy((char*)szHname, (char*)szIP);
 	}
 
 	/* We now have the names, so now let's allocate memory and store them permanently. */
@@ -570,7 +664,7 @@ finalize_it:
 
 
 /* Enable KEEPALIVE handling on the socket.  */
-static inline rsRetVal
+static rsRetVal
 EnableKeepAlive(ptcplstn_t *pLstn, int sock)
 {
 	int ret;
@@ -661,8 +755,7 @@ AcceptConnReq(ptcplstn_t *pLstn, int *newSock, prop_t **peerName, prop_t **peerI
 	if(pLstn->pSrv->bKeepAlive)
 		EnableKeepAlive(pLstn, iNewSock);/* we ignore errors, best to do! */
 
-	
-	CHKiRet(getPeerNames(peerName, peerIP, (struct sockaddr*) &addr));
+	CHKiRet(getPeerNames(peerName, peerIP, (struct sockaddr *) &addr, pLstn->pSrv->bUnixSocket));
 
 	/* set the new socket to non-blocking IO */
 	if((sockflags = fcntl(iNewSock, F_GETFL)) != -1) {
@@ -706,7 +799,7 @@ finalize_it:
 static rsRetVal
 doSubmitMsg(ptcpsess_t *pThis, struct syslogTime *stTime, time_t ttGenTime, multi_submit_t *pMultiSub)
 {
-	msg_t *pMsg;
+	smsg_t *pMsg;
 	ptcpsrv_t *pSrv;
 	DEFiRet;
 
@@ -747,10 +840,18 @@ finalize_it:
  * rgerhards, 2008-03-14
  * EXTRACT from tcps_sess.c
  */
-static inline rsRetVal
-processDataRcvd(ptcpsess_t *pThis, char c, struct syslogTime *stTime, time_t ttGenTime, multi_submit_t *pMultiSub)
+static rsRetVal
+processDataRcvd(ptcpsess_t *const __restrict__ pThis,
+	char **buff,
+	const int buffLen,
+	struct syslogTime *stTime,
+	const time_t ttGenTime,
+	multi_submit_t *pMultiSub,
+	unsigned *const __restrict__ pnMsgs)
 {
 	DEFiRet;
+	char c = **buff;
+	int octatesToCopy, octatesToDiscard;
 
 	if(pThis->inputState == eAtStrtFram) {
 		if(pThis->bSuppOctetFram && isdigit((int) c)) {
@@ -797,42 +898,60 @@ processDataRcvd(ptcpsess_t *pThis, char c, struct syslogTime *stTime, time_t ttG
 		}
 	} else {
 		assert(pThis->inputState == eInMsg);
-		if(pThis->iMsg >= iMaxLine) {
-			/* emergency, we now need to flush, no matter if we are at end of message or not... */
-			DBGPRINTF("error: message received is larger than max msg size, we split it\n");
-			doSubmitMsg(pThis, stTime, ttGenTime, pMultiSub);
-			/* we might think if it is better to ignore the rest of the
-			 * message than to treat it as a new one. Maybe this is a good
-			 * candidate for a configuration parameter...
-			 * rgerhards, 2006-12-04
-			 */
-		}
 
-		if((   (c == '\n')
-		   || ((pThis->pLstn->pSrv->iAddtlFrameDelim != TCPSRV_NO_ADDTL_DELIMITER)
-		       && (c == pThis->pLstn->pSrv->iAddtlFrameDelim))
-		   ) && pThis->eFraming == TCP_FRAMING_OCTET_STUFFING) { /* record delimiter? */
-			doSubmitMsg(pThis, stTime, ttGenTime, pMultiSub);
-			pThis->inputState = eAtStrtFram;
-		} else {
-			/* IMPORTANT: here we copy the actual frame content to the message - for BOTH framing modes!
-			 * If we have a message that is larger than the max msg size, we truncate it. This is the best
-			 * we can do in light of what the engine supports. -- rgerhards, 2008-03-14
-			 */
-			if(pThis->iMsg < iMaxLine) {
-				*(pThis->pMsg + pThis->iMsg++) = c;
+		if (pThis->eFraming == TCP_FRAMING_OCTET_STUFFING) {
+			if(pThis->iMsg >= iMaxLine) {
+				/* emergency, we now need to flush, no matter if we are at end of message or not... */
+				DBGPRINTF("error: message received is larger than max msg size, we split it\n");
+				doSubmitMsg(pThis, stTime, ttGenTime, pMultiSub);
+				++(*pnMsgs);
+				/* we might think if it is better to ignore the rest of the
+				 * message than to treat it as a new one. Maybe this is a good
+				 * candidate for a configuration parameter...
+				 * rgerhards, 2006-12-04
+				 */
 			}
-		}
 
-		if(pThis->eFraming == TCP_FRAMING_OCTET_COUNTING) {
-			/* do we need to find end-of-frame via octet counting? */
-			pThis->iOctetsRemain--;
-			if(pThis->iOctetsRemain < 1) {
+			if ((c == '\n')
+				   || ((pThis->pLstn->pSrv->iAddtlFrameDelim != TCPSRV_NO_ADDTL_DELIMITER)
+					   && (c == pThis->pLstn->pSrv->iAddtlFrameDelim))
+				   ) { /* record delimiter? */
+				doSubmitMsg(pThis, stTime, ttGenTime, pMultiSub);
+				++(*pnMsgs);
+				pThis->inputState = eAtStrtFram;
+			} else {
+				/* IMPORTANT: here we copy the actual frame content to the message - for BOTH framing modes!
+				 * If we have a message that is larger than the max msg size, we truncate it. This is the best
+				 * we can do in light of what the engine supports. -- rgerhards, 2008-03-14
+				 */
+				if(pThis->iMsg < iMaxLine) {
+					*(pThis->pMsg + pThis->iMsg++) = c;
+				}
+			}
+		} else {
+			assert(pThis->eFraming == TCP_FRAMING_OCTET_COUNTING);
+			octatesToCopy = pThis->iOctetsRemain;
+			octatesToDiscard = 0;
+			if (buffLen < octatesToCopy) {
+				octatesToCopy = buffLen;
+			}
+			if (octatesToCopy + pThis->iMsg > iMaxLine) {
+				octatesToDiscard = octatesToCopy - (iMaxLine - pThis->iMsg);
+				octatesToCopy = iMaxLine - pThis->iMsg;
+			}
+
+			memcpy(pThis->pMsg + pThis->iMsg, *buff, octatesToCopy);
+			pThis->iMsg += octatesToCopy;
+			pThis->iOctetsRemain -= (octatesToCopy + octatesToDiscard);
+			*buff += (octatesToCopy + octatesToDiscard - 1);
+			if (pThis->iOctetsRemain == 0) {
 				/* we have end of frame! */
 				doSubmitMsg(pThis, stTime, ttGenTime, pMultiSub);
+				++(*pnMsgs);
 				pThis->inputState = eAtStrtFram;
 			}
 		}
+
 	}
 
 finalize_it:
@@ -860,15 +979,16 @@ static rsRetVal
 DataRcvdUncompressed(ptcpsess_t *pThis, char *pData, size_t iLen, struct syslogTime *stTime, time_t ttGenTime)
 {
 	multi_submit_t multiSub;
-	msg_t *pMsgs[CONF_NUM_MULTISUB];
+	smsg_t *pMsgs[CONF_NUM_MULTISUB];
 	char *pEnd;
+	unsigned nMsgs = 0;
 	DEFiRet;
 
 	assert(pData != NULL);
 	assert(iLen > 0);
 
 	if(ttGenTime == 0)
-		datetime.getCurrTime(stTime, &ttGenTime);
+		datetime.getCurrTime(stTime, &ttGenTime, TIME_IN_LOCALTIME);
 	multiSub.ppMsgs = pMsgs;
 	multiSub.maxElem = CONF_NUM_MULTISUB;
 	multiSub.nElem = 0;
@@ -877,10 +997,14 @@ DataRcvdUncompressed(ptcpsess_t *pThis, char *pData, size_t iLen, struct syslogT
 	pEnd = pData + iLen; /* this is one off, which is intensional */
 
 	while(pData < pEnd) {
-		CHKiRet(processDataRcvd(pThis, *pData++, stTime, ttGenTime, &multiSub));
+		CHKiRet(processDataRcvd(pThis, &pData, pEnd - pData, stTime, ttGenTime, &multiSub, &nMsgs));
+		pData++;
 	}
 
 	iRet = multiSubmitFlush(&multiSub);
+
+	if(glblSenderKeepTrack)
+		statsRecordSender(propGetSzStr(pThis->peerName), nMsgs, ttGenTime);
 
 finalize_it:
 	RETiRet;
@@ -899,7 +1023,7 @@ DataRcvdCompressed(ptcpsess_t *pThis, char *buf, size_t len)
 	// by simply updating the input and output sizes?
 	uint64_t outtotal;
 
-	datetime.getCurrTime(&stTime, &ttGenTime);
+	datetime.getCurrTime(&stTime, &ttGenTime, TIME_IN_LOCALTIME);
 	outtotal = 0;
 
 	if(!pThis->bzInitDone) {
@@ -955,7 +1079,7 @@ DataRcvd(ptcpsess_t *pThis, char *pData, size_t iLen)
 /****************************************** --END-- TCP SUPPORT FUNCTIONS ***********************************/
 
 
-static inline void
+static void
 initConfigSettings(void)
 {
 	cs.bEmitMsgOnClose = 0;
@@ -971,17 +1095,18 @@ initConfigSettings(void)
 
 /* add socket to the epoll set
  */
-static inline rsRetVal
+static rsRetVal
 addEPollSock(epolld_type_t typ, void *ptr, int sock, epolld_t **pEpd)
 {
 	DEFiRet;
 	epolld_t *epd = NULL;
 
-	CHKmalloc(epd = calloc(sizeof(epolld_t), 1));
+	CHKmalloc(epd = calloc(1, sizeof(epolld_t)));
 	epd->typ = typ;
 	epd->ptr = ptr;
+	epd->sock = sock;
 	*pEpd = epd;
-	epd->ev.events = EPOLLIN|EPOLLET;
+	epd->ev.events = EPOLLIN|EPOLLET|EPOLLONESHOT;
 	epd->ev.data.ptr = (void*) epd;
 
 	if(epoll_ctl(epollfd, EPOLL_CTL_ADD, sock, &(epd->ev)) != 0) {
@@ -996,6 +1121,10 @@ addEPollSock(epolld_type_t typ, void *ptr, int sock, epolld_t **pEpd)
 
 finalize_it:
 	if(iRet != RS_RET_OK) {
+		if (epd != NULL) {
+			errmsg.LogError(0, RS_RET_INTERNAL_ERROR, "error: could not initialize mutex for ptcp "
+			"connection for socket: %d", sock);
+		}
 		free(epd);
 	}
 	RETiRet;
@@ -1008,7 +1137,7 @@ finalize_it:
  * For simplicity, we supply the same pointer we had when we created the
  * event (it's simple because we have it at hand).
  */
-static inline rsRetVal
+static rsRetVal
 removeEPollSock(int sock, epolld_t *epd)
 {
 	DEFiRet;
@@ -1101,7 +1230,7 @@ addSess(ptcplstn_t *pLstn, int sock, prop_t *peerName, prop_t *peerIP)
 	ptcpsrv_t *pSrv = pLstn->pSrv;
 
 	CHKmalloc(pSess = malloc(sizeof(ptcpsess_t)));
-	CHKmalloc(pSess->pMsg = malloc(iMaxLine * sizeof(uchar)));
+	CHKmalloc(pSess->pMsg = malloc(iMaxLine));
 	pSess->pLstn = pLstn;
 	pSess->sock = sock;
 	pSess->bSuppOctetFram = pLstn->bSuppOctetFram;
@@ -1114,8 +1243,6 @@ addSess(ptcplstn_t *pLstn, int sock, prop_t *peerName, prop_t *peerIP)
 	pSess->peerIP = peerIP;
 	pSess->compressionMode = pLstn->pSrv->compressionMode;
 
-	CHKiRet(addEPollSock(epolld_sess, pSess, sock, &pSess->epd));
-
 	/* add to start of server's listener list */
 	pSess->prev = NULL;
 	pthread_mutex_lock(&pSrv->mutSessLst);
@@ -1124,6 +1251,8 @@ addSess(ptcplstn_t *pLstn, int sock, prop_t *peerName, prop_t *peerIP)
 		pSrv->pSess->prev = pSess;
 	pSrv->pSess = pSess;
 	pthread_mutex_unlock(&pSrv->mutSessLst);
+
+	CHKiRet(addEPollSock(epolld_sess, pSess, sock, &pSess->epd));
 
 finalize_it:
 	if(iRet != RS_RET_OK) {
@@ -1155,7 +1284,8 @@ doZipFinish(ptcpsess_t *pSess)
 	pSess->zstrm.avail_in = 0;
 	/* run inflate() on buffer until everything has been compressed */
 	do {
-		DBGPRINTF("doZipFinish: in inflate() loop, avail_in %d, total_in %ld\n", pSess->zstrm.avail_in, pSess->zstrm.total_in);
+		DBGPRINTF("doZipFinish: in inflate() loop, avail_in %d, total_in %ld\n", pSess->zstrm.avail_in,
+		pSess->zstrm.total_in);
 		pSess->zstrm.avail_out = sizeof(zipBuf);
 		pSess->zstrm.next_out = zipBuf;
 		zRet = inflate(&pSess->zstrm, Z_FINISH);    /* no bad return value */
@@ -1215,7 +1345,7 @@ finalize_it:
 }
 
 
-/* create input instance, set default paramters, and
+/* create input instance, set default parameters, and
  * add it to the list of instances.
  */
 static rsRetVal
@@ -1228,6 +1358,8 @@ createInstance(instanceConf_t **pinst)
 
 	inst->pszBindPort = NULL;
 	inst->pszBindAddr = NULL;
+	inst->pszBindPath = NULL;
+	inst->bUnlink = 0;
 	inst->pszBindRuleset = NULL;
 	inst->pszInputName = NULL;
 	inst->bSuppOctetFram = 1;
@@ -1306,7 +1438,7 @@ finalize_it:
 }
 
 
-static inline rsRetVal
+static rsRetVal
 addListner(modConfData_t __attribute__((unused)) *modConf, instanceConf_t *inst)
 {
 	DEFiRet;
@@ -1325,22 +1457,33 @@ addListner(modConfData_t __attribute__((unused)) *modConf, instanceConf_t *inst)
 	pSrv->bEmitMsgOnClose = inst->bEmitMsgOnClose;
 	pSrv->compressionMode = inst->compressionMode;
 	pSrv->dfltTZ = inst->dfltTZ;
-	CHKiRet(ratelimitNew(&pSrv->ratelimiter, "imtcp", (char*)inst->pszBindPort));
-	ratelimitSetLinuxLike(pSrv->ratelimiter, inst->ratelimitInterval, inst->ratelimitBurst);
-	ratelimitSetThreadSafe(pSrv->ratelimiter);
-	CHKmalloc(pSrv->port = ustrdup(inst->pszBindPort));
+	if (inst->pszBindPort != NULL) {
+		CHKmalloc(pSrv->port = ustrdup(inst->pszBindPort));
+	}
 	pSrv->iAddtlFrameDelim = inst->iAddtlFrameDelim;
-	if(inst->pszBindAddr == NULL)
+	if (inst->pszBindAddr == NULL) {
 		pSrv->lstnIP = NULL;
-	else {
+	} else {
 		CHKmalloc(pSrv->lstnIP = ustrdup(inst->pszBindAddr));
 	}
+	if (inst->pszBindPath == NULL) {
+		pSrv->path = NULL;
+	} else {
+		CHKmalloc(pSrv->path = ustrdup(inst->pszBindPath));
+		CHKmalloc(pSrv->port = ustrdup(inst->pszBindPath));
+		pSrv->bUnixSocket = 1;
+	}
+
+	pSrv->bUnlink = inst->bUnlink;
 	pSrv->pRuleset = inst->pBindRuleset;
 	pSrv->pszInputName = ustrdup((inst->pszInputName == NULL) ?  UCHAR_CONSTANT("imptcp") : inst->pszInputName);
 	CHKiRet(prop.Construct(&pSrv->pInputName));
 	CHKiRet(prop.SetString(pSrv->pInputName, pSrv->pszInputName, ustrlen(pSrv->pszInputName)));
 	CHKiRet(prop.ConstructFinalize(pSrv->pInputName));
 
+	CHKiRet(ratelimitNew(&pSrv->ratelimiter, "imptcp", (char*) pSrv->port));
+	ratelimitSetLinuxLike(pSrv->ratelimiter, inst->ratelimitInterval, inst->ratelimitBurst);
+	ratelimitSetThreadSafe(pSrv->ratelimiter);
 	/* add to linked list */
 	pSrv->pNext = pSrvRoot;
 	pSrvRoot = pSrv;
@@ -1363,20 +1506,19 @@ finalize_it:
 
 /* destroy worker pool structures and wait for workers to terminate
  */
-static inline void
+static void
 startWorkerPool(void)
 {
 	int i;
 	wrkrRunning = 0;
-	if(runModConf->wrkrMax > 16)
-		runModConf->wrkrMax = 16; /* TODO: make dynamic? */
 	DBGPRINTF("imptcp: starting worker pool, %d workers\n", runModConf->wrkrMax);
-	pthread_mutex_init(&wrkrMut, NULL);
-	pthread_cond_init(&wrkrIdle, NULL);
+    wrkrInfo = calloc(runModConf->wrkrMax, sizeof(struct wrkrInfo_s));
+    if (wrkrInfo == NULL) {
+        DBGPRINTF("imptcp: worker-info array allocation failed.\n");
+        return;
+    }
 	for(i = 0 ; i < runModConf->wrkrMax ; ++i) {
 		/* init worker info structure! */
-		pthread_cond_init(&wrkrInfo[i].run, NULL);
-		wrkrInfo[i].event = NULL;
 		wrkrInfo[i].numCalled = 0;
 		pthread_create(&wrkrInfo[i].tid, &wrkrThrdAttr, wrkr, &(wrkrInfo[i]));
 	}
@@ -1385,19 +1527,19 @@ startWorkerPool(void)
 
 /* destroy worker pool structures and wait for workers to terminate
  */
-static inline void
+static void
 stopWorkerPool(void)
 {
 	int i;
 	DBGPRINTF("imptcp: stoping worker pool\n");
+	pthread_mutex_lock(&io_q.mut);
+	pthread_cond_broadcast(&io_q.wakeup_worker); /* awake wrkr if not running */
+	pthread_mutex_unlock(&io_q.mut);
 	for(i = 0 ; i < runModConf->wrkrMax ; ++i) {
-		pthread_cond_signal(&wrkrInfo[i].run); /* awake wrkr if not running */
 		pthread_join(wrkrInfo[i].tid, NULL);
 		DBGPRINTF("imptcp: info: worker %d was called %llu times\n", i, wrkrInfo[i].numCalled);
-		pthread_cond_destroy(&wrkrInfo[i].run);
 	}
-	pthread_cond_destroy(&wrkrIdle);
-	pthread_mutex_destroy(&wrkrMut);
+    free(wrkrInfo);
 }
 
 
@@ -1405,8 +1547,8 @@ stopWorkerPool(void)
 /* start up all listeners 
  * This is a one-time stop once the module is set to start.
  */
-static inline rsRetVal
-startupServers()
+static rsRetVal
+startupServers(void)
 {
 	DEFiRet;
 	rsRetVal localRet, lastErr;
@@ -1435,14 +1577,13 @@ startupServers()
 	RETiRet;
 }
 
-
 /* process new activity on listener. This means we need to accept a new
  * connection.
  */
-static inline rsRetVal
+static rsRetVal
 lstnActivity(ptcplstn_t *pLstn)
 {
-	int newSock;
+	int newSock = -1;
 	prop_t *peerName;
 	prop_t *peerIP;
 	rsRetVal localRet;
@@ -1451,8 +1592,9 @@ lstnActivity(ptcplstn_t *pLstn)
 	DBGPRINTF("imptcp: new connection on listen socket %d\n", pLstn->sock);
 	while(glbl.GetGlobalInputTermState() == 0) {
 		localRet = AcceptConnReq(pLstn, &newSock, &peerName, &peerIP);
-		if(localRet == RS_RET_NO_MORE_DATA || glbl.GetGlobalInputTermState() == 1)
+		if(localRet == RS_RET_NO_MORE_DATA || glbl.GetGlobalInputTermState() == 1) {
 			break;
+		}
 		CHKiRet(localRet);
 		localRet = addSess(pLstn, newSock, peerName, peerIP);
 		if(localRet != RS_RET_OK) {
@@ -1467,12 +1609,11 @@ finalize_it:
 	RETiRet;
 }
 
-
 /* process new activity on session. This means we need to accept data
  * or close the session.
  */
-static inline rsRetVal
-sessActivity(ptcpsess_t *pSess)
+static rsRetVal
+sessActivity(ptcpsess_t *pSess, int *continue_polling)
 {
 	int lenRcv;
 	int lenBuf;
@@ -1500,6 +1641,7 @@ sessActivity(ptcpsess_t *pSess)
 				remsock = pSess->sock;
 				bEmitOnClose = 1;
 			}
+			*continue_polling = 0;
 			CHKiRet(closeSess(pSess)); /* close may emit more messages in strmzip mode! */
 			if(bEmitOnClose) {
 				errmsg.LogError(0, RS_RET_PEER_CLOSED_CONN, "imptcp session %d closed by "
@@ -1510,6 +1652,7 @@ sessActivity(ptcpsess_t *pSess)
 			if(errno == EAGAIN || errno == EWOULDBLOCK)
 				break;
 			DBGPRINTF("imptcp: error on session socket %d - closed.\n", pSess->sock);
+			*continue_polling = 0;
 			closeSess(pSess); /* try clean-up by dropping session */
 			break;
 		}
@@ -1524,74 +1667,130 @@ finalize_it:
  * be carried out by the main worker or a helper. It can be run
  * concurrently.
  */
-static inline void
-processWorkItem(struct epoll_event *event)
+static void
+processWorkItem(epolld_t *epd)
 {
-	epolld_t *epd;
+	int continue_polling = 1;
 
-	epd = (epolld_t*) event->data.ptr;
 	switch(epd->typ) {
 	case epolld_lstn:
+		/* listener never stops polling (except server shutdown) */
 		lstnActivity((ptcplstn_t *) epd->ptr);
 		break;
 	case epolld_sess:
-		sessActivity((ptcpsess_t *) epd->ptr);
+		sessActivity((ptcpsess_t *) epd->ptr, &continue_polling);
 		break;
 	default:
 		errmsg.LogError(0, RS_RET_INTERNAL_ERROR,
-			"error: invalid epolld_type_t %d after epoll", epd->typ);
+						"error: invalid epolld_type_t %d after epoll", epd->typ);
 		break;
+	}
+	if (continue_polling == 1) {
+		epoll_ctl(epollfd, EPOLL_CTL_MOD, epd->sock, &(epd->ev));
 	}
 }
 
 
+static rsRetVal
+initIoQ(void)
+{
+	DEFiRet;
+	CHKiConcCtrl(pthread_mutex_init(&io_q.mut, NULL));
+	CHKiConcCtrl(pthread_cond_init(&io_q.wakeup_worker, NULL));
+	STAILQ_INIT(&io_q.q);
+	io_q.sz = 0;
+	io_q.ctrMaxSz = 0; /* TODO: discuss this and fix potential concurrent read/write issues */
+	CHKiRet(statsobj.Construct(&io_q.stats));
+	CHKiRet(statsobj.SetName(io_q.stats, (uchar*) "io-work-q"));
+	CHKiRet(statsobj.SetOrigin(io_q.stats, (uchar*) "imptcp"));
+	STATSCOUNTER_INIT(io_q.ctrEnq, io_q.mutCtrEnq);
+	CHKiRet(statsobj.AddCounter(io_q.stats, UCHAR_CONSTANT("enqueued"),
+								ctrType_IntCtr, CTR_FLAG_RESETTABLE, &io_q.ctrEnq));
+	CHKiRet(statsobj.AddCounter(io_q.stats, UCHAR_CONSTANT("maxqsize"),
+								ctrType_Int, CTR_FLAG_NONE, &io_q.ctrMaxSz));
+	CHKiRet(statsobj.ConstructFinalize(io_q.stats));
+finalize_it:
+	RETiRet;
+}
+
+static void
+destroyIoQ(void)
+{
+	io_req_t *n;
+	if (io_q.stats != NULL) {
+		statsobj.Destruct(&io_q.stats);
+	}
+	pthread_mutex_lock(&io_q.mut);
+	while (!STAILQ_EMPTY(&io_q.q)) {
+		n = STAILQ_FIRST(&io_q.q);
+		STAILQ_REMOVE_HEAD(&io_q.q, link);
+		errmsg.LogError(0, RS_RET_INTERNAL_ERROR, "imptcp: discarded enqueued io-work to allow shutdown - ignored");
+		free(n);
+	}
+	io_q.sz = 0;
+	pthread_mutex_unlock(&io_q.mut);
+	pthread_cond_destroy(&io_q.wakeup_worker);
+	pthread_mutex_destroy(&io_q.mut);
+}
+
+static rsRetVal
+enqueueIoWork(epolld_t *epd, int dispatchInlineIfQueueFull) {
+	io_req_t *n;
+	int dispatchInline;
+	DEFiRet;
+	
+	CHKmalloc(n = malloc(sizeof(io_req_t)));
+	n->epd = epd;
+	
+	int inlineDispatchThreshold = DFLT_inlineDispatchThreshold * runModConf->wrkrMax;
+	dispatchInline = 0;
+	
+	pthread_mutex_lock(&io_q.mut);
+	if (dispatchInlineIfQueueFull && io_q.sz > inlineDispatchThreshold) {
+		dispatchInline = 1;
+	} else {
+		STAILQ_INSERT_TAIL(&io_q.q, n, link);
+		io_q.sz++;
+		STATSCOUNTER_INC(io_q.ctrEnq, io_q.mutCtrEnq);
+		STATSCOUNTER_SETMAX_NOMUT(io_q.ctrMaxSz, io_q.sz);
+		pthread_cond_signal(&io_q.wakeup_worker);
+	}
+	pthread_mutex_unlock(&io_q.mut);
+
+	if (dispatchInline == 1) {
+		free(n);
+		processWorkItem(epd);
+	}
+finalize_it:
+	if (iRet != RS_RET_OK) {
+		if (n == NULL) {
+			errmsg.LogError(0, iRet, "imptcp: couldn't allocate memory to enqueue io-request - ignored");
+		}
+	}
+	RETiRet;
+}
+
 /* This function is called to process a complete workset, that
  * is a set of events returned from epoll.
  */
-static inline void
+static void
 processWorkSet(int nEvents, struct epoll_event events[])
 {
 	int iEvt;
-	int i;
 	int remainEvents;
-
 	remainEvents = nEvents;
+	epolld_t *epd;
+
 	for(iEvt = 0 ; (iEvt < nEvents) && (glbl.GetGlobalInputTermState() == 0) ; ++iEvt) {
-		if(remainEvents == 1) {
+		epd = (epolld_t*)events[iEvt].data.ptr;
+		if(runModConf->bProcessOnPoller && remainEvents == 1) {
 			/* process self, save context switch */
-			processWorkItem(events+iEvt);
+			processWorkItem(epd);
 		} else {
-			pthread_mutex_lock(&wrkrMut);
-			/* check if there is a free worker */
-			for(i = 0 ; (i < runModConf->wrkrMax) && (wrkrInfo[i].event != NULL) ; ++i)
-				/*do search*/;
-			if(i < runModConf->wrkrMax) {
-				/* worker free -> use it! */
-				wrkrInfo[i].event = events+iEvt;
-				++wrkrRunning;
-				pthread_cond_signal(&wrkrInfo[i].run);
-				pthread_mutex_unlock(&wrkrMut);
-			} else {
-				pthread_mutex_unlock(&wrkrMut);
-				/* no free worker, so we process this one ourselfs */
-				processWorkItem(events+iEvt);
-			}
+			enqueueIoWork(epd, runModConf->bProcessOnPoller);
 		}
 		--remainEvents;
 	}
-
-	if(nEvents > 1) {
-		/* we now need to wait until all workers finish. This is because the
-		 * rest of this module can not handle the concurrency introduced
-		 * by workers running during the epoll call.
-		 */
-		pthread_mutex_lock(&wrkrMut);
-		while(wrkrRunning > 0) {
-			pthread_cond_wait(&wrkrIdle, &wrkrMut);
-		}
-		pthread_mutex_unlock(&wrkrMut);
-	}
-
 }
 
 
@@ -1601,26 +1800,37 @@ static void *
 wrkr(void *myself)
 {
 	struct wrkrInfo_s *me = (struct wrkrInfo_s*) myself;
-	
-	pthread_mutex_lock(&wrkrMut);
+	pthread_mutex_lock(&io_q.mut);
+	++wrkrRunning;
+	pthread_mutex_unlock(&io_q.mut);
+
+	io_req_t *n;
 	while(1) {
-		while(me->event == NULL && glbl.GetGlobalInputTermState() == 0) {
-			pthread_cond_wait(&me->run, &wrkrMut);
+		n = NULL;
+		pthread_mutex_lock(&io_q.mut);
+		if (io_q.sz == 0) {
+			--wrkrRunning;
+			if (glbl.GetGlobalInputTermState() != 0) {
+				pthread_mutex_unlock(&io_q.mut);
+				break;
+			} else {
+				pthread_cond_wait(&io_q.wakeup_worker, &io_q.mut);
+			}
+			++wrkrRunning;
 		}
-		if(glbl.GetGlobalInputTermState() == 1)
-			break;
-		pthread_mutex_unlock(&wrkrMut);
+		if (io_q.sz > 0) {
+			n = STAILQ_FIRST(&io_q.q);
+			STAILQ_REMOVE_HEAD(&io_q.q, link);
+			io_q.sz--;
+		}
+		pthread_mutex_unlock(&io_q.mut);
 
-		++me->numCalled;
-		processWorkItem(me->event);
-
-		pthread_mutex_lock(&wrkrMut);
-		me->event = NULL;	/* indicate we are free again */
-		--wrkrRunning;
-		pthread_cond_signal(&wrkrIdle);
+		if (n != NULL) {
+			++me->numCalled;
+			processWorkItem(n->epd);
+			free(n);
+		}
 	}
-	pthread_mutex_unlock(&wrkrMut);
-
 	return NULL;
 }
 
@@ -1651,6 +1861,10 @@ CODESTARTnewInpInst
 			inst->pszBindPort = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
 		} else if(!strcmp(inppblk.descr[i].name, "address")) {
 			inst->pszBindAddr = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else if(!strcmp(inppblk.descr[i].name, "path")) {
+			inst->pszBindPath = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else if(!strcmp(inppblk.descr[i].name, "unlink")) {
+			inst->bUnlink = (int) pvals[i].val.d.n;
 		} else if(!strcmp(inppblk.descr[i].name, "name")) {
 			inst->pszInputName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
 		} else if(!strcmp(inppblk.descr[i].name, "ruleset")) {
@@ -1694,6 +1908,13 @@ CODESTARTnewInpInst
 			dbgprintf("imptcp: program error, non-handled "
 			  "param '%s'\n", inppblk.descr[i].name);
 		}
+
+		char *bindPort = (char *) inst->pszBindPort;
+		char *bindPath = (char *) inst->pszBindPath;
+		if ((bindPort == NULL || strlen(bindPort) < 1) && (bindPath == NULL || strlen (bindPath) < 1)) {
+			errmsg.LogError(0, RS_RET_PARAM_ERROR, "imptcp: Must have either port or path defined");
+			ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+		}
 	}
 finalize_it:
 CODE_STD_FINALIZERnewInpInst
@@ -1707,6 +1928,7 @@ CODESTARTbeginCnfLoad
 	pModConf->pConf = pConf;
 	/* init our settings */
 	loadModConf->wrkrMax = DFLT_wrkrMax;
+	loadModConf->bProcessOnPoller = 1;
 	loadModConf->configSetViaV2Method = 0;
 	bLegacyCnfModGlobalsPermitted = 1;
 	/* init legacy config vars */
@@ -1735,6 +1957,8 @@ CODESTARTsetModCnf
 			continue;
 		if(!strcmp(modpblk.descr[i].name, "threads")) {
 			loadModConf->wrkrMax = (int) pvals[i].val.d.n;
+		} else if(!strcmp(modpblk.descr[i].name, "processOnPoller")) {
+			loadModConf->bProcessOnPoller = (int) pvals[i].val.d.n;
 		} else {
 			dbgprintf("imptcp: program error, non-handled "
 			  "param '%s' in beginCnfLoad\n", modpblk.descr[i].name);
@@ -1838,6 +2062,7 @@ BEGINfreeCnf
 CODESTARTfreeCnf
 	for(inst = pModConf->root ; inst != NULL ; ) {
 		free(inst->pszBindPort);
+		free(inst->pszBindPath);
 		free(inst->pszBindAddr);
 		free(inst->pszBindRuleset);
 		free(inst->pszInputName);
@@ -1855,6 +2080,7 @@ BEGINrunInput
 	int nEvents;
 	struct epoll_event events[128];
 CODESTARTrunInput
+	initIoQ();
 	startWorkerPool();
 	DBGPRINTF("imptcp: now beginning to process input data\n");
 	while(glbl.GetGlobalInputTermState() == 0) {
@@ -1877,7 +2103,7 @@ ENDwillRun
 /* completely shut down a server, that means closing all of its
  * listeners and sessions.
  */
-static inline void
+static void
 shutdownSrv(ptcpsrv_t *pSrv)
 {
 	ptcplstn_t *pLstn, *lstnDel;
@@ -1893,9 +2119,13 @@ shutdownSrv(ptcpsrv_t *pSrv)
 		pLstn = pLstn->next;
 		DBGPRINTF("imptcp shutdown listen socket %d (rcvd %lld bytes, "
 			  "decompressed %lld)\n", lstnDel->sock, lstnDel->rcvdBytes,
-			  lstnDel->rcvdDecompressed);
+				  lstnDel->rcvdDecompressed);
 		free(lstnDel->epd);
 		free(lstnDel);
+	}
+
+	if (pSrv->bUnixSocket && pSrv->bUnlink) {
+		unlink((char*) pSrv->path);
 	}
 
 	/* sessions */
@@ -1914,6 +2144,7 @@ BEGINafterRun
 	ptcpsrv_t *pSrv, *srvDel;
 CODESTARTafterRun
 	stopWorkerPool();
+	destroyIoQ();
 
 	/* we need to close everything that is still open */
 	pSrv = pSrvRoot;
