@@ -91,6 +91,7 @@ lookupNew(lookup_ref_t **ppThis)
 	DEFiRet;
 
 	CHKmalloc(pThis = calloc(1, sizeof(lookup_ref_t)));
+    DBGPRINTF("Creating new lookup table ref at %p\n", pThis);
 	CHKmalloc(t = calloc(1, sizeof(lookup_t)));
 	CHKiConcCtrl(pthread_rwlock_init(&pThis->rwlock, NULL));
 	initialized++; /*1*/
@@ -102,7 +103,9 @@ lookupNew(lookup_ref_t **ppThis)
 	initialized++; /*4*/
 	pThis->do_reload = pThis->do_stop = 0;
 	pThis->reload_on_hup = 1; /*DO reload on HUP (default)*/
+    DBGPRINTF("Lookup table ref at %p had thread ref was %p before reloader-thread-creation\n", pThis, (void *) pThis->reloader);
 	CHKiConcCtrl(pthread_create(&pThis->reloader, &pThis->reloader_thd_attr, lookupTableReloader, pThis));
+    DBGPRINTF("Created thd %p for lookup table ref at %p\n", (void *) pThis->reloader, pThis);
 	initialized++; /*5*/
 
 	pThis->next = NULL;
@@ -117,6 +120,7 @@ lookupNew(lookup_ref_t **ppThis)
 
 	*ppThis = pThis;
 finalize_it:
+    DBGPRINTF("Lookup table ref %p created. iRet = %d, initialized = %d\n", pThis, iRet, initialized);
 	if(iRet != RS_RET_OK) {
 		errmsg.LogError(errno, iRet, "a lookup table could not be initialized: failed at init-step %d "
 		"(please enable debug logs for details)", initialized);
@@ -142,17 +146,21 @@ freeStubValueForReloadFailure(lookup_ref_t *pThis) {/*must be called with reload
 static void
 lookupStopReloader(lookup_ref_t *pThis) {
 	pthread_mutex_lock(&pThis->reloader_mut);
+    DBGPRINTF("Stopping reloader-thread for lookup table ref at '%p' (named %s). Thread-ref is: %p. (do_reload: %d, do_stop: %d)\n", pThis, pThis->name, (void *) pThis->reloader, pThis->do_reload, pThis->do_stop);
 	freeStubValueForReloadFailure(pThis);
 	pThis->do_reload = 0;
 	pThis->do_stop = 1;
 	pthread_cond_signal(&pThis->run_reloader);
 	pthread_mutex_unlock(&pThis->reloader_mut);
+    DBGPRINTF("Will join reloader-thread for lookup table ref at '%p' (named %s) now. Thread-ref is: %p.\n", pThis, pThis->name, pThis->reloader);
 	pthread_join(pThis->reloader, NULL);
+    DBGPRINTF("Stopped reloader-thread for lookup table ref at '%p' (named %s). Thread-ref is: %p. (do_reload: %d, do_stop: %d)\n", pThis, pThis->name, (void *) pThis->reloader, pThis->do_reload, pThis->do_stop);
 }
 
 static void
 lookupRefDestruct(lookup_ref_t *pThis)
 {
+    DBGPRINTF("Lookup table ref at '%p' (named %s) is being destroyed.\n", pThis, pThis->name);
 	lookupStopReloader(pThis);
 	pthread_mutex_destroy(&pThis->reloader_mut);
 	pthread_cond_destroy(&pThis->run_reloader);
@@ -163,6 +171,7 @@ lookupRefDestruct(lookup_ref_t *pThis)
 	free(pThis->name);
 	free(pThis->filename);
 	free(pThis);
+    DBGPRINTF("Lookup table ref at '%p' has been destroyed.\n", pThis);
 }
 
 static void
@@ -960,10 +969,12 @@ lookupTableDefProcessCnf(struct cnfobj *o)
 	reloader_thd_name[thd_name_len - 1] = '\0';
 	pthread_setname_np(lu->reloader, reloader_thd_name);
 #endif
+    DBGPRINTF("Lookup table ref named %s is at %p\n", lu->name, lu);
 	CHKiRet(lookupReadFile(lu->self, lu->name, lu->filename));
 	DBGPRINTF("lookup table '%s' loaded from file '%s'\n", lu->name, lu->filename);
 
 finalize_it:
+    DBGPRINTF("lookup table '%s' (at %p) is instantiated. iRet = %d\n", lu->name, lu, iRet);
 #ifdef HAVE_PTHREAD_SETNAME_NP
 	free(reloader_thd_name);
 #endif
